@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+import shutil
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from ...database.session_db import SessionDB
@@ -16,6 +17,17 @@ RASTER_OUTPUT_EXTENSIONS = {".tif", ".tiff"}
 TABLE_OUTPUT_EXTENSIONS = {".csv", ".xlsx", ".dbf"}
 FILE_OUTPUT_EXTENSIONS = {".txt", ".json", ".html", ".md"}
 OUTPUT_HINTS = ("output", "result", "save", "export", "write", "输出", "结果")
+SHAPEFILE_SIDECAR_EXTENSIONS = {
+    ".shp",
+    ".shx",
+    ".dbf",
+    ".prj",
+    ".cpg",
+    ".qpj",
+    ".sbn",
+    ".sbx",
+    ".fix",
+}
 
 
 def build_execute_gis_code_tool(
@@ -29,10 +41,15 @@ def build_execute_gis_code_tool(
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         code = str(arguments.get("code") or "")
         expected_outputs = arguments.get("expected_outputs") or []
+        delivery_outputs = arguments.get("delivery_outputs") or []
         expected_outputs_inferred = False
         if not expected_outputs:
             expected_outputs = infer_expected_outputs_from_code(code)
             expected_outputs_inferred = bool(expected_outputs)
+        expected_outputs, delivery_outputs = _prepare_delivery_outputs(
+            expected_outputs,
+            delivery_outputs,
+        )
         timeout_seconds = arguments.get("timeout_seconds")
 
         executor = QGISCodeExecutor(executor_config)
@@ -65,10 +82,20 @@ def build_execute_gis_code_tool(
             except Exception as exc:
                 load_errors.append(str(exc))
 
-        success = bool(result.get("success")) and not load_errors
+        delivered_outputs: list[dict[str, Any]] = []
+        delivery_errors: list[str] = []
+        if result.get("success") and delivery_outputs:
+            delivered_outputs, delivery_errors = _deliver_outputs(
+                result.get("outputs") or [],
+                delivery_outputs,
+            )
+
+        success = bool(result.get("success")) and not load_errors and not delivery_errors
         error = result.get("error")
         if load_errors and not error:
             error = "输出文件已生成，但加载到 QGIS 失败：" + "；".join(load_errors)
+        if delivery_errors and not error:
+            error = "输出文件已生成，但导出到指定目录失败：" + "；".join(delivery_errors)
         if not success and not error and result.get("stderr"):
             error = str(result["stderr"]).strip().splitlines()[-1]
 
@@ -78,6 +105,8 @@ def build_execute_gis_code_tool(
             "error": error,
             "loaded_layers": loaded_layers,
             "load_errors": load_errors,
+            "delivered_outputs": delivered_outputs,
+            "delivery_errors": delivery_errors,
             "expected_outputs_inferred": expected_outputs_inferred,
         }
         if session_db is not None:
@@ -115,7 +144,10 @@ def build_execute_gis_code_tool(
                 },
                 "expected_outputs": {
                     "type": "array",
-                    "description": "预期输出文件。path 必须是相对路径或工作目录内路径。",
+                    "description": (
+                        "预期输出文件。path 必须是相对路径或工作目录内路径。"
+                        "如果用户要求导出到外部目录，请代码仍输出到工作目录，并使用 delivery_outputs 指定外部目标。"
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -131,6 +163,19 @@ def build_execute_gis_code_tool(
                         "additionalProperties": False,
                     },
                     "minItems": 1,
+                },
+                "delivery_outputs": {
+                    "type": "array",
+                    "description": "可选。执行成功后复制到用户指定外部路径的交付目标。source_path 对应 expected_outputs.path。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source_path": {"type": "string", "description": "工作目录内输出文件名，例如 qn_500_area_8000.geojson。"},
+                            "target_path": {"type": "string", "description": "用户指定外部完整路径，例如 E:\\Desktop\\test\\qn_500_area_8000.geojson。"},
+                        },
+                        "required": ["source_path", "target_path"],
+                        "additionalProperties": False,
+                    },
                 },
                 "timeout_seconds": {
                     "type": "integer",
@@ -182,6 +227,111 @@ def infer_expected_outputs_from_code(code: str) -> list[dict[str, str]]:
             }
         )
     return outputs
+
+
+def _prepare_delivery_outputs(
+    expected_outputs: list[dict[str, Any]],
+    delivery_outputs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    prepared_outputs = []
+    prepared_delivery = list(delivery_outputs) if isinstance(delivery_outputs, list) else []
+    for output in expected_outputs:
+        if not isinstance(output, dict):
+            continue
+        prepared = dict(output)
+        raw_path = str(prepared.get("path") or "").strip()
+        if _is_external_output_path(raw_path):
+            filename = _output_filename(raw_path)
+            prepared["path"] = filename
+            prepared["name"] = str(prepared.get("name") or Path(filename).stem)
+            prepared_delivery.append(
+                {
+                    "source_path": filename,
+                    "target_path": raw_path,
+                }
+            )
+        prepared_outputs.append(prepared)
+    return prepared_outputs, prepared_delivery
+
+
+def _is_external_output_path(raw_path: str) -> bool:
+    if not raw_path:
+        return False
+    if PureWindowsPath(raw_path).drive:
+        return True
+    return Path(raw_path).expanduser().is_absolute()
+
+
+def _output_filename(raw_path: str) -> str:
+    windows_path = PureWindowsPath(raw_path)
+    filename = windows_path.name if windows_path.drive else Path(raw_path).name
+    return _fix_common_extension_typo(filename)
+
+
+def _fix_common_extension_typo(filename: str) -> str:
+    lower = filename.lower()
+    for extension in (
+        "geojson",
+        "json",
+        "gpkg",
+        "shp",
+        "tif",
+        "tiff",
+        "csv",
+        "xlsx",
+    ):
+        suffix = f",{extension}"
+        if lower.endswith(suffix):
+            return f"{filename[:-len(suffix)]}.{extension}"
+    return filename
+
+
+def _deliver_outputs(
+    outputs: list[dict[str, Any]],
+    delivery_outputs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    output_by_name = {Path(str(output.get("path") or "")).name: output for output in outputs}
+    delivered = []
+    errors = []
+    for delivery in delivery_outputs:
+        source_name = _output_filename(str(delivery.get("source_path") or ""))
+        target_path = Path(str(delivery.get("target_path") or "")).expanduser()
+        output = output_by_name.get(source_name)
+        if not output:
+            errors.append(f"找不到待交付输出：{source_name}")
+            continue
+        source_path = Path(str(output.get("path") or ""))
+        if not source_path.exists():
+            errors.append(f"待交付输出不存在：{source_path}")
+            continue
+        try:
+            copied = _copy_output_bundle(source_path, target_path)
+        except Exception as exc:
+            errors.append(f"{target_path}: {exc}")
+            continue
+        delivered.append(
+            {
+                "source_path": str(source_path),
+                "target_path": str(target_path),
+                "files": [str(path) for path in copied],
+            }
+        )
+    return delivered, errors
+
+
+def _copy_output_bundle(source_path: Path, target_path: Path) -> list[Path]:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    copied = []
+    if source_path.suffix.lower() == ".shp":
+        for sidecar in source_path.parent.glob(f"{source_path.stem}.*"):
+            if sidecar.suffix.lower() not in SHAPEFILE_SIDECAR_EXTENSIONS:
+                continue
+            target = target_path.with_suffix(sidecar.suffix)
+            shutil.copy2(sidecar, target)
+            copied.append(target)
+        return copied
+    shutil.copy2(source_path, target_path)
+    return [target_path]
 
 
 def _candidate_output_path(value: str) -> str | None:

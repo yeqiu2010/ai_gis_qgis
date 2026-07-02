@@ -517,6 +517,34 @@ def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
     assert result["outputs"][0]["exists"] is True
 
 
+def test_execute_gis_code_delivers_outputs_to_external_path(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="delivery", model="test", source="test")
+    target = tmp_path / "exports" / "result.geojson"
+    tool = build_execute_gis_code_tool(
+        session_db=session_db,
+        session_id=session.id,
+        executor_config={
+            "workspace_dir": str(tmp_path / "workspaces"),
+            "timeout_seconds": 10,
+        },
+    )
+
+    result = tool.handler(
+        {
+            "code": "output_path = 'result.geojson'\nwith open(output_path, 'w', encoding='utf-8') as handle:\n    handle.write('{\"type\":\"FeatureCollection\",\"features\":[]}')",
+            "expected_outputs": [
+                {"path": str(target), "name": "result", "type": "file"}
+            ],
+        }
+    )
+
+    assert result["success"] is True
+    assert result["expected_outputs"][0]["path"].endswith("result.geojson")
+    assert result["delivered_outputs"][0]["target_path"] == str(target)
+    assert target.exists()
+
+
 def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="memory", model="test", source="test")
@@ -619,6 +647,8 @@ def test_prompt_builder_routes_complex_analysis_to_pipeline():
     assert "复杂 GIS 分析任务必须先切换到 gis-pipeline" in prompt
     assert "优先一次调用 inspect_layers" in prompt
     assert "QGIS_AGENT_WORKSPACE 是 execute_gis_code 执行器注入的运行时变量" in prompt
+    assert "不要询问保存文件夹" in prompt
+    assert "分析结果默认输出到该工作目录" in prompt
     assert "{\"skill_name\":\"gis-pipeline\"}" in prompt
     assert "不要在 main-orchestrator 中直接调用 execute_gis_code" in prompt
     assert "500m.shp" in prompt

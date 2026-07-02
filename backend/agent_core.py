@@ -450,6 +450,10 @@ class AgentCore:
         elif outputs:
             names = ", ".join(str(output.get("name") or output.get("path") or "") for output in outputs)
             lines.append(f"已生成输出：{names}")
+        delivered_outputs = result.get("delivered_outputs") or []
+        if delivered_outputs:
+            targets = ", ".join(str(output.get("target_path") or "") for output in delivered_outputs)
+            lines.append(f"已导出到：{targets}")
         if result.get("retry_count"):
             lines.append(f"已根据上一次错误自动修复并重试 {result['retry_count']} 次。")
         return "\n".join(lines)

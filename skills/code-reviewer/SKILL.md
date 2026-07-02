@@ -3,7 +3,7 @@ name: code-reviewer
 description: 代码安全和 GIS 正确性审查
 tools:
   - record_pipeline_stage
-version: 1.1.2
+version: 1.1.3
 tags: [gis, pipeline, review]
 ---
 
@@ -19,6 +19,7 @@ tags: [gis, pipeline, review]
 - 使用 `subprocess`、`os.system`、`eval`、`exec`、`sys.exit`。
 - 删除或覆盖工作目录外文件。
 - 输出没有写入 `QGIS_AGENT_WORKSPACE`。
+- 用户要求导出到外部目录时，代码直接写外部目录；应改为工作目录输出 + `delivery_outputs`。
 - `expected_outputs` 为空，或没有包含用户要求生成的最终文件，例如 `500m.shp`。
 - `expected_outputs.path` 和代码实际输出文件名不一致。
 - 使用未定义变量，例如 `QgsProject` 未导入且不在当前命名空间说明中。

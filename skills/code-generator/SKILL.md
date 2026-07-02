@@ -3,7 +3,7 @@ name: code-generator
 description: 生成 QGIS 当前环境可执行代码
 tools:
   - record_pipeline_stage
-version: 1.1.3
+version: 1.1.5
 tags: [gis, pipeline, code]
 ---
 
@@ -17,7 +17,10 @@ tags: [gis, pipeline, code]
 - `QGIS_AGENT_WORKSPACE` 是 `execute_gis_code` 执行器注入到运行命名空间和环境变量中的工作目录变量，生成代码中可以直接使用；为了可读性，建议写成 `workspace = Path(QGIS_AGENT_WORKSPACE)`。
 - `expected_outputs` 必须和代码实际输出路径完全一致。
 - 用户要求生成的最终文件，例如 `500m.shp`、`result.gpkg`、`parks.geojson`，必须写入 `expected_outputs`；不要省略 `expected_outputs`，也不要只把文件名写在代码里。
+- 用户只说“导出/生成结果”但没有给文件名时，不要询问保存目录；使用合理默认文件名并写入 `expected_outputs`，例如 `park_parcels.geojson`。
 - 输出路径用 `Path(QGIS_AGENT_WORKSPACE) / "文件名"` 构造，不要写绝对路径到工作目录外。
+- 如果用户明确要求导出到外部目录，例如 `E:\Desktop\test`，代码仍然只能写入 `QGIS_AGENT_WORKSPACE`；在 `execute_gis_code` 参数中增加 `delivery_outputs`，把工作目录内输出复制到用户目录。
+- 外部导出示例：代码输出 `qn_500_area_8000.geojson`，`expected_outputs=[{"path":"qn_500_area_8000.geojson","name":"qn_500_area_8000","type":"vector"}]`，`delivery_outputs=[{"source_path":"qn_500_area_8000.geojson","target_path":"E:\\Desktop\\test\\qn_500_area_8000.geojson"}]`。
 - 可以直接使用当前命名空间中的常用对象：`QgsProject`、`QgsVectorLayer`、`QgsFeature`、`QgsFeatureRequest`、`QgsGeometry`、`QgsVectorFileWriter`、`QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback`、`processing`、`iface`、`Path`。
 - 也可以显式导入：`from qgis.core import ...`。
 - 如果代码里出现 `QgsProcessing`、`QgsProcessingContext` 或 `QgsProcessingFeedback`，必须确认它们已在当前命名空间或显式导入中可用；更推荐直接把 `OUTPUT` 写成 `str(Path(QGIS_AGENT_WORKSPACE) / "文件名")`，不要用 `QgsProcessing.TEMPORARY_OUTPUT` 作为最终输出。
@@ -49,6 +52,7 @@ tags: [gis, pipeline, code]
 ## 推荐模板：按属性筛选并输出 GeoJSON
 
 适用于“找出建筑物图层中的公园地块”“提取 leisure=park 的地块”等任务。
+如果用户只说“导出公园地块”但未提供文件名，默认输出 `park_parcels.geojson`，图层名为“公园地块”。
 
 ```python
 from pathlib import Path
@@ -150,6 +154,7 @@ processing.run(
 - 是否检查字段存在？字段不存在时不要静默输出空结果。
 - 是否把输出写进 `QGIS_AGENT_WORKSPACE`？
 - `expected_outputs.path` 是否和代码里的文件名一致？
+- 用户要求外部目录时，是否使用 `delivery_outputs` 而不是让代码直接写外部路径？
 - 是否包含用户要求的最终输出文件，例如 `500m.shp`？
 - 输出类型是否是 `vector`、`raster`、`table` 或 `file`？
 - 是否避免了 `QgsApplication`、`subprocess`、`eval`、`exec`、删除文件？

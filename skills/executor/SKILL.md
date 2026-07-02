@@ -6,6 +6,8 @@
 
 - 代码必须只写入 `QGIS_AGENT_WORKSPACE` 或 `expected_outputs` 中的文件。
 - `expected_outputs` 必须包含 `path`、`name`、`type`。
+- 分析结果默认保存在 `QGIS_AGENT_WORKSPACE` 并自动加载到 QGIS；不要在最终回答或执行前要求用户选择保存文件夹。
+- 用户明确指定外部目录时，`execute_gis_code` 使用 `delivery_outputs` 交付结果；代码本身仍不得写入外部目录。
 - `type` 为 `vector` 或 `raster` 的输出会由父进程加载进 QGIS。
 - 不得创建 `QgsApplication`、`QApplication`，不得调用 `initQgis`，不得启动新的 QGIS。
 - 不允许网络访问、`subprocess`、`os.system`、`eval`、`exec`、删除文件或写入工作目录外路径。
@@ -22,5 +24,6 @@
   - `字段不存在`：回到 `inspect_layer` 结果，选择真实字段；不要硬猜字段名。
   - `缺少预期输出文件`：确保代码输出路径和 `expected_outputs.path` 完全一致。
   - `必须提供 expected_outputs`：重新生成工具调用时补上用户要求的最终输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
+  - `输出文件必须位于工作目录内`：把代码和 `expected_outputs.path` 改为工作目录内相对文件名，并用 `delivery_outputs` 指定用户外部路径。
   - Processing 算法失败：检查算法 ID、参数名、输入图层类型和输出路径。
 - 用户取消确认时，不要重复执行，也不要声称工程已改变。

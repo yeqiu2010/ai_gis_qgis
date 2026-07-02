@@ -9,7 +9,7 @@ tools:
   - remove_layer
   - zoom_to_layer
   - export_layer
-version: 1.1.0
+version: 1.1.1
 tags: [orchestration, routing, gis]
 ---
 
@@ -47,6 +47,8 @@ tags: [orchestration, routing, gis]
 - 用户要求加载数据时，必须确认用户已提供明确的 `source` 路径或 QGIS 数据源 URI；缺失时先询问，不要猜测本地路径。
 - 从“加载 E:\data\roads.shp 数据”这类自然语言中提取真实路径 `E:\data\roads.shp` 作为 `load_layer.source`，不要把“加载”“数据”“图层”等说明性文字传给工具。
 - 用户要求删除、移除、导出覆盖类操作时，可以准备工具调用，但必须依赖工具确认流程；不要告诉用户已经完成，直到工具返回成功。
+- 用户要求“导出/生成”新的分析结果但没有提供目录时，不要追问保存文件夹；默认交给 `execute_gis_code` 输出到 `QGIS_AGENT_WORKSPACE` 并加载到 QGIS。
+- 只有用户明确要求把已有图层导出到某个外部目录时，才使用 `export_layer` 并要求 `output_path`。
 - 用户要求缩放到某图层时，使用 `zoom_to_layer`；如果图层名不明确，先用 `list_layers` 或询问用户。
 - 用户要求设置样式时，当前只支持 QML 文件，缺少 `qml_path` 时先询问。
 
@@ -58,6 +60,7 @@ tags: [orchestration, routing, gis]
 
 - 输入图层、字段、距离/单位和输出文件已明确。
 - 输出写入 `QGIS_AGENT_WORKSPACE`。
+- 用户未指定文件名时，基于任务生成合理默认文件名，例如 `park_parcels.geojson`、`buffer_result.gpkg`、`clip_result.gpkg`；不要询问保存文件夹。
 - `expected_outputs` 列出每个输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
 - 不创建 `QgsApplication`、`QApplication`，不调用 `initQgis`，不启动新的 QGIS。
 - 不生成网络访问、`subprocess`、`os.system`、`eval`、`exec`、删除文件或写工作目录外路径。

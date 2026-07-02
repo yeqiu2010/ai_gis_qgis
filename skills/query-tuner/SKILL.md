@@ -3,7 +3,7 @@ name: query-tuner
 description: 需求澄清和结构化查询
 tools:
   - record_pipeline_stage
-version: 1.1.0
+version: 1.1.2
 tags: [gis, pipeline, query]
 ---
 
@@ -28,6 +28,8 @@ tags: [gis, pipeline, query]
 
 - 距离和面积必须包含单位；例如 `500m` 解析为 `distance=500, unit=meter`。
 - 用户指定文件名时必须保留原文件名，例如 `500m.shp`，并写入 `output.expected_outputs`。
+- 用户未指定文件名或目录时，不要提出“保存到哪个文件夹”的问题；为分析结果生成默认文件名，并标记 `output.location = "QGIS_AGENT_WORKSPACE"`。
+- 用户明确指定外部目录时，记录 `output.delivery_directory` 和 `output.delivery_outputs`；执行代码仍输出到 `QGIS_AGENT_WORKSPACE`，外部目录只用于交付复制。
 - 多步骤任务必须把每一步拆成结构化操作，不要压缩成一句“执行分析”。
 - 字段名、图层名、属性取值不明确时写入 `questions`，并停止后续代码生成。
 - 如果已有 `inspect_layer` 结果，必须优先使用真实字段；不要硬猜字段名。
