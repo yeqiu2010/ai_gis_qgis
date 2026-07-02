@@ -178,6 +178,52 @@ class SessionDB:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_recent_tool_calls(self, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT tool_name, arguments, result, success, error_message, timestamp
+                FROM tool_call_log
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        values = []
+        for row in reversed(rows):
+            item = dict(row)
+            for key in ("arguments", "result"):
+                try:
+                    item[key] = json.loads(item[key] or "{}")
+                except json.JSONDecodeError:
+                    item[key] = item[key] or {}
+            values.append(item)
+        return values
+
+    def get_recent_stage_artifacts(self, session_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stage_name, content, stage_artifact, timestamp
+                FROM messages
+                WHERE session_id = ?
+                  AND event_type = 'stage_artifact'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        values = []
+        for row in reversed(rows):
+            item = dict(row)
+            try:
+                item["stage_artifact"] = json.loads(item["stage_artifact"] or "{}")
+            except json.JSONDecodeError:
+                item["stage_artifact"] = {}
+            values.append(item)
+        return values
+
     def get_state(self, key: str) -> str | None:
         with self._connect() as connection:
             row = connection.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()

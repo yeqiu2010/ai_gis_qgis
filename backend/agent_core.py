@@ -86,12 +86,7 @@ class AgentCore:
         self._save_process_message(session_id, thinking_message)
         publish(agent_event("thinking", {"message": thinking_message}, session_id=session_id, run_id=run_id))
 
-        history = self.session_db.get_messages(session_id, limit=50)
-        messages = [
-            ChatMessage(role=row["role"], content=row["content"] or "")
-            for row in history
-            if row["role"] in {"user", "assistant"}
-        ]
+        messages = self._build_conversation_messages(session_id)
 
         tool_registry = self._build_tool_registry(session_id)
         try:
@@ -545,6 +540,9 @@ class AgentCore:
             for row in history
             if row["role"] in {"user", "assistant"}
         ]
+        memory_message = self._build_memory_message(session_id)
+        if memory_message is not None:
+            messages.insert(0, memory_message)
         messages.append(
             ChatMessage(
                 role="assistant",
@@ -561,6 +559,73 @@ class AgentCore:
             )
         )
         return messages
+
+    def _build_conversation_messages(self, session_id: str) -> list[ChatMessage]:
+        history = self.session_db.get_messages(session_id, limit=50)
+        messages = [
+            ChatMessage(role=row["role"], content=row["content"] or "")
+            for row in history
+            if row["role"] in {"user", "assistant"}
+        ]
+        memory_message = self._build_memory_message(session_id)
+        if memory_message is not None:
+            messages.insert(0, memory_message)
+        return messages
+
+    def _build_memory_message(self, session_id: str) -> ChatMessage | None:
+        tool_calls = self.session_db.get_recent_tool_calls(session_id, limit=8)
+        stage_artifacts = self.session_db.get_recent_stage_artifacts(session_id, limit=5)
+        lines = []
+        if tool_calls:
+            lines.append("最近工具记忆：")
+            for call in tool_calls:
+                lines.extend(self._summarize_tool_memory(call))
+        if stage_artifacts:
+            lines.append("最近 Pipeline 记忆：")
+            for artifact in stage_artifacts:
+                summary = str(artifact.get("content") or "").strip()
+                stage_name = str(artifact.get("stage_name") or "")
+                if summary:
+                    lines.append(f"- {stage_name}: {summary}")
+        if not lines:
+            return None
+        content = (
+            "会话记忆：以下内容来自本会话历史工具结果和阶段产物。"
+            "当用户使用省略说法、代词或短句继续任务时，必须优先用这些记忆补全上下文；"
+            "不要重复询问已经由工具确认过的图层、字段或筛选依据。\n"
+            + "\n".join(lines)
+        )
+        return ChatMessage(role="assistant", content=content[:6000])
+
+    def _summarize_tool_memory(self, call: dict[str, Any]) -> list[str]:
+        name = str(call.get("tool_name") or "")
+        result = call.get("result") if isinstance(call.get("result"), dict) else {}
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        if name in {"inspect_layer", "inspect_layers"}:
+            layers = result.get("layers") if isinstance(result.get("layers"), list) else [result]
+            lines = []
+            for item in layers[:6]:
+                if not isinstance(item, dict):
+                    continue
+                layer = item.get("layer") if isinstance(item.get("layer"), dict) else {}
+                fields = item.get("fields") if isinstance(item.get("fields"), list) else []
+                field_names = [str(field.get("name")) for field in fields[:30] if isinstance(field, dict)]
+                samples = item.get("sample_features") if isinstance(item.get("sample_features"), list) else []
+                sample_hint = ""
+                if samples:
+                    sample_hint = f"，样例={json.dumps(samples[:2], ensure_ascii=False)[:500]}"
+                lines.append(
+                    f"- inspect: 图层={layer.get('name') or arguments.get('layer_name')}, "
+                    f"类型={layer.get('type')}, CRS={layer.get('crs')}, 字段={field_names}{sample_hint}"
+                )
+            return lines
+        if name in {"list_layers", "load_layer", "export_layer", "execute_gis_code"}:
+            compact = json.dumps(result, ensure_ascii=False)
+            return [f"- {name}: {compact[:800]}"]
+        if name:
+            status = "成功" if call.get("success") else f"失败：{call.get('error_message') or ''}"
+            return [f"- {name}: {status}"]
+        return []
 
     def _publish_stage_start_if_needed(
         self,

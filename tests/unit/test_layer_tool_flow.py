@@ -517,6 +517,50 @@ def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
     assert result["outputs"][0]["exists"] is True
 
 
+def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="memory", model="test", source="test")
+    session_db.save_message(session.id, "user", "从建筑物图层中找出公园地块", event_type="user")
+    session_db.save_message(
+        session.id,
+        "assistant",
+        "我看到建筑物图层中有 leisure、landuse 和 name 等字段。",
+        event_type="summary",
+    )
+    session_db.log_tool_call(
+        session.id,
+        "inspect_layer",
+        {"layer_name": "建筑物"},
+        {
+            "success": True,
+            "layer": {"name": "建筑物", "type": "vector", "crs": "EPSG:4326"},
+            "fields": [
+                {"name": "leisure", "type": "String"},
+                {"name": "landuse", "type": "String"},
+                {"name": "name", "type": "String"},
+            ],
+            "sample_features": [{"leisure": "park", "name": "中山公园"}],
+        },
+        duration_ms=12,
+    )
+    session_db.save_message(session.id, "user", "导出公园地块", event_type="user")
+
+    messages = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_conversation_messages(session.id)
+
+    memory = messages[0].content
+    assert messages[0].role == "assistant"
+    assert "会话记忆" in memory
+    assert "建筑物" in memory
+    assert "leisure" in memory
+    assert "landuse" in memory
+    assert "中山公园" in memory
+    assert messages[-1].content == "导出公园地块"
+
+
 def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="retry code", model="retry-code-test-model", source="test")
