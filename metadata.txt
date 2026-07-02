@@ -2,7 +2,7 @@
 name=AI GIS Agent
 description=Natural-language GIS assistant for QGIS, backed by a skill-driven agent.
 about=AI GIS Agent embeds a Vue chat panel in QGIS and connects it to a Python backend through QWebChannel.
-version=0.2.22
+version=0.2.23
 qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
 author=AI GIS Agent Team

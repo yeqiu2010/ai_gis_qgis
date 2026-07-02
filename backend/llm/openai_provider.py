@@ -25,7 +25,7 @@ class OpenAICompatibleProvider:
         timeout_seconds: int = 60,
     ):
         self.model = model
-        self.base_url = base_url.rstrip("/")
+        self.base_url = self._normalize_base_url(base_url)
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -37,9 +37,6 @@ class OpenAICompatibleProvider:
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        if not self.api_key:
-            raise RuntimeError("未配置 OPENAI_API_KEY，无法调用 OpenAI-compatible Provider。")
-
         payload = {
             "model": self.model,
             "temperature": self.temperature,
@@ -50,13 +47,13 @@ class OpenAICompatibleProvider:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -92,3 +89,11 @@ class OpenAICompatibleProvider:
             finish_reason=choice.get("finish_reason") or "stop",
             tool_calls=tool_calls,
         )
+
+    def _normalize_base_url(self, base_url: str) -> str:
+        value = (base_url or "").strip().rstrip("/")
+        if not value:
+            return "https://api.openai.com/v1"
+        if "://" not in value:
+            value = f"http://{value}"
+        return value

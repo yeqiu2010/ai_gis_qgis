@@ -473,15 +473,15 @@ async function waitForPaint() {
       </header>
       <label>
         <span>Base URL</span>
-        <input v-model="settingsForm.base_url" type="text" placeholder="https://.../v1" />
+        <input v-model="settingsForm.base_url" type="text" placeholder="http://10.0.19.214:11430/v1" />
       </label>
       <label>
         <span>模型名</span>
-        <input v-model="settingsForm.model" type="text" placeholder="例如 qwen-plus" />
+        <input v-model="settingsForm.model" type="text" placeholder="例如 gemma-4-31B-it-Q4:latest" />
       </label>
       <label>
         <span>API Key</span>
-        <input v-model="settingsForm.api_key" type="password" placeholder="输入你的 API Key" />
+        <input v-model="settingsForm.api_key" type="password" placeholder="本地 Ollama 可留空" />
       </label>
       <footer>
         <p>{{ settingsMessage }}</p>
