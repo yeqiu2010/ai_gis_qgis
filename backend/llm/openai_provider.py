@@ -59,6 +59,8 @@ class OpenAICompatibleProvider:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 data = json.loads(response.read().decode("utf-8"))
+        except TimeoutError as exc:
+            raise RuntimeError(f"OpenAI-compatible 请求超时：{exc}") from exc
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"OpenAI-compatible 请求失败：HTTP {exc.code} {body}") from exc

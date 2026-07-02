@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -36,6 +37,8 @@ class AgentCore:
         qgis_executor=None,
         executor_config: dict[str, Any] | None = None,
         should_cancel: CancelChecker | None = None,
+        llm_retry_attempts: int = 3,
+        llm_retry_delay_seconds: float = 0.8,
     ):
         self.session_db = session_db
         self.llm_provider = llm_provider
@@ -44,6 +47,8 @@ class AgentCore:
         self.qgis_executor = qgis_executor
         self.executor_config = executor_config or {}
         self.should_cancel = should_cancel or (lambda: False)
+        self.llm_retry_attempts = max(1, llm_retry_attempts)
+        self.llm_retry_delay_seconds = max(0.0, llm_retry_delay_seconds)
 
     def run(
         self,
@@ -95,10 +100,13 @@ class AgentCore:
             while not budget.exhausted:
                 if check_cancelled():
                     return events
-                response = self.llm_provider.chat(
+                response = self._chat_with_retries(
                     system=system_prompt,
                     messages=messages,
                     tools=tool_registry.definitions_for_skill(active_skill),
+                    publish=publish,
+                    session_id=session_id,
+                    run_id=run_id,
                 )
                 budget.record_iteration()
                 if not response.tool_calls:
@@ -207,7 +215,13 @@ class AgentCore:
                 )
 
             if response is None:
-                response = self.llm_provider.chat(system=system_prompt, messages=messages)
+                response = self._chat_with_retries(
+                    system=system_prompt,
+                    messages=messages,
+                    publish=publish,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
             elif response.tool_calls and budget.exhausted:
                 response = type(response)(
                     content="任务未完成：已达到本轮工具调用预算。请缩小任务范围或补充更明确的图层、字段和输出要求后重试。",
@@ -243,9 +257,8 @@ class AgentCore:
                 )
             )
         except Exception as exc:
-            content = f"对话生成失败：{exc}"
-            self.session_db.save_message(session_id, "assistant", content, event_type="error")
-            publish(agent_event("error", {"message": content}, session_id=session_id, run_id=run_id))
+            content = self._format_llm_error(exc)
+            self._publish_final_error(content, publish, session_id, run_id)
 
         publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
         return events
@@ -334,14 +347,20 @@ class AgentCore:
         self._publish_stage_end_if_needed(tool_name, result, publish, session_id, run_id)
 
         if tool_name == "execute_gis_code" and not result.get("success", True):
-            retry_result = self._retry_failed_code_execution(
-                session_id=session_id,
-                failed_arguments=arguments,
-                failed_result=result,
-                tool_registry=tool_registry,
-                publish=publish,
-                run_id=run_id,
-            )
+            try:
+                retry_result = self._retry_failed_code_execution(
+                    session_id=session_id,
+                    failed_arguments=arguments,
+                    failed_result=result,
+                    tool_registry=tool_registry,
+                    publish=publish,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                content = self._format_llm_error(exc)
+                self._publish_final_error(content, publish, session_id, run_id)
+                publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
+                return events
             if retry_result is not None:
                 result = retry_result
 
@@ -423,6 +442,76 @@ class AgentCore:
                 )
             )
 
+    def _chat_with_retries(
+        self,
+        *,
+        system: str,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+        publish: EventCallback | None = None,
+        session_id: str = "",
+        run_id: str = "",
+    ):
+        last_exc: Exception | None = None
+        for attempt in range(1, self.llm_retry_attempts + 1):
+            if self.should_cancel():
+                raise RuntimeError("任务已停止。")
+            try:
+                return self.llm_provider.chat(system=system, messages=messages, tools=tools)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.llm_retry_attempts:
+                    break
+                message = (
+                    "LLM 提供商调用失败，正在重试"
+                    f"（第 {attempt + 1}/{self.llm_retry_attempts} 次）：{self._short_error(exc)}"
+                )
+                if publish is not None:
+                    self._save_process_message(session_id, message)
+                    publish(agent_event("thinking", {"message": message}, session_id=session_id, run_id=run_id))
+                if self.llm_retry_delay_seconds > 0:
+                    time.sleep(self.llm_retry_delay_seconds * attempt)
+        reason = self._short_error(last_exc) if last_exc is not None else "未知错误"
+        raise RuntimeError(f"LLM 调用失败，已重试 {self.llm_retry_attempts} 次：{reason}") from last_exc
+
+    def _format_llm_error(self, exc: Exception) -> str:
+        return (
+            "Agent 暂时无法从 LLM 提供商获得响应。\n"
+            f"错误原因：{self._short_error(exc)}\n"
+            "已自动重试多次仍失败，请检查模型服务地址、模型名、网络连接和超时时间后再试。"
+        )
+
+    def _publish_final_error(
+        self,
+        content: str,
+        publish: EventCallback,
+        session_id: str,
+        run_id: str,
+    ) -> None:
+        self.session_db.save_message(session_id, "assistant", content, event_type="error")
+        self._publish_message_deltas(
+            content,
+            publish=publish,
+            session_id=session_id,
+            run_id=run_id,
+            model=self.llm_provider.model,
+        )
+        publish(
+            agent_event(
+                "message",
+                {"role": "assistant", "content": content, "model": self.llm_provider.model},
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
+        publish(agent_event("error", {"message": content}, session_id=session_id, run_id=run_id))
+
+    def _short_error(self, exc: Exception | None) -> str:
+        if exc is None:
+            return "未知错误"
+        text = str(exc).strip() or exc.__class__.__name__
+        return text[-1000:]
+
     def _format_tool_failure(self, tool_name: str, result: dict[str, Any]) -> str:
         lines = [f"工具 `{tool_name}` 执行失败：{result.get('error') or '未知错误'}"]
         if tool_name == "execute_gis_code":
@@ -487,10 +576,13 @@ class AgentCore:
                 session_id,
                 f"代码执行失败，正在反馈错误并重新生成代码（第 {retry_index} 次）",
             )
-            response = self.llm_provider.chat(
+            response = self._chat_with_retries(
                 system=system_prompt,
                 messages=messages,
                 tools=tool_registry.definitions_for_skill("gis-pipeline"),
+                publish=publish,
+                session_id=session_id,
+                run_id=run_id,
             )
             if not response.tool_calls:
                 if response.content:

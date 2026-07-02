@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import sys
 import types
@@ -205,6 +204,21 @@ class SequentialToolProvider:
                 ],
             )
         return ChatResponse(content="已完成。", model=self.model)
+
+
+class FlakyLLMProvider:
+    name = "flaky-llm-test"
+    model = "flaky-llm-test-model"
+
+    def __init__(self, fail_times: int):
+        self.calls = 0
+        self.fail_times = fail_times
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise TimeoutError("timed out")
+        return ChatResponse(content="模型已恢复。", model=self.model)
 
 
 class QVariantLike:
@@ -738,4 +752,50 @@ def test_tool_registry_converts_qvariant_like_results_to_json_safe_values():
     result, _ = registry.execute("qvariant_result", {})
 
     assert result["sample_features"] == [{"name": "公园", "empty": None}]
-    json.dumps(result, ensure_ascii=False)
+
+
+def test_agent_core_retries_llm_provider_failures(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="llm retry", model="flaky", source="test")
+    provider = FlakyLLMProvider(fail_times=2)
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        llm_retry_delay_seconds=0,
+    ).run(session_id=session.id, user_message="你好")
+
+    assert provider.calls == 3
+    retry_messages = [
+        event["payload"]["message"]
+        for event in events
+        if event["type"] == "thinking" and "LLM 提供商调用失败，正在重试" in event["payload"]["message"]
+    ]
+    assert len(retry_messages) == 2
+    final_message = next(event for event in reversed(events) if event["type"] == "message")
+    assert final_message["payload"]["content"] == "模型已恢复。"
+
+
+def test_agent_core_returns_agent_message_after_llm_retries_exhausted(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="llm exhausted", model="flaky", source="test")
+    provider = FlakyLLMProvider(fail_times=10)
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        llm_retry_delay_seconds=0,
+    ).run(session_id=session.id, user_message="你好")
+
+    assert provider.calls == 3
+    final_message = next(event for event in reversed(events) if event["type"] == "message")
+    assert "Agent 暂时无法从 LLM 提供商获得响应" in final_message["payload"]["content"]
+    assert "LLM 调用失败，已重试 3 次" in final_message["payload"]["content"]
+    assert any(event["type"] == "message_delta" for event in events)
+    assert events[-1]["type"] == "complete"
+
+    saved = session_db.get_messages(session.id, limit=10)
+    assert saved[-1]["event_type"] == "error"
+    assert "timed out" in saved[-1]["content"]
