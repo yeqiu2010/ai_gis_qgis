@@ -25,10 +25,19 @@ const settingsSaving = ref(false)
 const settingsMessage = ref('')
 const settings = ref<AppSettings | null>(null)
 const settingsForm = ref({
+  provider: 'openai_compatible',
   base_url: '',
   model: '',
-  api_key: ''
+  api_key: '',
+  temperature: 0.1,
+  max_tokens: 4096
 })
+const providerOptions = [
+  { value: 'openai_compatible', label: 'OpenAI Compatible' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'ollama', label: 'Ollama' },
+  { value: 'echo', label: 'Echo（离线测试）' }
+]
 
 const { status, request } = useBridge((event) => {
   if (event.type === 'run_start') {
@@ -203,9 +212,12 @@ async function loadSettings() {
   const loaded = await request<AppSettings>('getSettings')
   settings.value = loaded
   settingsForm.value = {
+    provider: loaded.llm?.provider || 'openai_compatible',
     base_url: loaded.llm?.base_url || '',
     model: loaded.llm?.model || '',
-    api_key: loaded.llm?.api_key || ''
+    api_key: loaded.llm?.api_key || '',
+    temperature: Number(loaded.llm?.temperature ?? 0.1),
+    max_tokens: Number(loaded.llm?.max_tokens ?? 4096)
   }
 }
 
@@ -224,17 +236,22 @@ async function saveSettings() {
       ...current,
       llm: {
         ...(current.llm || {}),
-        provider: 'openai_compatible',
+        provider: settingsForm.value.provider,
         base_url: settingsForm.value.base_url.trim(),
         model: settingsForm.value.model.trim(),
-        api_key: settingsForm.value.api_key.trim()
+        api_key: settingsForm.value.api_key.trim(),
+        temperature: Number(settingsForm.value.temperature),
+        max_tokens: Number(settingsForm.value.max_tokens)
       }
     })
     settings.value = saved
     settingsForm.value = {
+      provider: saved.llm?.provider || 'openai_compatible',
       base_url: saved.llm?.base_url || '',
       model: saved.llm?.model || '',
-      api_key: saved.llm?.api_key || ''
+      api_key: saved.llm?.api_key || '',
+      temperature: Number(saved.llm?.temperature ?? 0.1),
+      max_tokens: Number(saved.llm?.max_tokens ?? 4096)
     }
     settingsMessage.value = '设置已保存。'
   } finally {
@@ -472,6 +489,18 @@ async function waitForPaint() {
         <button type="button" class="icon-action" title="关闭设置" @click="settingsOpen = false">×</button>
       </header>
       <label>
+        <span>提供商</span>
+        <select v-model="settingsForm.provider">
+          <option
+            v-for="option in providerOptions"
+            :key="option.value"
+            :value="option.value"
+          >
+            {{ option.label }}
+          </option>
+        </select>
+      </label>
+      <label>
         <span>Base URL</span>
         <input v-model="settingsForm.base_url" type="text" placeholder="http://10.0.19.214:11430/v1" />
       </label>
@@ -483,6 +512,28 @@ async function waitForPaint() {
         <span>API Key</span>
         <input v-model="settingsForm.api_key" type="password" placeholder="本地 Ollama 可留空" />
       </label>
+      <div class="settings-grid">
+        <label>
+          <span>Temperature</span>
+          <input
+            v-model.number="settingsForm.temperature"
+            type="number"
+            min="0"
+            max="2"
+            step="0.1"
+          />
+        </label>
+        <label>
+          <span>Max Tokens</span>
+          <input
+            v-model.number="settingsForm.max_tokens"
+            type="number"
+            min="256"
+            max="200000"
+            step="512"
+          />
+        </label>
+      </div>
       <footer>
         <p>{{ settingsMessage }}</p>
         <button type="button" class="secondary-action" @click="settingsOpen = false">取消</button>

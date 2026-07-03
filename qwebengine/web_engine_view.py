@@ -13,10 +13,17 @@ try:
     from qgis.PyQt.QtGui import QTextCursor
     from qgis.PyQt.QtWidgets import (
         QApplication,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QDoubleSpinBox,
+        QFormLayout,
         QHBoxLayout,
         QLabel,
+        QLineEdit,
         QMessageBox,
         QPushButton,
+        QSpinBox,
         QTextBrowser,
         QTextEdit,
         QVBoxLayout,
@@ -30,9 +37,16 @@ except Exception:  # pragma: no cover - QGIS supplies these modules at runtime.
     pyqtSlot = None
     QHBoxLayout = None
     QLabel = None
+    QComboBox = None
+    QDialog = None
+    QDialogButtonBox = None
+    QDoubleSpinBox = None
+    QFormLayout = None
+    QLineEdit = None
     QMessageBox = None
     QApplication = None
     QPushButton = None
+    QSpinBox = None
     QTextBrowser = None
     QTextEdit = None
     QVBoxLayout = None
@@ -261,8 +275,10 @@ else:
 
             button_row = QHBoxLayout()
             self.new_button = QPushButton("新建会话", self)
+            self.settings_button = QPushButton("设置", self)
             self.send_button = QPushButton("发送", self)
             button_row.addWidget(self.new_button)
+            button_row.addWidget(self.settings_button)
             button_row.addStretch(1)
             button_row.addWidget(self.send_button)
 
@@ -273,6 +289,7 @@ else:
             layout.addLayout(button_row)
 
             self.new_button.clicked.connect(self._create_session)
+            self.settings_button.clicked.connect(self._open_settings_dialog)
             self.send_button.clicked.connect(self._send_message)
 
         def _bootstrap_session(self):
@@ -299,6 +316,108 @@ else:
                 self._append_system("新会话已创建。")
             except Exception as exc:
                 self._append_system(f"创建会话失败：{exc}")
+
+        def _open_settings_dialog(self):
+            if QDialog is None:
+                self._append_system("当前 Qt 环境不支持设置对话框。")
+                return
+            try:
+                current = self.controller.get_settings({})
+            except Exception as exc:
+                self._append_system(f"读取设置失败：{exc}")
+                return
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("模型设置")
+            dialog_layout = QVBoxLayout(dialog)
+            form = QFormLayout()
+
+            llm = dict(current.get("llm") or {})
+            provider_box = QComboBox(dialog)
+            provider_box.addItems(["openai_compatible", "openai", "ollama", "echo"])
+            provider = str(llm.get("provider") or "openai_compatible")
+            index = provider_box.findText(provider)
+            if index >= 0:
+                provider_box.setCurrentIndex(index)
+
+            model_input = QLineEdit(dialog)
+            model_input.setText(str(llm.get("model") or ""))
+            model_input.setPlaceholderText("例如 gemma-4-31B-it-Q4:latest")
+
+            base_url_input = QLineEdit(dialog)
+            base_url_input.setText(str(llm.get("base_url") or ""))
+            base_url_input.setPlaceholderText("例如 http://10.0.19.214:11430/v1")
+
+            api_key_input = QLineEdit(dialog)
+            api_key_input.setText(str(llm.get("api_key") or ""))
+            api_key_input.setPlaceholderText("本地 Ollama 可留空；留空表示不修改已有密钥")
+            if hasattr(QLineEdit, "EchoMode"):
+                api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+            elif hasattr(QLineEdit, "Password"):
+                api_key_input.setEchoMode(QLineEdit.Password)
+
+            temperature_input = QDoubleSpinBox(dialog)
+            temperature_input.setRange(0.0, 2.0)
+            temperature_input.setSingleStep(0.1)
+            temperature_input.setDecimals(2)
+            temperature_input.setValue(float(llm.get("temperature") or 0.1))
+
+            max_tokens_input = QSpinBox(dialog)
+            max_tokens_input.setRange(256, 200000)
+            max_tokens_input.setSingleStep(512)
+            max_tokens_input.setValue(int(llm.get("max_tokens") or 4096))
+
+            form.addRow("提供商", provider_box)
+            form.addRow("模型名", model_input)
+            form.addRow("Base URL", base_url_input)
+            form.addRow("API Key", api_key_input)
+            form.addRow("Temperature", temperature_input)
+            form.addRow("Max Tokens", max_tokens_input)
+            dialog_layout.addLayout(form)
+
+            if hasattr(QDialogButtonBox, "StandardButton"):
+                save_button = QDialogButtonBox.StandardButton.Save
+                cancel_button = QDialogButtonBox.StandardButton.Cancel
+            else:
+                save_button = QDialogButtonBox.Save
+                cancel_button = QDialogButtonBox.Cancel
+            buttons = QDialogButtonBox(save_button | cancel_button, dialog)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            dialog_layout.addWidget(buttons)
+
+            exec_method = getattr(dialog, "exec", None) or getattr(dialog, "exec_", None)
+            if hasattr(QDialog, "DialogCode"):
+                accepted_value = QDialog.DialogCode.Accepted
+            else:
+                accepted_value = QDialog.Accepted
+            if exec_method is None or exec_method() != accepted_value:
+                return
+
+            updated = dict(current)
+            updated_llm = dict(updated.get("llm") or {})
+            updated_llm.update(
+                {
+                    "provider": provider_box.currentText().strip(),
+                    "model": model_input.text().strip(),
+                    "base_url": base_url_input.text().strip(),
+                    "api_key": api_key_input.text().strip(),
+                    "temperature": temperature_input.value(),
+                    "max_tokens": max_tokens_input.value(),
+                }
+            )
+            updated["llm"] = updated_llm
+
+            try:
+                saved = self.controller.save_settings(updated)
+                saved_llm = saved.get("llm") or {}
+                self._append_system(
+                    "模型设置已保存。"
+                    f"当前提供商：{saved_llm.get('provider') or ''}，"
+                    f"模型：{saved_llm.get('model') or '未设置'}"
+                )
+            except Exception as exc:
+                self._append_system(f"保存设置失败：{exc}")
 
         def _load_messages(self):
             if not self.session_id:
