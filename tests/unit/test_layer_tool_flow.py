@@ -221,6 +221,19 @@ class FlakyLLMProvider:
         return ChatResponse(content="模型已恢复。", model=self.model)
 
 
+class SingleToolProvider:
+    name = "single-tool-test"
+    model = "single-tool-test-model"
+
+    def chat(self, system, messages, tools=None):
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[ToolCall(id="call-1", name="list_layers", arguments={})],
+        )
+
+
 class QVariantLike:
     __module__ = "qgis.PyQt.QtCore"
 
@@ -799,3 +812,31 @@ def test_agent_core_returns_agent_message_after_llm_retries_exhausted(tmp_path: 
     saved = session_db.get_messages(session.id, limit=10)
     assert saved[-1]["event_type"] == "error"
     assert "timed out" in saved[-1]["content"]
+
+
+def test_agent_core_stops_after_tool_returns_without_publishing_stale_result(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="cancel after tool", model="single-tool", source="test")
+    cancel_checks = 0
+
+    def should_cancel():
+        nonlocal cancel_checks
+        cancel_checks += 1
+        return cancel_checks >= 6
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=SingleToolProvider(),
+        iface=None,
+        should_cancel=should_cancel,
+    ).run(session_id=session.id, user_message="列出图层")
+
+    event_types = [event["type"] for event in events]
+    assert "tool_start" in event_types
+    assert "tool_end" not in event_types
+    assert event_types[-2:] == ["message", "complete"]
+    assert events[-2]["payload"]["content"] == "任务已停止。"
+
+    saved = session_db.get_messages(session.id, limit=20)
+    assert saved[-1]["content"] == "任务已停止。"
+    assert not any(message["content"].startswith("工具完成：") for message in saved)

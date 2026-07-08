@@ -108,6 +108,8 @@ class AgentCore:
                     session_id=session_id,
                     run_id=run_id,
                 )
+                if check_cancelled():
+                    return events
                 budget.record_iteration()
                 if not response.tool_calls:
                     break
@@ -176,6 +178,8 @@ class AgentCore:
                     self._save_process_message(session_id, f"调用工具：{call.name}")
                     self._publish_stage_start_if_needed(call.name, call.arguments, publish, session_id, run_id)
                     result, duration_ms = tool_registry.execute(call.name, call.arguments)
+                    if check_cancelled():
+                        return events
                     if call.name == "set_active_skill" and result.get("success"):
                         active_skill = str(result.get("active_skill") or active_skill)
                         system_prompt = self.prompt_builder.build(active_skill, qgis_context)
@@ -222,6 +226,8 @@ class AgentCore:
                     session_id=session_id,
                     run_id=run_id,
                 )
+                if check_cancelled():
+                    return events
             elif response.tool_calls and budget.exhausted:
                 response = type(response)(
                     content="任务未完成：已达到本轮工具调用预算。请缩小任务范围或补充更明确的图层、字段和输出要求后重试。",
@@ -230,6 +236,8 @@ class AgentCore:
                     tool_calls=[],
                 )
 
+            if check_cancelled():
+                return events
             self.session_db.save_message(
                 session_id,
                 "assistant",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ class RPCController:
         self.session_db = SessionDB(self.config["database"]["path"])
         self.main_thread_executor = MainThreadExecutor()
         self._run_lock = threading.Lock()
-        self._active_runs: set[str] = set()
+        self._active_runs: dict[str, str] = {}
         self._cancelled_runs: set[str] = set()
         self.agent_core = self._create_agent_core()
         self._workers: list[threading.Thread] = []
@@ -108,8 +109,10 @@ class RPCController:
     def cancel_run(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(params)
         with self._run_lock:
-            active = session_id in self._active_runs
-            self._cancelled_runs.add(session_id)
+            active_run_id = self._active_runs.get(session_id)
+            active = active_run_id is not None
+            if active_run_id is not None:
+                self._cancelled_runs.add(active_run_id)
         self._emit(agent_event("complete", {"cancelled": True}, session_id=session_id))
         return {"accepted": True, "session_id": session_id, "active": active, "cancelled": True}
 
@@ -131,29 +134,44 @@ class RPCController:
         worker.start()
 
     def _run_chat(self, session_id: str, message: str, qgis_context: QGISContext) -> None:
+        controller_run_id = str(uuid.uuid4())
         with self._run_lock:
-            self._active_runs.add(session_id)
-            self._cancelled_runs.discard(session_id)
+            previous_run_id = self._active_runs.get(session_id)
+            if previous_run_id is not None:
+                self._cancelled_runs.add(previous_run_id)
+            self._active_runs[session_id] = controller_run_id
+            self._cancelled_runs.discard(controller_run_id)
+
+        def emit_current_run(event: dict[str, Any]) -> None:
+            self._emit_for_run(event, session_id, controller_run_id)
+
         try:
-            self._create_agent_core(session_id).run(
+            self._create_agent_core(controller_run_id).run(
                 session_id=session_id,
                 user_message=message,
-                emit=self._emit,
+                emit=emit_current_run,
                 qgis_context=qgis_context,
             )
         except Exception as exc:
-            self._emit(
+            self._emit_for_run(
                 agent_event(
                     "error",
                     {"message": f"后台对话执行失败：{exc}"},
                     session_id=session_id,
-                )
+                ),
+                session_id,
+                controller_run_id,
             )
-            self._emit(agent_event("complete", {}, session_id=session_id))
+            self._emit_for_run(
+                agent_event("complete", {}, session_id=session_id),
+                session_id,
+                controller_run_id,
+            )
         finally:
             with self._run_lock:
-                self._active_runs.discard(session_id)
-                self._cancelled_runs.discard(session_id)
+                if self._active_runs.get(session_id) == controller_run_id:
+                    self._active_runs.pop(session_id, None)
+                self._cancelled_runs.discard(controller_run_id)
 
     def _run_confirm_tool_call(
         self,
@@ -179,31 +197,36 @@ class RPCController:
             self._emit(agent_event("complete", {}, session_id=session_id))
 
     def _emit(self, event: dict[str, Any]) -> None:
-        session_id = event.get("session_id")
-        if (
-            isinstance(session_id, str)
-            and self._is_cancelled_session(session_id)
-            and event.get("type") != "complete"
-        ):
-            return
         if self.bridge is not None:
             self.bridge.emit_event(event)
 
-    def _create_agent_core(self, session_id: str | None = None) -> AgentCore:
+    def _emit_for_run(self, event: dict[str, Any], session_id: str, run_id: str) -> None:
+        if not self._should_emit_for_run(session_id, run_id):
+            return
+        self._emit(event)
+
+    def _should_emit_for_run(self, session_id: str, run_id: str) -> bool:
+        with self._run_lock:
+            return (
+                self._active_runs.get(session_id) == run_id
+                and run_id not in self._cancelled_runs
+            )
+
+    def _is_cancelled_run(self, run_id: str | None) -> bool:
+        if not run_id:
+            return False
+        with self._run_lock:
+            return run_id in self._cancelled_runs
+
+    def _create_agent_core(self, cancellable_run_id: str | None = None) -> AgentCore:
         return AgentCore(
             session_db=self.session_db,
             llm_provider=create_provider(self.config),
             iface=self.iface,
             qgis_executor=self.main_thread_executor.run,
             executor_config=self.config.get("executor") or {},
-            should_cancel=lambda: self._is_cancelled_session(session_id),
+            should_cancel=lambda: self._is_cancelled_run(cancellable_run_id),
         )
-
-    def _is_cancelled_session(self, session_id: str | None) -> bool:
-        if not session_id:
-            return False
-        with self._run_lock:
-            return session_id in self._cancelled_runs
 
     def _require_session_id(self, params: dict[str, Any]) -> str:
         session_id = str(params.get("session_id") or "").strip()
