@@ -11,6 +11,7 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "temperature": 0.1,
         "max_tokens": 4096,
+        "max_context_tokens": 32768,
     },
     "database": {
         "path": "~/.qgis_hermes_agent/state.db",

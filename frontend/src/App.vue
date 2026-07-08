@@ -30,7 +30,8 @@ const settingsForm = ref({
   model: '',
   api_key: '',
   temperature: 0.1,
-  max_tokens: 4096
+  max_tokens: 4096,
+  max_context_tokens: 32768
 })
 const providerOptions = [
   { value: 'openai_compatible', label: 'OpenAI Compatible' },
@@ -217,7 +218,8 @@ async function loadSettings() {
     model: loaded.llm?.model || '',
     api_key: loaded.llm?.api_key || '',
     temperature: Number(loaded.llm?.temperature ?? 0.1),
-    max_tokens: Number(loaded.llm?.max_tokens ?? 4096)
+    max_tokens: Number(loaded.llm?.max_tokens ?? 4096),
+    max_context_tokens: Number(loaded.llm?.max_context_tokens ?? 32768)
   }
 }
 
@@ -241,7 +243,8 @@ async function saveSettings() {
         model: settingsForm.value.model.trim(),
         api_key: settingsForm.value.api_key.trim(),
         temperature: Number(settingsForm.value.temperature),
-        max_tokens: Number(settingsForm.value.max_tokens)
+        max_tokens: Number(settingsForm.value.max_tokens),
+        max_context_tokens: Number(settingsForm.value.max_context_tokens)
       }
     })
     settings.value = saved
@@ -251,7 +254,8 @@ async function saveSettings() {
       model: saved.llm?.model || '',
       api_key: saved.llm?.api_key || '',
       temperature: Number(saved.llm?.temperature ?? 0.1),
-      max_tokens: Number(saved.llm?.max_tokens ?? 4096)
+      max_tokens: Number(saved.llm?.max_tokens ?? 4096),
+      max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768)
     }
     settingsMessage.value = '设置已保存。'
   } finally {
@@ -531,6 +535,16 @@ async function waitForPaint() {
             min="256"
             max="200000"
             step="512"
+          />
+        </label>
+        <label>
+          <span>Context Window</span>
+          <input
+            v-model.number="settingsForm.max_context_tokens"
+            type="number"
+            min="4096"
+            max="1000000"
+            step="4096"
           />
         </label>
       </div>

@@ -25,5 +25,6 @@ def create_provider(config: dict[str, Any] | None = None) -> LLMProvider:
             api_key=llm_config.get("api_key") or None,
             temperature=float(llm_config.get("temperature", 0.1)),
             max_tokens=int(llm_config.get("max_tokens", 4096)),
+            max_context_tokens=int(llm_config.get("max_context_tokens", 32768)),
         )
     return EchoProvider()

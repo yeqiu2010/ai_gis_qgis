@@ -79,6 +79,7 @@ export interface AppSettings {
     api_key?: string
     temperature?: number
     max_tokens?: number
+    max_context_tokens?: number
   }
   database?: Record<string, unknown>
   executor?: Record<string, unknown>

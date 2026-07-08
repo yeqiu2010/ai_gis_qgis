@@ -367,12 +367,18 @@ else:
             max_tokens_input.setSingleStep(512)
             max_tokens_input.setValue(int(llm.get("max_tokens") or 4096))
 
+            max_context_tokens_input = QSpinBox(dialog)
+            max_context_tokens_input.setRange(4096, 1000000)
+            max_context_tokens_input.setSingleStep(4096)
+            max_context_tokens_input.setValue(int(llm.get("max_context_tokens") or 32768))
+
             form.addRow("提供商", provider_box)
             form.addRow("模型名", model_input)
             form.addRow("Base URL", base_url_input)
             form.addRow("API Key", api_key_input)
             form.addRow("Temperature", temperature_input)
             form.addRow("Max Tokens", max_tokens_input)
+            form.addRow("Context Window", max_context_tokens_input)
             dialog_layout.addLayout(form)
 
             if hasattr(QDialogButtonBox, "StandardButton"):
@@ -404,6 +410,7 @@ else:
                     "api_key": api_key_input.text().strip(),
                     "temperature": temperature_input.value(),
                     "max_tokens": max_tokens_input.value(),
+                    "max_context_tokens": max_context_tokens_input.value(),
                 }
             )
             updated["llm"] = updated_llm
