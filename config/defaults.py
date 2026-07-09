@@ -23,6 +23,10 @@ DEFAULT_CONFIG = {
         "max_memory_mb": 2048,
         "workspace_dir": "~/.qgis_hermes_agent/workspaces",
     },
+    "skills": {
+        "custom_skills_dir": "~/.qgis_hermes_agent/custom_skills",
+        "custom_tools_dir": "~/.qgis_hermes_agent/custom_tools",
+    },
     "ui": {
         "panel_width": 420,
         "theme": "auto",

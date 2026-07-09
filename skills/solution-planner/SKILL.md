@@ -2,8 +2,11 @@
 name: solution-planner
 description: GIS 处理方案规划
 tools:
+  - search_qgis_toolbox_domains
+  - search_qgis_processing_tools
+  - get_qgis_processing_tool
   - record_pipeline_stage
-version: 1.1.0
+version: 2.0.0
 tags: [gis, pipeline, plan]
 ---
 
@@ -21,11 +24,16 @@ tags: [gis, pipeline, plan]
 - `risks`：字段缺失、字段取值不确定、CRS 单位、空结果、Shapefile 字段名限制等。
 - `fallbacks`：字段或取值不匹配时的回退策略。
 - `summary`：可执行方案摘要。
+- `retrieval_queries`：覆盖全部操作的一组中英文标准 GIS 查询。
+- `algorithm_evidence`：每个最终算法对应的 Catalog 描述、参数依据和选择理由。
 
 ## 规划规则
 
 - 涉及距离/面积时必须说明投影 CRS 策略：若图层 CRS 为地理坐标系，应先重投影到合适的米制 CRS，再缓冲。
 - 多步骤任务必须明确每一步输入、输出和算法；不要直接写“生成代码完成全部操作”。
+- 先完成全部步骤规划，再只调用一次 `search_qgis_processing_tools`；禁止按步骤反复搜索。
+- 用一次 `get_qgis_processing_tool.tool_ids` 批量读取候选详情。未读取详情的算法不得进入最终方案。
+- 本阶段只选择算法，不执行 Processing。
 - 最终输出文件必须在 `final_outputs` 中列出，例如 `500m.shp`。
 - 如果“政府办公”“公园”等业务概念无法通过字段或样例判断，应在 `risks` 中说明，并优先使用 `inspect_layer` 结果中的真实字段和值。
 - 如果风险不可接受，先询问用户，不继续生成代码。

@@ -14,6 +14,7 @@ PIPELINE_STAGES = [
     "generated_code",
     "execution_result",
 ]
+PIPELINE_CYCLE_STATE_SUFFIX = "pipeline_cycle_start"
 
 
 def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> ToolEntry:
@@ -30,6 +31,26 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
                 "error": f"stage_name 必须是以下之一：{', '.join(PIPELINE_STAGES)}",
             }
         summary = str(arguments.get("summary") or artifact.get("summary") or "").strip()
+        if not summary:
+            return {"success": False, "error": f"{stage_name} 阶段必须提供非空 summary。"}
+        expected_stage = next_pipeline_stage(session_db, session_id)
+        if stage_name != expected_stage:
+            return {
+                "success": False,
+                "error": (
+                    f"Pipeline 阶段顺序错误：当前必须记录 {expected_stage}，"
+                    f"不能记录 {stage_name}。"
+                ),
+                "expected_stage": expected_stage,
+                "received_stage": stage_name,
+            }
+        validation_error = _validate_stage_artifact(stage_name, artifact)
+        if validation_error:
+            return {
+                "success": False,
+                "error": validation_error,
+                "expected_stage": expected_stage,
+            }
         message_id = session_db.log_stage_artifact(
             session_id,
             stage_name=stage_name,
@@ -100,12 +121,63 @@ def _normalize_stage_name(stage_name: str) -> str:
 
 
 def _infer_stage_name(session_db: SessionDB, session_id: str, artifact: dict[str, Any]) -> str:
-    if artifact.get("code") or artifact.get("expected_outputs") or artifact.get("review"):
-        return "generated_code"
-    if artifact.get("stdout") or artifact.get("stderr") or artifact.get("outputs"):
-        return "execution_result"
-    recorded = session_db.list_pipeline_stage_names(session_id)
-    for stage_name in PIPELINE_STAGES:
-        if stage_name not in recorded:
-            return stage_name
-    return PIPELINE_STAGES[-1]
+    return next_pipeline_stage(session_db, session_id)
+
+
+def next_pipeline_stage(session_db: SessionDB, session_id: str) -> str:
+    current_cycle = _current_pipeline_cycle(session_db, session_id)
+    if current_cycle == PIPELINE_STAGES:
+        return PIPELINE_STAGES[0]
+    if not current_cycle:
+        return PIPELINE_STAGES[0]
+    return PIPELINE_STAGES[len(current_cycle)]
+
+
+def current_pipeline_cycle(session_db: SessionDB, session_id: str) -> list[str]:
+    return list(_current_pipeline_cycle(session_db, session_id))
+
+
+def start_pipeline_cycle(session_db: SessionDB, session_id: str) -> None:
+    stage_count = len(session_db.list_pipeline_stage_names(session_id))
+    session_db.set_state(
+        f"{session_id}:{PIPELINE_CYCLE_STATE_SUFFIX}",
+        str(stage_count),
+    )
+
+
+def _current_pipeline_cycle(session_db: SessionDB, session_id: str) -> list[str]:
+    current_cycle: list[str] = []
+    recorded_stages = session_db.list_pipeline_stage_names(session_id)
+    raw_start = session_db.get_state(f"{session_id}:{PIPELINE_CYCLE_STATE_SUFFIX}")
+    try:
+        start_index = max(0, min(int(raw_start or 0), len(recorded_stages)))
+    except ValueError:
+        start_index = 0
+    for stage_name in recorded_stages[start_index:]:
+        if not current_cycle and stage_name == PIPELINE_STAGES[0]:
+            current_cycle = [stage_name]
+        elif current_cycle == PIPELINE_STAGES and stage_name == PIPELINE_STAGES[0]:
+            current_cycle = [stage_name]
+        elif (
+            current_cycle
+            and len(current_cycle) < len(PIPELINE_STAGES)
+            and stage_name == PIPELINE_STAGES[len(current_cycle)]
+        ):
+            current_cycle.append(stage_name)
+    return current_cycle
+
+
+def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str | None:
+    if stage_name == "generated_code":
+        if not str(artifact.get("code") or "").strip():
+            return "generated_code 阶段缺少非空 code。"
+        if not isinstance(artifact.get("expected_outputs"), list) or not artifact["expected_outputs"]:
+            return "generated_code 阶段缺少 expected_outputs。"
+        review = artifact.get("review")
+        if not isinstance(review, dict):
+            return "generated_code 阶段缺少 review。"
+    if stage_name == "execution_result" and not any(
+        key in artifact for key in ("stdout", "stderr", "outputs", "error", "success")
+    ):
+        return "execution_result 必须包含真实执行结果：success、stdout、stderr、outputs 或 error。"
+    return None

@@ -154,13 +154,41 @@ class PipelineStageProvider:
                             "artifact": {
                                 "summary": "已生成测试代码。",
                                 "code": "print('ok')",
-                                "expected_outputs": [],
+                                "expected_outputs": [
+                                    {"path": "result.txt", "name": "result", "type": "file"}
+                                ],
+                                "review": {"passed": True},
                             },
                         },
                     )
                 ],
             )
         return ChatResponse(content="Pipeline 阶段已记录。", model=self.model)
+
+
+class SwitchPipelineProvider:
+    name = "switch-pipeline-test"
+    model = "switch-pipeline-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="switch-pipeline",
+                        name="set_active_skill",
+                        arguments={"skill_name": "gis-pipeline"},
+                    )
+                ],
+            )
+        return ChatResponse(content="等待开始数据盘点。", model=self.model)
 
 
 class SequentialToolProvider:
@@ -262,7 +290,8 @@ def test_agent_core_registers_and_executes_layer_tools(tmp_path: Path):
     assert "inspect_layers" in provider.first_call_tools
     assert "load_layer" in provider.first_call_tools
     assert "remove_layer" in provider.first_call_tools
-    assert "execute_gis_code" in provider.first_call_tools
+    assert "execute_gis_code" not in provider.first_call_tools
+    assert "search_skills" in provider.first_call_tools
     event_types = [event["type"] for event in events]
     assert event_types[:4] == [
         "run_start",
@@ -658,6 +687,9 @@ def test_prompt_builder_composes_pipeline_includes():
     assert "Included Skill: data-overview" in prompt
     assert "Included Skill: code-reviewer" in prompt
     assert "record_pipeline_stage" in prompt
+    assert "search_qgis_processing_tools" in prompt
+    assert "get_qgis_processing_tool" in prompt
+    assert "只调用一次 `execute_gis_code`" in prompt
     assert "推荐模板：按属性筛选并输出 GeoJSON" in prompt
     assert "native:extractbyexpression" in prompt
     assert "不允许在 `data_overview`、`structured_query`、`solution_plan`、`generated_code` 四个阶段完成之前调用 `execute_gis_code`" in prompt
@@ -671,12 +703,13 @@ def test_prompt_builder_routes_complex_analysis_to_pipeline():
         QGISContext(project_path="", layer_count=1, layers=[{"name": "建筑物"}]),
     )
 
-    assert "复杂 GIS 分析任务必须先切换到 gis-pipeline" in prompt
+    assert "两个及以上步骤" in prompt
+    assert "必须切换到 gis-pipeline" in prompt
     assert "优先一次调用 inspect_layers" in prompt
     assert "QGIS_AGENT_WORKSPACE 是 execute_gis_code 执行器注入的运行时变量" in prompt
     assert "不要询问保存文件夹" in prompt
     assert "分析结果默认输出到该工作目录" in prompt
-    assert "{\"skill_name\":\"gis-pipeline\"}" in prompt
+    assert "{\"skill_name\":\"qgis-toolbox\"}" in prompt
     assert "不要在 main-orchestrator 中直接调用 execute_gis_code" in prompt
     assert "500m.shp" in prompt
 
@@ -684,6 +717,13 @@ def test_prompt_builder_routes_complex_analysis_to_pipeline():
 def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="pipeline", model="pipeline-stage-test-model", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
 
     events = AgentCore(session_db=session_db, llm_provider=PipelineStageProvider(), iface=None).run(
         session_id=session.id,
@@ -700,7 +740,8 @@ def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
 
     with sqlite3.connect(tmp_path / "state.db") as connection:
         row = connection.execute(
-            "SELECT stage_name, stage_artifact FROM messages WHERE event_type = 'stage_artifact'"
+            "SELECT stage_name, stage_artifact FROM messages "
+            "WHERE event_type = 'stage_artifact' ORDER BY id DESC LIMIT 1"
         ).fetchone()
     assert row[0] == "generated_code"
     assert "print('ok')" in row[1]
@@ -720,6 +761,149 @@ def test_record_pipeline_stage_infers_missing_stage_name(tmp_path: Path):
     assert result["success"] is True
     assert result["stage_name"] == "data_overview"
     assert session_db.list_pipeline_stage_names(session.id) == ["data_overview"]
+
+
+def test_record_pipeline_stage_rejects_skipped_or_empty_stage(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="pipeline order", model="test", source="test")
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    skipped = tool.handler(
+        {
+            "stage_name": "execution_result",
+            "summary": "执行完成",
+            "artifact": {"success": True},
+        }
+    )
+    empty = tool.handler(
+        {
+            "stage_name": "data_overview",
+            "artifact": {"available_layers": []},
+        }
+    )
+
+    assert skipped["success"] is False
+    assert skipped["expected_stage"] == "data_overview"
+    assert "顺序错误" in skipped["error"]
+    assert empty["success"] is False
+    assert "summary" in empty["error"]
+    assert session_db.list_pipeline_stage_names(session.id) == []
+
+
+def test_switching_to_pipeline_starts_new_cycle_after_stale_artifacts(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="new pipeline cycle", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": f"旧任务 {stage_name}"},
+            summary=f"旧任务 {stage_name}",
+        )
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=SwitchPipelineProvider(),
+        iface=None,
+    )
+
+    core.run(session_id=session.id, user_message="开始新的复杂分析任务")
+    tool = core._build_tool_registry(session.id).get("record_pipeline_stage")
+    result = tool.handler(
+        {
+            "stage_name": "data_overview",
+            "summary": "新任务数据盘点",
+            "artifact": {"summary": "新任务数据盘点"},
+        }
+    )
+
+    assert result["success"] is True
+    assert result["stage_name"] == "data_overview"
+    assert session_db.list_pipeline_stage_names(session.id) == [
+        "data_overview",
+        "structured_query",
+        "data_overview",
+    ]
+
+
+def test_pipeline_completion_gate_blocks_incomplete_reply_but_allows_questions(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+
+    incomplete = session_db.create_session(title="incomplete", model="test", source="test")
+    session_db.log_stage_artifact(
+        incomplete.id,
+        stage_name="data_overview",
+        artifact={"summary": "数据已检查"},
+        summary="数据已检查",
+    )
+    session_db.log_stage_artifact(
+        incomplete.id,
+        stage_name="structured_query",
+        artifact={"summary": "需求已结构化", "questions": []},
+        summary="需求已结构化",
+    )
+
+    waiting = session_db.create_session(title="waiting", model="test", source="test")
+    session_db.log_stage_artifact(
+        waiting.id,
+        stage_name="data_overview",
+        artifact={"summary": "数据已检查"},
+        summary="数据已检查",
+    )
+    session_db.log_stage_artifact(
+        waiting.id,
+        stage_name="structured_query",
+        artifact={"summary": "需要确认字段", "questions": ["学校类型字段取值是什么？"]},
+        summary="需要确认字段",
+    )
+
+    assert core._pipeline_must_continue(incomplete.id, "gis-pipeline") is True
+    assert core._pipeline_must_continue(waiting.id, "gis-pipeline") is False
+
+
+def test_confirmed_pipeline_execution_records_final_stage(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="pipeline execute", model="test", source="test")
+    session_db.set_state(f"{session.id}:active_skill", "gis-pipeline")
+    for stage_name in ("data_overview", "structured_query", "solution_plan", "generated_code"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=CodeExecutionProvider(),
+        iface=None,
+        executor_config={"workspace_dir": str(tmp_path / "workspaces")},
+    )
+
+    events = core.run(session_id=session.id, user_message="执行已审查脚本")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert session_db.list_pipeline_stage_names(session.id) == [
+        "data_overview",
+        "structured_query",
+        "solution_plan",
+        "generated_code",
+        "execution_result",
+    ]
+    assert session_db.get_state(f"{session.id}:active_skill") == "main-orchestrator"
+    assert any(
+        event["type"] == "stage_end"
+        and event["payload"]["stage_name"] == "execution_result"
+        for event in confirmed_events
+    )
 
 
 def test_agent_core_continues_tool_loop_until_confirmation(tmp_path: Path):

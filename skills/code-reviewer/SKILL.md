@@ -3,7 +3,7 @@ name: code-reviewer
 description: 代码安全和 GIS 正确性审查
 tools:
   - record_pipeline_stage
-version: 1.1.3
+version: 2.0.0
 tags: [gis, pipeline, review]
 ---
 
@@ -26,6 +26,9 @@ tags: [gis, pipeline, review]
 - 使用 `QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback` 但既没有显式导入，也不在当前命名空间说明中；最终输出不能只使用 `QgsProcessing.TEMPORARY_OUTPUT`。
 - 对字段做筛选前没有检查字段是否存在。
 - 任务依赖距离/面积但未说明 CRS 或单位。
+- 使用了未出现在 `solution_plan.algorithm_evidence` 中的算法。
+- `processing.run` 参数名与已读取的算法详情不一致。
+- 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
 
 ## GIS 正确性检查
 

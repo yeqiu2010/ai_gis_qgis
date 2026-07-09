@@ -20,16 +20,21 @@ class SkillDocument:
 
 
 class SkillLoader:
-    def __init__(self, skills_dir: Path | str):
-        self.skills_dir = Path(skills_dir)
+    def __init__(self, skills_dir: Path | str | list[Path | str]):
+        if isinstance(skills_dir, list):
+            self.skills_dirs = [Path(path) for path in skills_dir]
+        else:
+            self.skills_dirs = [Path(skills_dir)]
+        self.skills_dir = self.skills_dirs[0]
 
     def load_all(self) -> dict[str, SkillDocument]:
         documents = {}
-        if not self.skills_dir.exists():
-            return documents
-        for path in sorted(self.skills_dir.glob("*/SKILL.md")):
-            document = self.load(path)
-            documents[document.name] = document
+        for skills_dir in self.skills_dirs:
+            if not skills_dir.exists():
+                continue
+            for path in sorted(skills_dir.glob("*/SKILL.md")):
+                document = self.load(path)
+                documents[document.name] = document
         return documents
 
     def load(self, path: Path) -> SkillDocument:

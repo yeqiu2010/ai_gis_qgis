@@ -3,7 +3,7 @@ name: code-generator
 description: 生成 QGIS 当前环境可执行代码
 tools:
   - record_pipeline_stage
-version: 1.1.5
+version: 2.0.0
 tags: [gis, pipeline, code]
 ---
 
@@ -27,6 +27,10 @@ tags: [gis, pipeline, code]
 - 不得创建 `QgsApplication`、`QApplication`，不得调用 `initQgis`，不得启动新的 QGIS。
 - 不生成网络访问、`subprocess`、`os.system`、`eval`、`exec`、`sys.exit`、删除文件或写工作目录外路径。
 - 记录 `generated_code` artifact：`code`、`expected_outputs`、`dependencies`、`assumptions`、`summary`、`review`。
+- 代码中的每个 `processing.run` 必须来自 `solution_plan.algorithm_evidence`，
+  参数名必须依据 `get_qgis_processing_tool` 返回的真实参数，不得凭记忆猜测。
+- 多步骤任务生成一份完整脚本；中间结果在脚本内显式衔接，整个任务只调用一次
+  `execute_gis_code`。
 
 ## 常用 PyQGIS 函数和对象
 

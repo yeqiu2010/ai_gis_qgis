@@ -15,12 +15,20 @@ from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, LLMProvider
 from .tools.code_execution import build_execute_gis_code_tool
+from .tools.custom_tools import load_custom_tool_entries
 from .tools.gis_analysis import build_get_task_context_tool
 from .tools.layer_ops import build_layer_tools
-from .tools.pipeline import build_record_pipeline_stage_tool
+from .tools.pipeline import (
+    PIPELINE_STAGES,
+    build_record_pipeline_stage_tool,
+    current_pipeline_cycle,
+    next_pipeline_stage,
+    start_pipeline_cycle,
+)
+from .tools.qgis_toolbox import build_qgis_toolbox_tools
 from .tools.registry import ToolRegistry
 from .tools.search_tools import build_search_messages_tool
-from .tools.skill_management import build_set_active_skill_tool
+from .tools.skill_management import build_search_skills_tool, build_set_active_skill_tool
 
 EventCallback = Callable[[dict[str, Any]], None]
 CancelChecker = Callable[[], bool]
@@ -36,6 +44,7 @@ class AgentCore:
         iface=None,
         qgis_executor=None,
         executor_config: dict[str, Any] | None = None,
+        custom_tools_dir: str | None = None,
         should_cancel: CancelChecker | None = None,
         llm_retry_attempts: int = 3,
         llm_retry_delay_seconds: float = 0.8,
@@ -46,6 +55,7 @@ class AgentCore:
         self.iface = iface
         self.qgis_executor = qgis_executor
         self.executor_config = executor_config or {}
+        self.custom_tools_dir = custom_tools_dir
         self.should_cancel = should_cancel or (lambda: False)
         self.llm_retry_attempts = max(1, llm_retry_attempts)
         self.llm_retry_delay_seconds = max(0.0, llm_retry_delay_seconds)
@@ -111,6 +121,19 @@ class AgentCore:
                 if check_cancelled():
                     return events
                 budget.record_iteration()
+                if not response.tool_calls and self._pipeline_must_continue(session_id, active_skill):
+                    expected_stage = next_pipeline_stage(self.session_db, session_id)
+                    messages.append(
+                        ChatMessage(
+                            role="assistant",
+                            content=(
+                                "当前 GIS Pipeline 尚未完成，不能把上一段不完整文本作为最终回复。"
+                                f"下一阶段必须是 {expected_stage}。请继续调用必要工具并记录该阶段；"
+                                "只有 structured_query 明确包含需要用户回答的问题时才可暂停。"
+                            ),
+                        )
+                    )
+                    continue
                 if not response.tool_calls:
                     break
 
@@ -181,7 +204,10 @@ class AgentCore:
                     if check_cancelled():
                         return events
                     if call.name == "set_active_skill" and result.get("success"):
-                        active_skill = str(result.get("active_skill") or active_skill)
+                        next_skill = str(result.get("active_skill") or active_skill)
+                        if next_skill == "gis-pipeline" and active_skill != "gis-pipeline":
+                            start_pipeline_cycle(self.session_db, session_id)
+                        active_skill = next_skill
                         system_prompt = self.prompt_builder.build(active_skill, qgis_context)
                     self.session_db.log_tool_call(
                         session_id,
@@ -372,6 +398,15 @@ class AgentCore:
             if retry_result is not None:
                 result = retry_result
 
+        if tool_name == "execute_gis_code":
+            self._record_pipeline_execution_result(
+                session_id=session_id,
+                result=result,
+                tool_registry=tool_registry,
+                publish=publish,
+                run_id=run_id,
+            )
+
         if result.get("success", True):
             content = self._format_tool_success(tool_name, result)
         else:
@@ -397,7 +432,9 @@ class AgentCore:
 
     def _build_tool_registry(self, session_id: str) -> ToolRegistry:
         registry = ToolRegistry()
+        registry.set_skill_tools(self.prompt_builder.skill_manager.tool_allowlist())
         registry.register(build_set_active_skill_tool(self.session_db.set_state, session_id))
+        registry.register(build_search_skills_tool(self.prompt_builder.skill_manager))
         registry.register(build_get_task_context_tool(self.iface, qgis_executor=self.qgis_executor))
         registry.register(build_search_messages_tool(self.session_db, session_id))
         registry.register(build_record_pipeline_stage_tool(self.session_db, session_id))
@@ -417,7 +454,78 @@ class AgentCore:
             qgis_executor=self.qgis_executor,
         ):
             registry.register(entry)
+        for entry in build_qgis_toolbox_tools(
+            session_db=self.session_db,
+            session_id=session_id,
+            iface=self.iface,
+            qgis_executor=self.qgis_executor,
+            executor_config=self.executor_config,
+        ):
+            registry.register(entry)
+        for entry in load_custom_tool_entries(self.custom_tools_dir):
+            registry.register(entry)
         return registry
+
+    def _pipeline_must_continue(self, session_id: str, active_skill: str) -> bool:
+        if active_skill != "gis-pipeline":
+            return False
+        cycle = current_pipeline_cycle(self.session_db, session_id)
+        if not cycle or cycle == PIPELINE_STAGES:
+            return False
+        recent = self.session_db.get_recent_stage_artifacts(session_id, limit=1)
+        if recent and recent[-1].get("stage_name") == "structured_query":
+            artifact = recent[-1].get("stage_artifact") or {}
+            if isinstance(artifact, dict) and artifact.get("questions"):
+                return False
+        return True
+
+    def _record_pipeline_execution_result(
+        self,
+        *,
+        session_id: str,
+        result: dict[str, Any],
+        tool_registry: ToolRegistry,
+        publish: EventCallback,
+        run_id: str,
+    ) -> None:
+        if self.session_db.get_state(f"{session_id}:active_skill") != "gis-pipeline":
+            return
+        if next_pipeline_stage(self.session_db, session_id) != "execution_result":
+            return
+        summary = "GIS 脚本执行成功。" if result.get("success") else "GIS 脚本执行失败。"
+        arguments = {
+            "stage_name": "execution_result",
+            "summary": summary,
+            "artifact": {
+                "summary": summary,
+                "success": bool(result.get("success")),
+                "error": result.get("error"),
+                "stdout": result.get("stdout") or "",
+                "stderr": result.get("stderr") or "",
+                "outputs": result.get("outputs") or [],
+                "loaded_layers": result.get("loaded_layers") or [],
+            },
+        }
+        self._publish_stage_start_if_needed(
+            "record_pipeline_stage",
+            arguments,
+            publish,
+            session_id,
+            run_id,
+        )
+        stage_result, _ = tool_registry.execute("record_pipeline_stage", arguments)
+        self._publish_stage_end_if_needed(
+            "record_pipeline_stage",
+            stage_result,
+            publish,
+            session_id,
+            run_id,
+        )
+        if stage_result.get("success"):
+            self.session_db.set_state(
+                f"{session_id}:active_skill",
+                "main-orchestrator",
+            )
 
     def _confirmation_key(self, session_id: str, confirmation_id: str) -> str:
         return f"{session_id}:pending_confirmation:{confirmation_id}"
@@ -763,7 +871,11 @@ class AgentCore:
         if tool_name != "record_pipeline_stage":
             return
         payload = {
-            "stage_name": result.get("stage_name"),
+            "stage_name": (
+                result.get("stage_name")
+                or result.get("received_stage")
+                or result.get("expected_stage")
+            ),
             "summary": result.get("summary"),
             "artifact": result.get("artifact") or {},
             "success": result.get("success", True),
@@ -772,9 +884,17 @@ class AgentCore:
         publish(agent_event("stage_end", payload, session_id=session_id, run_id=run_id))
         state = "失败" if result.get("success") is False else "完成"
         summary = str(result.get("summary") or "")
-        process_message = f"Pipeline 阶段{state}：{result.get('stage_name') or ''}"
+        stage_name = (
+            result.get("stage_name")
+            or result.get("received_stage")
+            or result.get("expected_stage")
+            or ""
+        )
+        process_message = f"Pipeline 阶段{state}：{stage_name}"
         if summary:
             process_message = f"{process_message}\n{summary}"
+        if result.get("error"):
+            process_message = f"{process_message}\nerror：{result['error']}"
         self._save_process_message(session_id, process_message)
         if result.get("stage_name") == "generated_code" and isinstance(result.get("artifact"), dict):
             artifact = result["artifact"]

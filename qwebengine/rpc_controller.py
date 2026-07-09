@@ -9,6 +9,7 @@ from typing import Any
 
 from ..backend.agent_core import AgentCore
 from ..backend.context.qgis_context import QGISContext
+from ..backend.context.prompt_builder import PromptBuilder
 from ..backend.llm.provider_registry import create_provider
 from ..config.settings import SettingsManager
 from ..database.session_db import SessionDB
@@ -219,12 +220,18 @@ class RPCController:
             return run_id in self._cancelled_runs
 
     def _create_agent_core(self, cancellable_run_id: str | None = None) -> AgentCore:
+        skills_config = self.config.get("skills") or {}
+        builtin_skills_dir = Path(__file__).resolve().parents[1] / "skills"
+        custom_skills_dir = Path(str(skills_config.get("custom_skills_dir") or "~/.qgis_hermes_agent/custom_skills")).expanduser()
+        custom_tools_dir = str(skills_config.get("custom_tools_dir") or "~/.qgis_hermes_agent/custom_tools")
         return AgentCore(
             session_db=self.session_db,
             llm_provider=create_provider(self.config),
+            prompt_builder=PromptBuilder(skills_dir=[builtin_skills_dir, custom_skills_dir]),
             iface=self.iface,
             qgis_executor=self.main_thread_executor.run,
             executor_config=self.config.get("executor") or {},
+            custom_tools_dir=custom_tools_dir,
             should_cancel=lambda: self._is_cancelled_run(cancellable_run_id),
         )
 

@@ -8,7 +8,10 @@ AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 Q
 
 - QGIS 侧边栏聊天面板，支持会话历史、流式过程消息和停止当前任务。
 - OpenAI-compatible、OpenAI、Ollama 和离线 Echo provider。
-- Skill 驱动的任务路由，复杂 GIS 分析会进入 `gis-pipeline` 流程。
+- Skill 驱动的任务路由：自定义 Skill 优先，简单单步任务使用 `qgis-toolbox`，复杂任务进入 `gis-pipeline`。
+- QGIS Toolbox 算法知识检索：先分析数据和 GIS 术语，再批量检索 Processing 算法及参数示例。
+- 统一脚本执行：复杂流程生成并审查一份完整 Processing/PyQGIS 脚本，通过 `execute_gis_code` 一次确认执行。
+- 用户自定义 Skills 可放在 `~/.qgis_hermes_agent/custom_skills`；自定义工具以现有 `ToolEntry` 方式注册，并由 Skill 的 `tools` 声明调用。
 - QGIS 图层工具：列出图层、查看字段/CRS/范围、加载/移除图层、缩放到图层、导出图层。
 - 代码执行工具：在 QGIS 主线程中运行受控 PyQGIS 代码，并将结果加载回当前工程。
 - 工具确认机制：对需要确认的写入或潜在破坏性操作先请求用户确认。
@@ -123,6 +126,7 @@ database/             SQLite schema、迁移和会话数据库
 frontend/             Vue 前端源码
 qwebengine/           QGIS WebEngine 面板、QWebChannel 和 RPC 控制器
 resources/            图标与已构建前端资源
+resources/qgis_toolbox/ QGIS Processing 工具箱检索目录
 skills/               Agent Skill 定义
 tests/                单元测试
 scripts/              打包和调试脚本
@@ -136,4 +140,3 @@ plugin.py             QGIS 插件生命周期入口
 - 代码执行工作目录默认位于 `~/.qgis_hermes_agent/workspaces`。
 - 复杂或写入型操作会通过工具确认流程请求用户确认。
 - 建议在真实生产数据上操作前先备份 QGIS 工程和关键数据文件。
-

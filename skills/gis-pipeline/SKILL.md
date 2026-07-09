@@ -6,6 +6,9 @@ tools:
   - inspect_layer
   - inspect_layers
   - get_task_context
+  - search_qgis_toolbox_domains
+  - search_qgis_processing_tools
+  - get_qgis_processing_tool
   - record_pipeline_stage
   - execute_gis_code
 includes:
@@ -15,7 +18,7 @@ includes:
   - code-generator
   - code-reviewer
   - executor
-version: 1.1.0
+version: 2.0.0
 tags: [gis, pipeline]
 ---
 
@@ -26,9 +29,9 @@ tags: [gis, pipeline]
 ## 阶段顺序
 
 1. `data_overview`：检查可用图层、字段、CRS、样例、缺失数据和质量风险。
-2. `structured_query`：把用户自然语言整理为任务类型、目标图层、参数、输出要求。
-3. `solution_plan`：给出分步 GIS 方案、算法选择、CRS 策略、风险和回退方案。
-4. `generated_code`：生成将结果写入 `QGIS_AGENT_WORKSPACE` 的代码，并附安全审查结果。
+2. `structured_query`：把自然语言整理为任务、数据角色、有序 GIS 操作和中英文检索术语。
+3. `solution_plan`：一次检索全部算法并读取详情，给出算法依据、参数、CRS 策略和回退方案。
+4. `generated_code`：依据真实算法参数和示例生成一份完整脚本，并附安全审查结果。
 5. `execution_result`：执行或等待确认后解释 stdout、stderr、输出文件、加载图层和耗时。
 
 ## 强制执行顺序
@@ -38,6 +41,12 @@ tags: [gis, pipeline]
 - `generated_code` 阶段 artifact 必须包含 `code`、`expected_outputs`、`dependencies`、`assumptions`、`summary`、`review`。
 - `review.passed` 为 false、`expected_outputs` 为空、字段/CRS/输出文件不明确时，不得调用 `execute_gis_code`。
 - 复杂任务不要跳过图层检查；涉及多个图层时优先一次调用 `inspect_layers`，至少检查主要输入图层的字段、CRS、几何类型和样例，避免连续多次调用 `inspect_layer`。
+- `structured_query` 完成前不得搜索算法；必须先产出每个操作的标准 GIS 术语。
+- `solution_plan` 中只调用一次 `search_qgis_processing_tools`，用 `queries` 覆盖全部操作；随后只调用一次 `get_qgis_processing_tool` 批量读取候选详情。
+- 不得调用或假设存在 `run_qgis_processing`。所有步骤必须组合进一份脚本，审查通过后只调用一次 `execute_gis_code`。
+- 进入本 Skill 后不得切换到其他 Skill；domain 检索结果只是算法候选，不是切换 Skill 的指令。
+- `record_pipeline_stage` 由服务端严格校验顺序。返回 `success=false` 时根据
+  `expected_stage` 补齐当前阶段，不得跳到最终回复。
 
 ## 总规则
 
@@ -58,13 +67,15 @@ tags: [gis, pipeline]
    - 使用 `query-tuner` 的结构，明确属性筛选、空间关系、距离单位和最终输出。
    - 用户指定文件名时必须写入 `output.expected_outputs`。
 3. `solution_plan`
-   - 使用 `solution-planner`，列出每个 Processing 算法、输入输出、CRS 策略和风险。
+   - 用标准 GIS 术语一次检索全部候选算法。
+   - 一次读取候选算法的描述、参数和代码示例。
+   - 使用 `solution-planner` 记录最终算法、选择依据、输入输出、CRS 策略和风险。
 4. `generated_code`
-   - 使用 `code-generator` 模板生成代码。
+   - 严格依据已读取的算法参数和示例，使用 `code-generator` 生成一份完整代码。
    - 使用 `code-reviewer` 阻断项自检。
    - 确保最终输出路径和 `expected_outputs.path` 完全一致，例如 `500m.shp`。
 5. `execution_result`
-   - 调用 `execute_gis_code`。
+   - 只调用一次 `execute_gis_code`，由用户确认整份脚本。
    - 成功时直接说明结果和加载图层；失败时把错误反馈给代码生成阶段重试。
 
 ## 示例任务识别

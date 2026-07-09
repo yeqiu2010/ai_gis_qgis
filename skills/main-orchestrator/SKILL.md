@@ -3,13 +3,15 @@ name: main-orchestrator
 description: 主调度与 Skill 路由
 tools:
   - set_active_skill
+  - search_skills
   - list_layers
   - inspect_layer
+  - inspect_layers
   - load_layer
   - remove_layer
   - zoom_to_layer
   - export_layer
-version: 1.1.1
+version: 2.0.0
 tags: [orchestration, routing, gis]
 ---
 
@@ -20,18 +22,27 @@ tags: [orchestration, routing, gis]
 ## 路由优先级
 
 1. 图层管理、图层查看、字段查看、加载数据、缩放、样式、导出等单步操作：直接使用对应图层工具。
-2. 简单低风险分析：可切换到 `fast-path`，但仅限一个输入、一个清晰算法、一个清晰输出的任务。
-3. 复杂 GIS 分析：必须先调用 `set_active_skill({"skill_name": "gis-pipeline"})`，由 `gis-pipeline` 完成完整流程。
+2. 用户请求可能匹配公司/用户自定义 Skill 时，先调用 `search_skills` 检索；命中后优先 `set_active_skill` 切换到该 Skill。
+3. 一个主要输入、一个明确标准 GIS 操作的简单任务切换到 `qgis-toolbox`。
+4. 两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务直接切换到 `gis-pipeline`。
+5. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
 
+## QGIS Toolbox 简单任务
+
+以下任务只有在单步且参数明确时，才调用 `set_active_skill({"skill_name":"qgis-toolbox"})`：
+
+- 缓冲、裁剪、相交、联合、差集、按位置提取。
+- 属性筛选、表达式筛选、字段计算、属性连接、统计汇总。
+- 坡度、坡向、山体阴影、栅格裁剪、重投影、栅格化、矢量化。
 ## 必须走 GIS Pipeline 的任务
 
-只要用户请求满足以下任意条件，不要直接调用 `execute_gis_code`：
+只要用户请求满足以下任意条件且没有匹配的自定义 Skill，直接进入 `gis-pipeline`：
 
-- 包含两个或更多 GIS 步骤，例如“先提取，再缓冲，再相交，再导出”。
-- 同时包含属性筛选和空间关系，例如“政府办公地块 + 500m 缓冲区 + 相交地块”。
-- 包含缓冲区、裁剪、叠加、相交、空间连接、字段计算、统计汇总中的多个操作。
-- 用户指定最终输出文件，例如 `500m.shp`、`result.gpkg`、`parks.geojson`。
-- 需要确认字段含义、属性取值、CRS/距离单位或中间结果。
+- 包含两个及以上 GIS 操作。
+- 同时使用属性筛选和空间关系。
+- 涉及多个图层、空间连接、分类汇总、字段连接或字段计算组合。
+- 需要确认字段含义、属性取值、CRS、距离/面积单位或中间结果。
+- 需要复杂 PyQGIS、制图布局、非 Processing 能力或业务逻辑。
 
 复杂任务的正确第一步是：
 

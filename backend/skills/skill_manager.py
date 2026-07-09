@@ -8,12 +8,18 @@ from .skill_loader import SkillDocument, SkillLoader
 
 
 class SkillManager:
-    def __init__(self, skills_dir: Path | str):
+    def __init__(self, skills_dir: Path | str | list[Path | str]):
         self.loader = SkillLoader(skills_dir)
         self._documents = self.loader.load_all()
 
     def get(self, name: str) -> SkillDocument | None:
         return self._documents.get(name)
+
+    def all(self) -> dict[str, SkillDocument]:
+        return dict(self._documents)
+
+    def tool_allowlist(self) -> dict[str, list[str]]:
+        return {name: document.tools for name, document in self._documents.items() if document.tools}
 
     def compose_prompt(self, name: str) -> str:
         document = self.get(name)

@@ -13,7 +13,10 @@ class PromptBuilder:
         if skill_manager is not None:
             self.skill_manager = skill_manager
         else:
-            default_dir = skills_dir or Path(__file__).resolve().parents[2] / "skills"
+            default_dir = skills_dir or [
+                Path(__file__).resolve().parents[2] / "skills",
+                Path.home() / ".qgis_hermes_agent" / "custom_skills",
+            ]
             self.skill_manager = SkillManager(default_dir)
 
     def build(self, active_skill: str, qgis_context: QGISContext) -> str:
@@ -36,12 +39,15 @@ class PromptBuilder:
             "对于分析、筛选、提取、缓冲、裁剪、叠加等会产生结果的任务，"
             "如果信息已足够，不能把“我将执行/我会使用某方法”作为最终答复；"
             "必须继续调用工具完成任务，或明确说明缺少哪些信息。\n\n"
+            "能力选择遵循 Skill-first：先判断当前或自定义 Skill 是否匹配任务，"
+            "自定义工具只能由已匹配或已激活的 Skill 声明和调用，不能作为主调度独立路由目标。"
+            "单个明确的标准 GIS 操作切换到 qgis-toolbox；"
+            "两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖必须直接进入 gis-pipeline。"
+            "QGIS 算法目录只提供描述、参数和示例；分析统一生成完整脚本并通过 execute_gis_code 一次确认执行。\n\n"
             "会话具备记忆：用户使用“导出它”“继续”“按刚才的条件”“导出公园地块”等短句时，"
             "必须结合会话记忆、上一轮工具结果和最近对话补全图层、字段、筛选条件和待办事项；"
             "不要重复询问已经由历史工具结果确认过的信息。\n\n"
-            "复杂 GIS 分析任务必须先切换到 gis-pipeline：如果用户请求包含多个步骤，"
-            "例如属性筛选后再缓冲、相交、裁剪、空间连接、统计或生成指定输出文件，"
-            "第一步应调用 set_active_skill，参数为 {\"skill_name\":\"gis-pipeline\"}，"
+            "包含多个标准 Processing 步骤的 GIS 分析，必须切换到 gis-pipeline 统一规划、检索、生成和审查脚本；"
             "不要在 main-orchestrator 中直接调用 execute_gis_code。\n\n"
             "当用户说“加载 <路径> 数据/图层”时，你负责从自然语言中提取真实路径作为 load_layer.source，"
             "source 不应包含“数据”“图层”“加载”等说明性文字。\n\n"
@@ -63,9 +69,11 @@ class PromptBuilder:
             )
         return (
             "Main Orchestrator 规则：将图层管理请求路由到对应工具；复杂分析任务先澄清数据和参数。"
-            "如果任务包含多个 GIS 步骤、属性筛选加空间关系、缓冲后相交/裁剪/空间连接，"
-            "或用户指定输出文件如 500m.shp，必须先调用 set_active_skill 切换到 gis-pipeline，"
-            "不要直接调用 execute_gis_code。只有简单单步任务才可进入 fast-path。"
+            "如果任务只有一个明确的缓冲、裁剪、筛选、字段计算或栅格操作，"
+            "调用 set_active_skill 切换到 qgis-toolbox。"
+            "如果任务包含两个及以上操作、多个图层、CRS/字段推断、空间连接或统计汇总，"
+            "直接切换到 gis-pipeline。"
+            "不要直接调用 execute_gis_code。只有简单单步且非工具箱更合适的任务才可进入 fast-path。"
             "调用代码执行前必须只写入 QGIS_AGENT_WORKSPACE，"
             "QGIS_AGENT_WORKSPACE 是 execute_gis_code 执行器注入的运行时变量。"
             "分析结果默认输出到该工作目录；用户未指定文件名时，基于任务生成合理文件名，"
