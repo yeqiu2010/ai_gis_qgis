@@ -47,6 +47,11 @@ tags: [gis, pipeline]
 - 进入本 Skill 后不得切换到其他 Skill；domain 检索结果只是算法候选，不是切换 Skill 的指令。
 - `record_pipeline_stage` 由服务端严格校验顺序。返回 `success=false` 时根据
   `expected_stage` 补齐当前阶段，不得跳到最终回复。
+- 不要重复 `completed_stages` 中已经完成的数据盘点或结构化需求。阶段失败时只修正
+  `expected_stage`。
+- `generated_code` 成功记录且 `review.passed=true` 后，系统会自动从 artifact 创建
+  `execute_gis_code` 确认请求；不要再次记录数据盘点，也不要手动记录
+  `execution_result`。
 
 ## 总规则
 

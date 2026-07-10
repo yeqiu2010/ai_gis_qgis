@@ -29,6 +29,13 @@ tags: [gis, pipeline, review]
 - 使用了未出现在 `solution_plan.algorithm_evidence` 中的算法。
 - `processing.run` 参数名与已读取的算法详情不一致。
 - 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
+- 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
+  `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
+- 创建 Polygon/Line/Point 输出图层，却没有为输出要素调用 `setGeometry`；纯统计结果
+  应创建无几何表，要求空间结果时必须保留或聚合真实几何。
+- 分组统计中用赋值覆盖分母字段，例如遍历多栋建筑时反复执行
+  `land_area = current_land_area`。地块面积必须按唯一地块去重汇总，不能按建筑重复累加，
+  也不能只保留最后一个地块。
 
 ## GIS 正确性检查
 
@@ -38,6 +45,10 @@ tags: [gis, pipeline, review]
 - 中文名称模糊匹配优先用 `ILIKE '%公园%'`。
 - Processing 输出参数必须是工作目录内路径字符串。
 - 输出 vector/raster 后，`expected_outputs.type` 应匹配。
+- 写 GeoPackage 时明确设置 `SaveVectorOptions.driverName = "GPKG"` 和输出图层名，并检查
+  `QgsVectorFileWriter.writeAsVectorFormatV3` 返回状态。
+- 密度、覆盖率等比值必须审查分子与分母的统计粒度一致；按用地类型统计时，分母应为该
+  类型唯一地块面积总量，不能使用任意单个地块面积。
 
 ## 审查产物
 

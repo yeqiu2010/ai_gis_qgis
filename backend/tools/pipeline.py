@@ -35,14 +35,16 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
             return {"success": False, "error": f"{stage_name} 阶段必须提供非空 summary。"}
         expected_stage = next_pipeline_stage(session_db, session_id)
         if stage_name != expected_stage:
+            completed_stages = current_pipeline_cycle(session_db, session_id)
             return {
                 "success": False,
                 "error": (
                     f"Pipeline 阶段顺序错误：当前必须记录 {expected_stage}，"
-                    f"不能记录 {stage_name}。"
+                    f"不能记录 {stage_name}。不要重复已经完成的阶段。"
                 ),
                 "expected_stage": expected_stage,
                 "received_stage": stage_name,
+                "completed_stages": completed_stages,
             }
         validation_error = _validate_stage_artifact(stage_name, artifact)
         if validation_error:
@@ -176,6 +178,8 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
         review = artifact.get("review")
         if not isinstance(review, dict):
             return "generated_code 阶段缺少 review。"
+        if review.get("passed") is not True:
+            return "generated_code 的 review.passed 必须为 true；请修正代码后重新记录本阶段。"
     if stage_name == "execution_result" and not any(
         key in artifact for key in ("stdout", "stderr", "outputs", "error", "success")
     ):

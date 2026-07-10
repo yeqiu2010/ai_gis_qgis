@@ -734,9 +734,13 @@ def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
     assert "stage_start" in event_types
     assert "stage_end" in event_types
     assert "code_generated" in event_types
+    assert "confirm_request" in event_types
     stage_end = next(event for event in events if event["type"] == "stage_end")
     assert stage_end["payload"]["stage_name"] == "generated_code"
     assert stage_end["payload"]["artifact"]["code"] == "print('ok')"
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    assert confirmation["payload"]["tool_name"] == "execute_gis_code"
+    assert confirmation["payload"]["arguments"]["code"] == "print('ok')"
 
     with sqlite3.connect(tmp_path / "state.db") as connection:
         row = connection.execute(
@@ -792,6 +796,41 @@ def test_record_pipeline_stage_rejects_skipped_or_empty_stage(tmp_path: Path):
     assert empty["success"] is False
     assert "summary" in empty["error"]
     assert session_db.list_pipeline_stage_names(session.id) == []
+
+
+def test_generated_code_stage_requires_passed_review(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="review gate", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    result = tool.handler(
+        {
+            "stage_name": "generated_code",
+            "summary": "代码审查未通过",
+            "artifact": {
+                "summary": "代码审查未通过",
+                "code": "print('unsafe')",
+                "expected_outputs": [{"path": "result.txt", "name": "result", "type": "file"}],
+                "review": {"passed": False, "blocking_issues": ["统计分母错误"]},
+            },
+        }
+    )
+
+    assert result["success"] is False
+    assert result["expected_stage"] == "generated_code"
+    assert "review.passed" in result["error"]
+    assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
 
 
 def test_switching_to_pipeline_starts_new_cycle_after_stale_artifacts(tmp_path: Path):

@@ -227,6 +227,21 @@ class AgentCore:
                     )
                     self._save_process_message(session_id, self._format_tool_process(call.name, result))
                     self._publish_stage_end_if_needed(call.name, result, publish, session_id, run_id)
+                    execution_arguments = self._execution_arguments_from_generated_stage(
+                        call.name,
+                        result,
+                    )
+                    if execution_arguments is not None:
+                        self._request_tool_confirmation(
+                            session_id=session_id,
+                            run_id=run_id,
+                            tool_name="execute_gis_code",
+                            arguments=execution_arguments,
+                            tool_registry=tool_registry,
+                            publish=publish,
+                            model=response.model,
+                        )
+                        return events
                     budget.record_tool_call()
                     if check_cancelled():
                         return events
@@ -254,7 +269,10 @@ class AgentCore:
                 )
                 if check_cancelled():
                     return events
-            elif response.tool_calls and budget.exhausted:
+            elif budget.exhausted and (
+                response.tool_calls
+                or self._pipeline_must_continue(session_id, active_skill)
+            ):
                 response = type(response)(
                     content="任务未完成：已达到本轮工具调用预算。请缩小任务范围或补充更明确的图层、字段和输出要求后重试。",
                     model=response.model,
@@ -478,6 +496,91 @@ class AgentCore:
             if isinstance(artifact, dict) and artifact.get("questions"):
                 return False
         return True
+
+    def _execution_arguments_from_generated_stage(
+        self,
+        tool_name: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if tool_name != "record_pipeline_stage" or not result.get("success"):
+            return None
+        if result.get("stage_name") != "generated_code":
+            return None
+        artifact = result.get("artifact")
+        if not isinstance(artifact, dict):
+            return None
+        review = artifact.get("review")
+        if not isinstance(review, dict) or review.get("passed") is not True:
+            return None
+        return {
+            "code": str(artifact.get("code") or ""),
+            "expected_outputs": artifact.get("expected_outputs") or [],
+            **(
+                {"delivery_outputs": artifact["delivery_outputs"]}
+                if artifact.get("delivery_outputs")
+                else {}
+            ),
+            **(
+                {"timeout_seconds": artifact["timeout_seconds"]}
+                if artifact.get("timeout_seconds")
+                else {}
+            ),
+        }
+
+    def _request_tool_confirmation(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_registry: ToolRegistry,
+        publish: EventCallback,
+        model: str,
+    ) -> None:
+        entry = tool_registry.get(tool_name)
+        confirmation_id = str(uuid.uuid4())
+        pending = {
+            "confirmation_id": confirmation_id,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "run_id": run_id,
+        }
+        self.session_db.set_state(
+            self._confirmation_key(session_id, confirmation_id),
+            json.dumps(pending, ensure_ascii=False),
+        )
+        publish(
+            agent_event(
+                "confirm_request",
+                {
+                    "confirmation_id": confirmation_id,
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "destructive": entry.destructive,
+                    "writes_project": entry.writes_project,
+                    "description": entry.description,
+                },
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
+        content = f"工具 `{tool_name}` 需要确认后才能执行。请确认或取消该操作。"
+        self.session_db.save_message(
+            session_id,
+            "assistant",
+            content,
+            event_type="confirm_request",
+        )
+        publish(
+            agent_event(
+                "message",
+                {"role": "assistant", "content": content, "model": model},
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
+        publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
 
     def _record_pipeline_execution_result(
         self,
@@ -849,7 +952,9 @@ class AgentCore:
     ) -> None:
         if tool_name != "record_pipeline_stage":
             return
-        stage_name = str(arguments.get("stage_name") or "")
+        stage_name = str(arguments.get("stage_name") or "").strip()
+        if not stage_name:
+            stage_name = next_pipeline_stage(self.session_db, session_id)
         self._save_process_message(session_id, f"Pipeline 阶段开始：{stage_name}")
         publish(
             agent_event(
