@@ -22,6 +22,7 @@ tags: [gis, pipeline, review]
 - 用户要求导出到外部目录时，代码直接写外部目录；应改为工作目录输出 + `delivery_outputs`。
 - `expected_outputs` 为空，或没有包含用户要求生成的最终文件，例如 `500m.shp`。
 - `expected_outputs.path` 和代码实际输出文件名不一致。
+- `expected_outputs` 声明了文件，但代码只向 stdout 打印内容，没有通过 Processing `OUTPUT`、文件写入或 Writer API 实际创建该文件。
 - 使用未定义变量，例如 `QgsProject` 未导入且不在当前命名空间说明中。
 - 使用 `QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback` 但既没有显式导入，也不在当前命名空间说明中；最终输出不能只使用 `QgsProcessing.TEMPORARY_OUTPUT`。
 - 对字段做筛选前没有检查字段是否存在。
@@ -29,6 +30,7 @@ tags: [gis, pipeline, review]
 - 使用了未出现在 `solution_plan.algorithm_evidence` 中的算法。
 - `processing.run` 参数名与已读取的算法详情不一致。
 - 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
+- 用户未明确要求修复数据，却调用 `native:fixgeometries`；分析查询应通过 Processing context 的 `GeometrySkipInvalid` 排除空几何或无效几何要素。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
 - 创建 Polygon/Line/Point 输出图层，却没有为输出要素调用 `setGeometry`；纯统计结果
@@ -45,6 +47,7 @@ tags: [gis, pipeline, review]
 - 中文名称模糊匹配优先用 `ILIKE '%公园%'`。
 - Processing 输出参数必须是工作目录内路径字符串。
 - 输出 vector/raster 后，`expected_outputs.type` 应匹配。
+- 属性值探查不是最终产物时，不得虚构 `.txt` 预期输出；优先使用 `inspect_layer`，确需输出诊断文件时必须在代码中真实写入。
 - 写 GeoPackage 时明确设置 `SaveVectorOptions.driverName = "GPKG"` 和输出图层名，并检查
   `QgsVectorFileWriter.writeAsVectorFormatV3` 返回状态。
 - 密度、覆盖率等比值必须审查分子与分母的统计粒度一致；按用地类型统计时，分母应为该

@@ -32,6 +32,10 @@ tags: [qgis, processing, toolbox]
 5. 根据真实参数生成完整脚本，并按 `code-reviewer` 规则审查。
 6. 脚本最终输出到 `QGIS_AGENT_WORKSPACE`，通过 `execute_gis_code` 一次确认执行。
 
+字段和值已经由用户明确指定时，直接生成最终 Processing 筛选代码，不得先用
+`execute_gis_code` 打印唯一值做诊断。确需补充探查时优先使用 `inspect_layer`；stdout
+不是文件，禁止为仅打印的诊断代码声明虚假的 `expected_outputs`。
+
 ## GIS 术语映射
 
 先按用户目标识别操作，再生成英文检索词。不要把整句业务描述原样作为唯一查询。

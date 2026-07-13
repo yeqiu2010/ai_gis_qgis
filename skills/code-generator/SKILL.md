@@ -31,6 +31,12 @@ tags: [gis, pipeline, code]
   参数名必须依据 `get_qgis_processing_tool` 返回的真实参数，不得凭记忆猜测。
 - 多步骤任务生成一份完整脚本；中间结果在脚本内显式衔接，整个任务只调用一次
   `execute_gis_code`。
+- 任一输入超过 10 万要素时，不得生成对两个图层执行 `getFeatures()` 的嵌套循环。
+- 大图层空间筛选必须使用 Processing/数据源空间索引，并先缩小候选范围再做精确判断。
+- 分析查询遇到空几何或无效几何时，使用 `QgsProcessingContext.setInvalidGeometryCheck(Qgis.InvalidGeometryCheck.GeometrySkipInvalid)` 排除这些要素，并在输出摘要中说明。除非用户明确要求修复数据，否则禁止生成 `native:fixgeometries`。
+- 大数据任务的缓冲筛选默认溶解缓冲区，最终结果优先输出 GeoPackage。
+- 耗时 Processing 调用必须保留或传入 `QgsProcessingFeedback`，以支持进度、取消和界面事件刷新。
+- 每个用户任务只生成一次面向最终结果的 `execute_gis_code` 调用。不得先生成“打印唯一值”的诊断脚本，不得为 stdout 虚构 `.txt` 输出；字段和值已由用户指定时直接生成最终筛选结果。
 
 ## 常用 PyQGIS 函数和对象
 

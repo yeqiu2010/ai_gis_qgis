@@ -75,6 +75,10 @@ tags: [orchestration, routing, gis]
 - `expected_outputs` 列出每个输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
 - 不创建 `QgsApplication`、`QApplication`，不调用 `initQgis`，不启动新的 QGIS。
 - 不生成网络访问、`subprocess`、`os.system`、`eval`、`exec`、删除文件或写工作目录外路径。
+- 任一输入图层超过 10 万要素时必须进入 `gis-pipeline`，不得使用简单 fast-path。
+- 大数据空间分析必须检查空间索引，避免逐要素嵌套循环，并优先输出 GeoPackage。
+- 自动重试遇到空几何或无效几何时必须排除对应要素；除非用户明确要求修复数据，不得运行 `fixgeometries` 或创建修复副本。
+- `execute_gis_code` 只用于生成用户要求的最终结果，不得用于字段唯一值探查或仅打印诊断信息；用户已明确图层、字段和筛选值时应直接进入最终筛选。
 
 ## 回复规则
 

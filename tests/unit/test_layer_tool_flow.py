@@ -12,6 +12,7 @@ from ai_gis_qgis.backend.executor.qgis_executor import QGISCodeExecutor
 from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
+    find_unwritten_expected_outputs,
     infer_expected_outputs_from_code,
 )
 from ai_gis_qgis.backend.tools.layer_ops import _normalize_source
@@ -103,7 +104,11 @@ class RetryCodeExecutionProvider:
                         id="call-1",
                         name="execute_gis_code",
                         arguments={
-                            "code": "raise NameError(\"name 'QgsProject' is not defined\")",
+                            "code": (
+                                "if False:\n"
+                                "    open('parks.txt', 'w').write('unreachable')\n"
+                                "raise NameError(\"name 'QgsProject' is not defined\")"
+                            ),
                             "expected_outputs": [
                                 {"path": "parks.txt", "name": "parks", "type": "file"}
                             ],
@@ -153,7 +158,7 @@ class PipelineStageProvider:
                             "summary": "已生成测试代码。",
                             "artifact": {
                                 "summary": "已生成测试代码。",
-                                "code": "print('ok')",
+                                "code": "open('result.txt', 'w').write('ok')",
                                 "expected_outputs": [
                                     {"path": "result.txt", "name": "result", "type": "file"}
                                 ],
@@ -164,6 +169,40 @@ class PipelineStageProvider:
                 ],
             )
         return ChatResponse(content="Pipeline 阶段已记录。", model=self.model)
+
+
+class InvalidOutputContractProvider:
+    name = "invalid-output-contract-test"
+    model = "invalid-output-contract-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="bad-output",
+                        name="execute_gis_code",
+                        arguments={
+                            "code": "print('公园')",
+                            "expected_outputs": [
+                                {
+                                    "path": "type_unique_values.txt",
+                                    "name": "字段值",
+                                    "type": "file",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            )
+        return ChatResponse(content="已改为直接生成最终筛选结果。", model=self.model)
 
 
 class SwitchPipelineProvider:
@@ -223,7 +262,10 @@ class SequentialToolProvider:
                         id="call-2",
                         name="execute_gis_code",
                         arguments={
-                            "code": "print('filter parks')",
+                            "code": (
+                                "with open('parks.geojson', 'w', encoding='utf-8') as handle:\n"
+                                "    handle.write('{\"type\":\"FeatureCollection\",\"features\":[]}')"
+                            ),
                             "expected_outputs": [
                                 {"path": "parks.geojson", "name": "parks", "type": "vector"}
                             ],
@@ -509,7 +551,111 @@ def test_execute_gis_code_uses_current_qgis_mode_when_executor_is_available(tmp_
     assert "current" in result["stdout"]
 
 
-def test_execute_gis_code_uses_stderr_as_error_fallback(tmp_path: Path):
+def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tmp_path: Path):
+    calls = []
+    event_pumps = []
+
+    class FakeFeedback:
+        def setProgress(self, progress):
+            calls.append(("progress", progress))
+
+    class FakeCoreApplication:
+        @staticmethod
+        def processEvents(*args):
+            event_pumps.append(args)
+
+    class FakeProcessingContext:
+        def setInvalidGeometryCheck(self, value):
+            self.invalid_geometry_check = value
+
+    class FakeQgis:
+        class InvalidGeometryCheck:
+            GeometrySkipInvalid = "skip"
+
+    fake_processing = types.ModuleType("processing")
+
+    def original_run(*args, **kwargs):
+        feedback = kwargs["feedback"]
+        feedback.setProgress(25)
+        return {"OUTPUT": "result.gpkg"}
+
+    fake_processing.run = original_run
+    fake_qgis_core = types.ModuleType("qgis.core")
+    fake_qgis_core.QgsProcessingFeedback = FakeFeedback
+    fake_qgis_core.QgsProcessingContext = FakeProcessingContext
+    fake_qgis_core.Qgis = FakeQgis
+    fake_qt_core = types.ModuleType("qgis.PyQt.QtCore")
+    fake_qt_core.QCoreApplication = FakeCoreApplication
+    fake_qt_core.QEventLoop = type("QEventLoop", (), {"AllEvents": 0})
+    monkeypatch.setitem(sys.modules, "processing", fake_processing)
+    monkeypatch.setitem(sys.modules, "qgis.core", fake_qgis_core)
+    monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", fake_qt_core)
+
+    executor = QGISCodeExecutor({"workspace_dir": str(tmp_path / "workspaces")})
+    with executor._responsive_processing():
+        assert fake_processing.run("native:test", {}) == {"OUTPUT": "result.gpkg"}
+        assert fake_processing.run is not original_run
+
+    assert fake_processing.run is original_run
+    assert calls == [("progress", 25)]
+    assert len(event_pumps) == 1
+
+
+def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Path):
+    received_feedback = []
+
+    class FakeFeedback:
+        def __init__(self):
+            self.progress = []
+
+        def setProgress(self, progress):
+            self.progress.append(progress)
+
+        def isCanceled(self):
+            return False
+
+    class FakeCoreApplication:
+        @staticmethod
+        def processEvents(*args):
+            pass
+
+    class FakeProcessingContext:
+        def setInvalidGeometryCheck(self, value):
+            self.invalid_geometry_check = value
+
+    class FakeQgis:
+        class InvalidGeometryCheck:
+            GeometrySkipInvalid = "skip"
+
+    fake_processing = types.ModuleType("processing")
+
+    def original_run(*args, **kwargs):
+        received_feedback.append(kwargs["feedback"])
+        kwargs["feedback"].setProgress(50)
+        return {}
+
+    fake_processing.run = original_run
+    fake_qgis_core = types.ModuleType("qgis.core")
+    fake_qgis_core.QgsProcessingFeedback = FakeFeedback
+    fake_qgis_core.QgsProcessingContext = FakeProcessingContext
+    fake_qgis_core.Qgis = FakeQgis
+    fake_qt_core = types.ModuleType("qgis.PyQt.QtCore")
+    fake_qt_core.QCoreApplication = FakeCoreApplication
+    fake_qt_core.QEventLoop = type("QEventLoop", (), {"AllEvents": 0})
+    monkeypatch.setitem(sys.modules, "processing", fake_processing)
+    monkeypatch.setitem(sys.modules, "qgis.core", fake_qgis_core)
+    monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", fake_qt_core)
+
+    explicit_feedback = FakeFeedback()
+    executor = QGISCodeExecutor({"workspace_dir": str(tmp_path / "workspaces")})
+    with executor._responsive_processing():
+        fake_processing.run("native:test", {}, feedback=explicit_feedback)
+
+    assert received_feedback[0] is not explicit_feedback
+    assert explicit_feedback.progress == [50]
+
+
+def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="stderr fallback", model="test", source="test")
     tool = build_execute_gis_code_tool(
@@ -530,7 +676,9 @@ def test_execute_gis_code_uses_stderr_as_error_fallback(tmp_path: Path):
     )
 
     assert result["success"] is False
-    assert result["error"] == "代码执行结束，但缺少预期输出文件：" + result["outputs"][0]["path"]
+    assert result["preflight_failed"] is True
+    assert "代码没有写入" in result["error"]
+    assert "missing.txt" in result["error"]
 
 
 def test_infers_expected_outputs_from_generated_output_path():
@@ -547,6 +695,50 @@ processing.run(
     assert infer_expected_outputs_from_code(code) == [
         {"path": "500m.shp", "name": "500m", "type": "vector"}
     ]
+
+
+def test_detects_expected_output_that_is_only_printed():
+    code = "print('type_values_check.txt')\nprint('公园')"
+
+    assert find_unwritten_expected_outputs(
+        code,
+        [{"path": "type_values_check.txt", "name": "values", "type": "file"}],
+    ) == ["type_values_check.txt"]
+
+
+def test_invalid_output_contract_is_rejected_before_confirmation(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="preflight", model="test", source="test")
+    provider = InvalidOutputContractProvider()
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+    ).run(session_id=session.id, user_message="按 type 提取公园")
+
+    assert not any(event["type"] == "confirm_request" for event in events)
+    tool_end = next(event for event in events if event["type"] == "tool_end")
+    assert tool_end["payload"]["result"]["preflight_failed"] is True
+    assert provider.calls == 2
+
+
+def test_accepts_processing_and_text_file_output_writes():
+    code = """
+from pathlib import Path
+output_path = Path(QGIS_AGENT_WORKSPACE) / "parks.gpkg"
+processing.run("native:extractbyexpression", {"INPUT": layer, "OUTPUT": str(output_path)})
+report_path = Path(QGIS_AGENT_WORKSPACE) / "report.txt"
+report_path.write_text("ok", encoding="utf-8")
+"""
+
+    assert find_unwritten_expected_outputs(
+        code,
+        [
+            {"path": "parks.gpkg", "name": "parks", "type": "vector"},
+            {"path": "report.txt", "name": "report", "type": "file"},
+        ],
+    ) == []
 
 
 def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
@@ -737,10 +929,10 @@ def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
     assert "confirm_request" in event_types
     stage_end = next(event for event in events if event["type"] == "stage_end")
     assert stage_end["payload"]["stage_name"] == "generated_code"
-    assert stage_end["payload"]["artifact"]["code"] == "print('ok')"
+    assert stage_end["payload"]["artifact"]["code"] == "open('result.txt', 'w').write('ok')"
     confirmation = next(event for event in events if event["type"] == "confirm_request")
     assert confirmation["payload"]["tool_name"] == "execute_gis_code"
-    assert confirmation["payload"]["arguments"]["code"] == "print('ok')"
+    assert confirmation["payload"]["arguments"]["code"] == "open('result.txt', 'w').write('ok')"
 
     with sqlite3.connect(tmp_path / "state.db") as connection:
         row = connection.execute(
@@ -748,7 +940,7 @@ def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
             "WHERE event_type = 'stage_artifact' ORDER BY id DESC LIMIT 1"
         ).fetchone()
     assert row[0] == "generated_code"
-    assert "print('ok')" in row[1]
+    assert "result.txt" in row[1]
 
 
 def test_record_pipeline_stage_infers_missing_stage_name(tmp_path: Path):
@@ -767,7 +959,7 @@ def test_record_pipeline_stage_infers_missing_stage_name(tmp_path: Path):
     assert session_db.list_pipeline_stage_names(session.id) == ["data_overview"]
 
 
-def test_record_pipeline_stage_rejects_skipped_or_empty_stage(tmp_path: Path):
+def test_record_pipeline_stage_rejects_skipped_and_fills_empty_summary(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="pipeline order", model="test", source="test")
     tool = AgentCore(
@@ -793,9 +985,39 @@ def test_record_pipeline_stage_rejects_skipped_or_empty_stage(tmp_path: Path):
     assert skipped["success"] is False
     assert skipped["expected_stage"] == "data_overview"
     assert "顺序错误" in skipped["error"]
-    assert empty["success"] is False
-    assert "summary" in empty["error"]
-    assert session_db.list_pipeline_stage_names(session.id) == []
+    assert empty["success"] is True
+    assert empty["summary"] == "数据盘点已完成。"
+    assert session_db.list_pipeline_stage_names(session.id) == ["data_overview"]
+
+
+def test_record_pipeline_stage_accepts_json_artifact_and_duplicate(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="pipeline tolerant", model="test", source="test")
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    first = tool.handler(
+        {
+            "stage_name": "data_overview",
+            "artifact": '{"summary":"图层盘点完成"}',
+        }
+    )
+    duplicate = tool.handler(
+        {
+            "stage_name": "data_overview",
+            "summary": "重复提交",
+            "artifact": {"summary": "重复提交"},
+        }
+    )
+
+    assert first["success"] is True
+    assert duplicate["success"] is True
+    assert duplicate["already_recorded"] is True
+    assert duplicate["expected_stage"] == "structured_query"
+    assert session_db.list_pipeline_stage_names(session.id) == ["data_overview"]
 
 
 def test_generated_code_stage_requires_passed_review(tmp_path: Path):
@@ -830,6 +1052,41 @@ def test_generated_code_stage_requires_passed_review(tmp_path: Path):
     assert result["success"] is False
     assert result["expected_stage"] == "generated_code"
     assert "review.passed" in result["error"]
+    assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
+
+
+def test_generated_code_stage_rejects_unwritten_output(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="output gate", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    result = tool.handler(
+        {
+            "stage_name": "generated_code",
+            "summary": "打印唯一值",
+            "artifact": {
+                "code": "print('公园')",
+                "expected_outputs": [
+                    {"path": "type_unique_values.txt", "name": "values", "type": "file"}
+                ],
+                "review": {"passed": True},
+            },
+        }
+    )
+
+    assert result["success"] is False
+    assert "没有写入" in result["error"]
     assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
 
 

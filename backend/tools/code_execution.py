@@ -50,6 +50,11 @@ def build_execute_gis_code_tool(
             expected_outputs,
             delivery_outputs,
         )
+        preflight_error = validate_execute_gis_code_arguments(
+            {"code": code, "expected_outputs": expected_outputs}
+        )
+        if preflight_error:
+            return preflight_error
         timeout_seconds = arguments.get("timeout_seconds")
 
         executor = QGISCodeExecutor(executor_config)
@@ -129,6 +134,7 @@ def build_execute_gis_code_tool(
         name="execute_gis_code",
         description=(
             "在当前已打开的 QGIS Python 环境中执行生成的 GIS 代码。"
+            "每个用户任务只用于生成最终文件，不得用于字段唯一值探查或仅打印诊断信息。"
             "代码只能通过文件产出结果，工具会加载 vector/raster 输出到当前 QGIS 工程。"
         ),
         parameters={
@@ -227,6 +233,115 @@ def infer_expected_outputs_from_code(code: str) -> list[dict[str, str]]:
             }
         )
     return outputs
+
+
+def find_unwritten_expected_outputs(
+    code: str,
+    expected_outputs: list[dict[str, Any]],
+) -> list[str]:
+    """Return declared outputs that are not connected to an obvious write sink."""
+    if not code.strip() or not expected_outputs:
+        return []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []  # Compilation reports the more useful syntax error later.
+
+    assignments: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            values = _path_names_from_expression(node.value, assignments)
+            for target in node.targets:
+                if isinstance(target, ast.Name) and values:
+                    assignments[target.id] = values
+
+    written: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = _call_name(node.func)
+        if func_name == "open" and node.args:
+            mode = _literal_string(node.args[1]) if len(node.args) > 1 else "r"
+            if any(flag in (mode or "") for flag in "wax+"):
+                written.update(_path_names_from_expression(node.args[0], assignments))
+        elif func_name.endswith((".write_text", ".write_bytes")) and isinstance(
+            node.func, ast.Attribute
+        ):
+            written.update(_path_names_from_expression(node.func.value, assignments))
+        elif func_name.endswith("processing.run") or func_name == "processing.run":
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Dict):
+                for key, value in zip(node.args[1].keys, node.args[1].values, strict=True):
+                    if _literal_string(key) in {"OUTPUT", "OUTPUT_LAYER", "OUTPUT_TABLE"}:
+                        written.update(_path_names_from_expression(value, assignments))
+        elif func_name.endswith(("writeAsVectorFormatV3", "writeAsVectorFormatV2")):
+            if len(node.args) >= 2:
+                written.update(_path_names_from_expression(node.args[1], assignments))
+
+    missing = []
+    for output in expected_outputs:
+        filename = _output_filename(str(output.get("path") or ""))
+        if filename and filename not in written:
+            missing.append(filename)
+    return missing
+
+
+def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the code/output contract before asking for execution approval."""
+    code = str(arguments.get("code") or "")
+    expected_outputs = arguments.get("expected_outputs") or []
+    if not isinstance(expected_outputs, list):
+        return None
+    unwritten_outputs = find_unwritten_expected_outputs(code, expected_outputs)
+    if not unwritten_outputs:
+        return None
+    return {
+        "success": False,
+        "error": (
+            "代码与预期输出不一致：以下文件已声明但代码没有写入："
+            + "、".join(unwritten_outputs)
+            + "。请直接生成用户要求的最终结果；不要调用 execute_gis_code 探查字段唯一值。"
+            "仅打印到 stdout 不能生成预期文件。"
+        ),
+        "expected_outputs": expected_outputs,
+        "outputs": [],
+        "stdout": "",
+        "stderr": "",
+        "exit_code": None,
+        "duration_ms": 0,
+        "preflight_failed": True,
+    }
+
+
+def _path_names_from_expression(
+    node: ast.AST,
+    assignments: dict[str, set[str]],
+) -> set[str]:
+    if isinstance(node, ast.Name):
+        return assignments.get(node.id, set())
+    names = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            names.update(assignments.get(child.id, set()))
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            candidate = _candidate_output_path(child.value)
+            if candidate:
+                names.add(_output_filename(candidate))
+    return names
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _literal_string(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
 
 
 def _prepare_delivery_outputs(

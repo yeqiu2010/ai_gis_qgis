@@ -26,4 +26,5 @@
   - `必须提供 expected_outputs`：重新生成工具调用时补上用户要求的最终输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
   - `输出文件必须位于工作目录内`：把代码和 `expected_outputs.path` 改为工作目录内相对文件名，并用 `delivery_outputs` 指定用户外部路径。
   - Processing 算法失败：检查算法 ID、参数名、输入图层类型和输出路径。
+  - 空几何或无效几何：使用 Processing context 的 `GeometrySkipInvalid` 排除对应要素；除非用户明确要求修复数据，不得调用 `native:fixgeometries`。
 - 用户取消确认时，不要重复执行，也不要声称工程已改变。

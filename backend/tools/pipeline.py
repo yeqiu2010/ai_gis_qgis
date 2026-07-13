@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ...database.session_db import SessionDB
+from .code_execution import find_unwritten_expected_outputs
 from .registry import ToolEntry
 
 PIPELINE_STAGES = [
@@ -20,8 +22,25 @@ PIPELINE_CYCLE_STATE_SUFFIX = "pipeline_cycle_start"
 def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         artifact = arguments.get("artifact") or {}
+        if isinstance(artifact, str):
+            try:
+                artifact = json.loads(artifact)
+            except json.JSONDecodeError as exc:
+                return {
+                    "success": False,
+                    "error": f"artifact 不是有效的 JSON object：{exc.msg}",
+                    "received_stage": _normalize_stage_name(
+                        str(arguments.get("stage_name") or "").strip()
+                    ),
+                }
         if not isinstance(artifact, dict):
-            return {"success": False, "error": "artifact 必须是 JSON object。"}
+            return {
+                "success": False,
+                "error": "artifact 必须是 JSON object。",
+                "received_stage": _normalize_stage_name(
+                    str(arguments.get("stage_name") or "").strip()
+                ),
+            }
         stage_name = _normalize_stage_name(str(arguments.get("stage_name") or "").strip())
         if not stage_name:
             stage_name = _infer_stage_name(session_db, session_id, artifact)
@@ -29,13 +48,24 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
             return {
                 "success": False,
                 "error": f"stage_name 必须是以下之一：{', '.join(PIPELINE_STAGES)}",
+                "received_stage": stage_name,
             }
         summary = str(arguments.get("summary") or artifact.get("summary") or "").strip()
         if not summary:
-            return {"success": False, "error": f"{stage_name} 阶段必须提供非空 summary。"}
+            summary = f"{_stage_display_name(stage_name)}已完成。"
+            artifact = {**artifact, "summary": summary}
         expected_stage = next_pipeline_stage(session_db, session_id)
         if stage_name != expected_stage:
             completed_stages = current_pipeline_cycle(session_db, session_id)
+            if stage_name in completed_stages:
+                return {
+                    "success": True,
+                    "stage_name": stage_name,
+                    "summary": summary,
+                    "artifact": artifact,
+                    "already_recorded": True,
+                    "expected_stage": expected_stage,
+                }
             return {
                 "success": False,
                 "error": (
@@ -126,6 +156,16 @@ def _infer_stage_name(session_db: SessionDB, session_id: str, artifact: dict[str
     return next_pipeline_stage(session_db, session_id)
 
 
+def _stage_display_name(stage_name: str) -> str:
+    return {
+        "data_overview": "数据盘点",
+        "structured_query": "结构化需求",
+        "solution_plan": "处理方案",
+        "generated_code": "代码生成",
+        "execution_result": "执行结果",
+    }.get(stage_name, stage_name)
+
+
 def next_pipeline_stage(session_db: SessionDB, session_id: str) -> str:
     current_cycle = _current_pipeline_cycle(session_db, session_id)
     if current_cycle == PIPELINE_STAGES:
@@ -180,6 +220,16 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
             return "generated_code 阶段缺少 review。"
         if review.get("passed") is not True:
             return "generated_code 的 review.passed 必须为 true；请修正代码后重新记录本阶段。"
+        unwritten = find_unwritten_expected_outputs(
+            str(artifact.get("code") or ""),
+            artifact["expected_outputs"],
+        )
+        if unwritten:
+            return (
+                "generated_code 的代码没有写入以下 expected_outputs："
+                + "、".join(unwritten)
+                + "。仅打印到 stdout 不会创建输出文件。"
+            )
     if stage_name == "execution_result" and not any(
         key in artifact for key in ("stdout", "stderr", "outputs", "error", "success")
     ):

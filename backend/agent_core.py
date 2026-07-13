@@ -14,7 +14,10 @@ from .context.prompt_builder import PromptBuilder
 from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, LLMProvider
-from .tools.code_execution import build_execute_gis_code_tool
+from .tools.code_execution import (
+    build_execute_gis_code_tool,
+    validate_execute_gis_code_arguments,
+)
 from .tools.custom_tools import load_custom_tool_entries
 from .tools.gis_analysis import build_get_task_context_tool
 from .tools.layer_ops import build_layer_tools
@@ -142,6 +145,49 @@ class AgentCore:
                     if check_cancelled():
                         return events
                     entry = tool_registry.get(call.name)
+                    if call.name == "execute_gis_code":
+                        preflight_result = validate_execute_gis_code_arguments(call.arguments)
+                        if preflight_result is not None:
+                            publish(
+                                agent_event(
+                                    "tool_start",
+                                    {"name": call.name, "arguments": call.arguments},
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                )
+                            )
+                            self._save_process_message(
+                                session_id, "执行前检查生成代码与预期输出。"
+                            )
+                            self.session_db.log_tool_call(
+                                session_id,
+                                call.name,
+                                call.arguments,
+                                preflight_result,
+                                duration_ms=0,
+                            )
+                            tool_results.append(
+                                {
+                                    "name": call.name,
+                                    "arguments": call.arguments,
+                                    "result": preflight_result,
+                                }
+                            )
+                            publish(
+                                agent_event(
+                                    "tool_end",
+                                    {"name": call.name, "result": preflight_result, "duration_ms": 0},
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                )
+                            )
+                            self._save_process_message(
+                                session_id,
+                                "生成代码未通过执行前检查，正在重新生成最终结果代码。\n"
+                                f"error：{preflight_result['error']}",
+                            )
+                            budget.record_tool_call()
+                            continue
                     if entry.requires_confirmation:
                         confirmation_id = str(uuid.uuid4())
                         pending = {
@@ -503,6 +549,8 @@ class AgentCore:
         result: dict[str, Any],
     ) -> dict[str, Any] | None:
         if tool_name != "record_pipeline_stage" or not result.get("success"):
+            return None
+        if result.get("already_recorded"):
             return None
         if result.get("stage_name") != "generated_code":
             return None
@@ -866,6 +914,9 @@ class AgentCore:
                     "不要重复相同错误。常见修复：如果使用 QgsProject/QgsVectorLayer 等 PyQGIS 类，"
                     "可以直接使用当前 QGIS 环境中已有符号，或显式 `from qgis.core import ...`；"
                     "输出仍必须写入 QGIS_AGENT_WORKSPACE。"
+                    "如果错误来自空几何或无效几何，应在 Processing context 中使用 "
+                    "GeometrySkipInvalid 排除这些要素；除非用户明确要求修复源数据，禁止调用 "
+                    "native:fixgeometries，也不得生成完整图层的修复副本。"
                     "如果错误提示必须提供 expected_outputs，必须在下一次 execute_gis_code 调用中"
                     "补上最终输出文件，例如 {\"path\":\"500m.shp\",\"name\":\"500m\",\"type\":\"vector\"}。\n"
                     f"失败参数：{json.dumps(failed_arguments, ensure_ascii=False)}\n"
@@ -1001,7 +1052,11 @@ class AgentCore:
         if result.get("error"):
             process_message = f"{process_message}\nerror：{result['error']}"
         self._save_process_message(session_id, process_message)
-        if result.get("stage_name") == "generated_code" and isinstance(result.get("artifact"), dict):
+        if (
+            result.get("stage_name") == "generated_code"
+            and not result.get("already_recorded")
+            and isinstance(result.get("artifact"), dict)
+        ):
             artifact = result["artifact"]
             if artifact.get("code"):
                 publish(

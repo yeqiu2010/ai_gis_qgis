@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -164,7 +165,11 @@ class QGISCodeExecutor:
             os.environ["QGIS_AGENT_WORKSPACE"] = str(workspace_dir)
             os.environ["QGIS_AGENT_EXPECTED_OUTPUTS"] = json.dumps(payload_outputs, ensure_ascii=False)
             namespace = self._current_qgis_namespace(workspace_dir, iface)
-            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            with (
+                contextlib.redirect_stdout(stdout_buffer),
+                contextlib.redirect_stderr(stderr_buffer),
+                self._responsive_processing(),
+            ):
                 compiled = compile(code, "<ai_gis_agent_current_qgis_code>", "exec")
                 exec(compiled, namespace, namespace)
             outputs = self._collect_outputs(payload_outputs)
@@ -224,6 +229,83 @@ class QGISCodeExecutor:
         }
         namespace.update(self._qgis_symbols())
         return namespace
+
+    @contextmanager
+    def _responsive_processing(self):
+        """Keep Qt responsive while synchronous Processing algorithms are running.
+
+        Generated scripts commonly import ``processing`` themselves, so the module
+        function is patched for the duration of this execution instead of only
+        placing a proxy in the execution namespace.  The original function is
+        always restored, including after an exception.
+        """
+        try:
+            import processing  # type: ignore[import-not-found]
+            from qgis.core import (  # type: ignore[import-not-found]
+                Qgis,
+                QgsProcessingContext,
+                QgsProcessingFeedback,
+            )
+            from qgis.PyQt.QtCore import (  # type: ignore[import-not-found]
+                QCoreApplication,
+                QEventLoop,
+            )
+        except Exception:
+            yield
+            return
+
+        original_run = getattr(processing, "run", None)
+        if original_run is None:
+            yield
+            return
+
+        class ResponsiveFeedback(QgsProcessingFeedback):
+            def __init__(self, delegate=None):
+                super().__init__()
+                self._delegate = delegate
+                self._last_pump = 0.0
+
+            def setProgress(self, progress):  # noqa: N802 - QGIS API name
+                super().setProgress(progress)
+                if self._delegate is not None:
+                    self._delegate.setProgress(progress)
+                now = time.monotonic()
+                if now - self._last_pump >= 0.05:
+                    self._last_pump = now
+                    QCoreApplication.processEvents(QEventLoop.AllEvents, 25)
+
+            def isCanceled(self):  # noqa: N802 - QGIS API name
+                return super().isCanceled() or (
+                    self._delegate is not None and self._delegate.isCanceled()
+                )
+
+        def responsive_run(*args, **kwargs):
+            # Generated scripts often create a plain QgsProcessingFeedback. Wrap
+            # that object too; otherwise an explicit feedback argument bypasses
+            # the event pump and QGIS becomes unresponsive again.
+            mutable_args = list(args)
+            if len(mutable_args) >= 4:
+                mutable_args[3] = ResponsiveFeedback(mutable_args[3])
+            else:
+                kwargs["feedback"] = ResponsiveFeedback(kwargs.get("feedback"))
+            if len(mutable_args) >= 5:
+                context = mutable_args[4] or QgsProcessingContext()
+                mutable_args[4] = context
+            else:
+                context = kwargs.get("context") or QgsProcessingContext()
+                kwargs["context"] = context
+            # Analysis queries must not modify source data just because a source
+            # feature has null/invalid geometry. Exclude it from the operation.
+            context.setInvalidGeometryCheck(
+                Qgis.InvalidGeometryCheck.GeometrySkipInvalid
+            )
+            return original_run(*mutable_args, **kwargs)
+
+        processing.run = responsive_run
+        try:
+            yield
+        finally:
+            processing.run = original_run
 
     def _qgis_symbols(self) -> dict[str, Any]:
         symbols: dict[str, Any] = {}
