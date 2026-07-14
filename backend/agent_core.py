@@ -727,6 +727,23 @@ class AgentCore:
                 return self.llm_provider.chat(system=system, messages=messages, tools=tools)
             except Exception as exc:
                 last_exc = exc
+                if session_id:
+                    try:
+                        self.session_db.log_failure(
+                            session_id,
+                            source_type="llm_call",
+                            source_name=self.llm_provider.name,
+                            error_message=self._short_error(exc),
+                            attempt=attempt,
+                            context={
+                                "model": self.llm_provider.model,
+                                "run_id": run_id,
+                                "max_attempts": self.llm_retry_attempts,
+                            },
+                        )
+                    except Exception:
+                        # Failure telemetry must never replace the original error.
+                        pass
                 if attempt >= self.llm_retry_attempts:
                     break
                 message = (
@@ -897,7 +914,7 @@ class AgentCore:
         failed_arguments: dict[str, Any],
         failed_result: dict[str, Any],
     ) -> list[ChatMessage]:
-        history = self.session_db.get_messages(session_id, limit=20)
+        history = self.session_db.get_conversation_messages(session_id, limit=20)
         messages = [
             ChatMessage(role=row["role"], content=row["content"] or "")
             for row in history
@@ -927,7 +944,7 @@ class AgentCore:
         return messages
 
     def _build_conversation_messages(self, session_id: str) -> list[ChatMessage]:
-        history = self.session_db.get_messages(session_id, limit=50)
+        history = self.session_db.get_conversation_messages(session_id, limit=50)
         messages = [
             ChatMessage(role=row["role"], content=row["content"] or "")
             for row in history

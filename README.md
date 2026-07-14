@@ -16,6 +16,27 @@ AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 Q
 - 代码执行工具：在 QGIS 主线程中运行受控 PyQGIS 代码，并将结果加载回当前工程。
 - 工具确认机制：对需要确认的写入或潜在破坏性操作先请求用户确认。
 - 本地 SQLite 会话库，默认保存到 `~/.qgis_hermes_agent/state.db`。
+- 结构化失败样本日志，记录工具、Pipeline、生成代码、QGIS 运行和 LLM 调用错误，支持 JSONL 导出。
+
+## 失败日志与改进数据
+
+失败样本保存在会话数据库的 `failure_log` 表中。记录内容包括错误来源、工具或阶段、
+错误分类、推断原因、重试次数、是否适合重试、生成代码以及相关参数、stdout/stderr。
+常见分类包括 `output_contract`、`pipeline_stage`、`invalid_geometry`、`missing_output`、
+`generated_code_api`、`timeout`、`rate_limit`、`layer_not_found`、`field_not_found` 和
+`processing_error`；工具流程错误还会分类为 `tool_arguments`、`search_query` 等。
+
+可通过 `SessionDB` 查询或导出 JSONL：
+
+```python
+from ai_gis_qgis.database.session_db import SessionDB
+
+db = SessionDB("~/.qgis_hermes_agent/state.db")
+records = db.get_failure_records(limit=200)
+db.export_failure_records("failure_samples.jsonl")
+```
+
+导出内容可能包含图层名称、本地路径、生成代码和错误上下文，分享给外部人员或模型前应先脱敏。
 
 ## 环境要求
 
@@ -61,6 +82,7 @@ uv run python scripts/package_plugin.py
 - `Temperature`：采样温度。
 - `Max Tokens`：期望的最大输出 token 数。
 - `Context Window`：模型总上下文窗口，例如 vLLM `--max-model-len 32768` 时填写 `32768`。
+- `请求超时（秒）`：等待 OpenAI-compatible/vLLM 完成一次非流式生成的最长时间，默认 300 秒。27B 等大模型或长工具调用建议设置为 300–600 秒。
 
 后端会根据当前输入上下文自动收敛本次 `max_tokens`，避免 `输入 token + 输出 token` 超过模型上下文长度。若 vLLM 返回精确的上下文越界错误，provider 会解析错误并用合法输出上限自动重试一次。
 

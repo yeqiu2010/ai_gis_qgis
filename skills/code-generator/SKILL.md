@@ -37,6 +37,17 @@ tags: [gis, pipeline, code]
 - 大数据任务的缓冲筛选默认溶解缓冲区，最终结果优先输出 GeoPackage。
 - 耗时 Processing 调用必须保留或传入 `QgsProcessingFeedback`，以支持进度、取消和界面事件刷新。
 - 每个用户任务只生成一次面向最终结果的 `execute_gis_code` 调用。不得先生成“打印唯一值”的诊断脚本，不得为 stdout 虚构 `.txt` 输出；字段和值已由用户指定时直接生成最终筛选结果。
+- 不得使用 `mapLayersByName(...)[0]`；先保存 `matches` 并检查非空，再取 `matches[0]`。
+- `processing.run` 写入文件时，结果字典中的 `OUTPUT` 通常是路径字符串，不能对其直接调用 `featureCount()`；需要计数时用 `QgsVectorLayer(result["OUTPUT"], "result", "ogr")` 验证有效后计数，或省略非必要计数。
+- `QgsProcessingFeedback` 从 `qgis.core` 导入，不得写成 `processing.QgsProcessingFeedback()`。
+- 矢量筛选、裁剪、叠加和导出优先使用已检索的 Processing 算法及 `OUTPUT`。不得凭记忆调用 `QgsVectorFileWriter.create/writeAsVectorFormat*` 的重载签名。
+- 不得调用 `QgsProject.addVectorLayer`；最终输出由 `execute_gis_code` 自动加载。不得直接导入 `PyQt5` 或 `PyQt6`，统一使用 `qgis.PyQt`。
+- 不猜测 Processing 结果键（例如 `OUTPUT_COUNT`）或算法 ID/参数；只能使用 `algorithm_evidence` 中读取到的真实 outputs 和参数。
+- Processing 参数类型也必须与 `algorithm_evidence` 一致：`PREDICATE` 传整数枚举列表，不得传 `"intersects"`/`"within"` 等名称；`JOIN_FIELDS` 传字段名字符串列表，不得传字段索引。
+- `native:aggregate` 的 `AGGREGATES` 必须是聚合定义 object 列表，不得传单个 object 或 JSON 字符串。`native:joinattributesbylocation` 的连接图层参数是 `JOIN`，不得混用其他算法的 `OVERLAY`。
+- `QgsGeometry` 空几何判断使用 `isEmpty()`，不得调用不存在的 `isGeosEmpty()`。分析流程的无效几何仍交给 `GeometrySkipInvalid` 排除。
+- 空间连接、聚合等中间结果可能改名或丢弃字段。后续引用前必须检查实际 `result_layer.fields()`；不得假定 `SHAPE_Area` 等源字段一定存在。如果统计目标来自土地图层，应优先在原土地图层上聚合，不要反向依赖连接后的建筑物字段。
+- 不得使用 `??_1` 等乱码或占位字段名。中间输出需自建字段时优先使用 ASCII 内部名，最终 CSV 表头再映射为中文。
 
 ## 常用 PyQGIS 函数和对象
 
@@ -50,7 +61,7 @@ tags: [gis, pipeline, code]
 - `provider = layer.dataProvider()`：获取数据提供器。
 - `provider.addAttributes(source.fields())`：复制字段。
 - `provider.addFeatures(features)`：写入要素。
-- `QgsVectorFileWriter.writeAsVectorFormatV3(...)`：保存矢量文件。
+- 矢量文件输出优先通过已验证的 `processing.run(..., {"OUTPUT": output_path})` 完成。
 - `QgsProcessing.TEMPORARY_OUTPUT`：仅适合中间结果；最终结果必须写到 `QGIS_AGENT_WORKSPACE`。
 - `QgsProcessingFeedback()`：Processing 反馈对象，只有在算法参数确实需要时再使用。
 - `processing.run("native:extractbyexpression", {...})`：按表达式提取。
@@ -58,6 +69,28 @@ tags: [gis, pipeline, code]
 - `processing.run("native:clip", {...})`：裁剪。
 - `processing.run("native:intersection", {...})`：相交。
 - `processing.run("native:joinattributesbylocation", {...})`：空间连接。
+
+## Processing 参数示例
+
+以当前 QGIS 的算法详情为准，空间连接的关键参数形状应类似：
+
+```python
+processing.run(
+    "native:joinattributesbylocation",
+    {
+        "INPUT": input_layer,
+        "PREDICATE": [0],
+        "JOIN": join_layer,
+        "JOIN_FIELDS": ["SHAPE_Area"],
+        "METHOD": 0,
+        "DISCARD_NONMATCHING": True,
+        "PREFIX": "land_",
+        "OUTPUT": output_path,
+    },
+)
+```
+
+其中 `[0]` 只是形状示例；具体枚举数值必须从本次 `inspect_processing_algorithm`/`get_qgis_processing_tool` 的结果取得。
 
 ## 推荐模板：按属性筛选并输出 GeoJSON
 
@@ -119,7 +152,10 @@ from pathlib import Path
 from qgis.core import QgsProject
 import processing
 
-layer = QgsProject.instance().mapLayersByName("道路")[0]
+matches = QgsProject.instance().mapLayersByName("道路")
+if not matches:
+    raise ValueError("找不到图层：道路")
+layer = matches[0]
 output_path = str(Path(QGIS_AGENT_WORKSPACE) / "road_buffer.gpkg")
 
 processing.run(
@@ -144,8 +180,12 @@ from pathlib import Path
 from qgis.core import QgsProject
 import processing
 
-input_layer = QgsProject.instance().mapLayersByName("建筑物")[0]
-overlay_layer = QgsProject.instance().mapLayersByName("研究区")[0]
+input_matches = QgsProject.instance().mapLayersByName("建筑物")
+overlay_matches = QgsProject.instance().mapLayersByName("研究区")
+if not input_matches or not overlay_matches:
+    raise ValueError("找不到建筑物或研究区图层")
+input_layer = input_matches[0]
+overlay_layer = overlay_matches[0]
 output_path = str(Path(QGIS_AGENT_WORKSPACE) / "buildings_clip.gpkg")
 
 processing.run(
@@ -168,3 +208,5 @@ processing.run(
 - 是否包含用户要求的最终输出文件，例如 `500m.shp`？
 - 输出类型是否是 `vector`、`raster`、`table` 或 `file`？
 - 是否避免了 `QgsApplication`、`subprocess`、`eval`、`exec`、删除文件？
+- `PREDICATE`、`JOIN_FIELDS`、`AGGREGATES` 的数值类型是否与算法详情完全一致？
+- 后续使用中间结果字段前，是否检查了该结果的实际字段名？

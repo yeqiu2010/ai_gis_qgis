@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ...database.session_db import SessionDB
+from ..json_recovery import recover_json_object
 from .code_execution import find_unwritten_expected_outputs
 from .registry import ToolEntry
 
@@ -23,16 +23,16 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         artifact = arguments.get("artifact") or {}
         if isinstance(artifact, str):
-            try:
-                artifact = json.loads(artifact)
-            except json.JSONDecodeError as exc:
+            recovered_artifact = recover_json_object(artifact)
+            if recovered_artifact is None:
                 return {
                     "success": False,
-                    "error": f"artifact 不是有效的 JSON object：{exc.msg}",
+                    "error": "artifact 不是可恢复的 JSON object。",
                     "received_stage": _normalize_stage_name(
                         str(arguments.get("stage_name") or "").strip()
                     ),
                 }
+            artifact = recovered_artifact
         if not isinstance(artifact, dict):
             return {
                 "success": False,

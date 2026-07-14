@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
 
+from ..json_recovery import recover_json_object
 from .base_provider import ChatMessage, ChatResponse, ToolCall
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32768
@@ -27,7 +29,7 @@ class OpenAICompatibleProvider:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
-        timeout_seconds: int = 60,
+        timeout_seconds: int = 300,
     ):
         self.model = model
         self.base_url = self._normalize_base_url(base_url)
@@ -35,7 +37,7 @@ class OpenAICompatibleProvider:
         self.temperature = temperature
         self.max_tokens = max(1, int(max_tokens))
         self.max_context_tokens = max(0, int(max_context_tokens))
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = max(1, int(timeout_seconds))
 
     def chat(
         self,
@@ -51,6 +53,7 @@ class OpenAICompatibleProvider:
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": max_tokens,
+            "stream": False,
             "messages": api_messages,
         }
         if tools:
@@ -65,10 +68,7 @@ class OpenAICompatibleProvider:
             function = call.get("function") or {}
             arguments = function.get("arguments") or {}
             if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments) if arguments else {}
-                except json.JSONDecodeError:
-                    arguments = {"_raw_arguments": arguments}
+                arguments = self._parse_tool_arguments(arguments)
             tool_calls.append(
                 ToolCall(
                     id=str(call.get("id") or ""),
@@ -83,6 +83,11 @@ class OpenAICompatibleProvider:
             tool_calls=tool_calls,
         )
 
+    def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
+        """Recover valid JSON arguments from common model wrapper artifacts."""
+        parsed = recover_json_object(raw_arguments)
+        return parsed if parsed is not None else {"_raw_arguments": raw_arguments}
+
     def _post_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -93,11 +98,12 @@ class OpenAICompatibleProvider:
             headers=headers,
             method="POST",
         )
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except TimeoutError as exc:
-            raise RuntimeError(f"OpenAI-compatible 请求超时：{exc}") from exc
+            raise self._timeout_error(payload, started, exc) from exc
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             retry_payload = self._payload_for_context_window_retry(payload, body)
@@ -116,9 +122,35 @@ class OpenAICompatibleProvider:
                     raise RuntimeError(
                         f"OpenAI-compatible 请求失败：HTTP {retry_exc.code} {retry_body}"
                     ) from retry_exc
+                except TimeoutError as retry_exc:
+                    raise self._timeout_error(retry_payload, started, retry_exc) from retry_exc
+                except urllib.error.URLError as retry_exc:
+                    if isinstance(retry_exc.reason, TimeoutError):
+                        raise self._timeout_error(
+                            retry_payload, started, retry_exc.reason
+                        ) from retry_exc
+                    raise RuntimeError(f"OpenAI-compatible 请求失败：{retry_exc}") from retry_exc
             raise RuntimeError(f"OpenAI-compatible 请求失败：HTTP {exc.code} {body}") from exc
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise self._timeout_error(payload, started, exc.reason) from exc
             raise RuntimeError(f"OpenAI-compatible 请求失败：{exc}") from exc
+
+    def _timeout_error(
+        self,
+        payload: dict[str, Any],
+        started: float,
+        exc: BaseException,
+    ) -> RuntimeError:
+        elapsed = time.monotonic() - started
+        prompt_tokens = self._estimate_prompt_tokens(payload.get("messages") or [], payload.get("tools"))
+        return RuntimeError(
+            "OpenAI-compatible 客户端读取超时："
+            f"等待 {elapsed:.1f} 秒（配置上限 {self.timeout_seconds} 秒），"
+            f"估算输入 {prompt_tokens} tokens，最大输出 {payload.get('max_tokens')} tokens。"
+            "这通常表示非流式生成尚未完成，不代表服务端存在并发占用。"
+            f"底层错误：{exc}"
+        )
 
     def _bounded_max_tokens(
         self,

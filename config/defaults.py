@@ -12,6 +12,7 @@ DEFAULT_CONFIG = {
         "temperature": 0.1,
         "max_tokens": 4096,
         "max_context_tokens": 32768,
+        "request_timeout_seconds": 300,
     },
     "database": {
         "path": "~/.qgis_hermes_agent/state.db",

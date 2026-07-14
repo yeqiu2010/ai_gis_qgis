@@ -292,15 +292,20 @@ def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, 
     if not isinstance(expected_outputs, list):
         return None
     unwritten_outputs = find_unwritten_expected_outputs(code, expected_outputs)
-    if not unwritten_outputs:
+    issues = find_generated_code_issues(code)
+    if unwritten_outputs:
+        issues.insert(
+            0,
+            "以下文件已声明但代码没有写入：" + "、".join(unwritten_outputs),
+        )
+    if not issues:
         return None
     return {
         "success": False,
         "error": (
-            "代码与预期输出不一致：以下文件已声明但代码没有写入："
-            + "、".join(unwritten_outputs)
-            + "。请直接生成用户要求的最终结果；不要调用 execute_gis_code 探查字段唯一值。"
-            "仅打印到 stdout 不能生成预期文件。"
+            "生成代码未通过执行前检查："
+            + "；".join(issues)
+            + "。请重新生成面向最终结果的代码，不要用 execute_gis_code 做诊断探查。"
         ),
         "expected_outputs": expected_outputs,
         "outputs": [],
@@ -310,6 +315,178 @@ def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, 
         "duration_ms": 0,
         "preflight_failed": True,
     }
+
+
+def find_generated_code_issues(code: str) -> list[str]:
+    """Detect recurrent PyQGIS mistakes observed in execution failure logs."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    issues: list[str] = []
+    imported_roots: set[str] = set()
+    output_path_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+            if any(alias.name in {"PyQt5", "PyQt6"} or alias.name.startswith(("PyQt5.", "PyQt6.")) for alias in node.names):
+                _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == "os":
+                imported_roots.add("os")
+            if module in {"PyQt5", "PyQt6"} or module.startswith(("PyQt5.", "PyQt6.")):
+                _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript):
+            if _subscript_string_key(node.value) == "OUTPUT":
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        output_path_names.add(target.id)
+
+    uses_os = any(
+        isinstance(node, ast.Name) and node.id == "os" and isinstance(getattr(node, "ctx", None), ast.Load)
+        for node in ast.walk(tree)
+    )
+    if uses_os and "os" not in imported_roots:
+        _append_issue(issues, "使用了 os 但没有 import os；输出路径应优先使用 Path(QGIS_AGENT_WORKSPACE)")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "processing"
+                and node.attr == "QgsProcessingFeedback"
+            ):
+                _append_issue(
+                    issues,
+                    "QgsProcessingFeedback 属于 qgis.core，不是 processing 模块属性",
+                )
+            if node.attr == "addVectorLayer":
+                _append_issue(
+                    issues,
+                    "QgsProject 没有 addVectorLayer；输出图层由执行器自动加载",
+                )
+            if node.attr == "isGeosEmpty":
+                _append_issue(
+                    issues,
+                    "QgsGeometry 没有 isGeosEmpty；空几何应使用 isEmpty 判断，无效几何由 Processing GeometrySkipInvalid 排除",
+                )
+            if node.attr in {
+                "create",
+                "writeAsVectorFormat",
+                "writeAsVectorFormatV2",
+                "writeAsVectorFormatV3",
+            } and _attribute_chain_contains(node.value, "QgsVectorFileWriter"):
+                _append_issue(
+                    issues,
+                    "禁止猜测 QgsVectorFileWriter 重载签名；矢量结果优先使用已检索的 Processing OUTPUT",
+                )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (
+                node.func.attr == "featureCount"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in output_path_names
+            ):
+                _append_issue(
+                    issues,
+                    "processing.run 的文件 OUTPUT 是路径字符串，不能直接调用 featureCount；需加载 QgsVectorLayer 或省略计数",
+                )
+            if _call_name(node.func) == "processing.run":
+                _check_processing_call(node, issues)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call):
+            if (
+                isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "mapLayersByName"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == 0
+            ):
+                _append_issue(
+                    issues,
+                    "mapLayersByName(...)[0] 缺少空列表检查；必须先检查 matches",
+                )
+        if isinstance(node, ast.Subscript):
+            field_key = _subscript_string_key(node)
+            if field_key and "??" in field_key:
+                _append_issue(
+                    issues,
+                    "字段名中包含 ?? 乱码占位符；必须使用 inspect_layer 返回的真实字段名，中间输出优先使用 ASCII 别名",
+                )
+    return issues
+
+
+def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
+    """Validate parameter shapes that Processing otherwise rejects at runtime."""
+    if len(node.args) < 2:
+        return
+    algorithm_id = (_literal_string(node.args[0]) or "").lower()
+    parameters = _literal_dict_items(node.args[1])
+    if not parameters:
+        return
+
+    predicate = parameters.get("PREDICATE")
+    if isinstance(predicate, (ast.List, ast.Tuple)) and any(
+        isinstance(item, ast.Constant) and isinstance(item.value, str)
+        for item in predicate.elts
+    ):
+        _append_issue(
+            issues,
+            "Processing PREDICATE 必须使用算法详情中的整数枚举列表，不能使用 intersects/within 等字符串",
+        )
+
+    join_fields = parameters.get("JOIN_FIELDS")
+    if isinstance(join_fields, (ast.List, ast.Tuple)) and any(
+        isinstance(item, ast.Constant)
+        and isinstance(item.value, int)
+        and not isinstance(item.value, bool)
+        for item in join_fields.elts
+    ):
+        _append_issue(
+            issues,
+            "Processing JOIN_FIELDS 必须是字段名字符串列表，不能使用字段索引",
+        )
+
+    if algorithm_id == "native:aggregate":
+        aggregates = parameters.get("AGGREGATES")
+        if aggregates is not None and not isinstance(aggregates, (ast.List, ast.Tuple)):
+            _append_issue(
+                issues,
+                "native:aggregate 的 AGGREGATES 必须是聚合定义 object 列表，不能传 dict 或 JSON 字符串",
+            )
+
+    if algorithm_id == "native:joinattributesbylocation" and "OVERLAY" in parameters:
+        _append_issue(
+            issues,
+            "native:joinattributesbylocation 的连接图层参数名是 JOIN，不是 OVERLAY；调用前应以 inspect_processing_algorithm 返回的参数为准",
+        )
+
+
+def _literal_dict_items(node: ast.AST) -> dict[str, ast.AST]:
+    if not isinstance(node, ast.Dict):
+        return {}
+    items: dict[str, ast.AST] = {}
+    for key, value in zip(node.keys, node.values, strict=True):
+        literal_key = _literal_string(key)
+        if literal_key is not None:
+            items[literal_key] = value
+    return items
+
+
+def _subscript_string_key(node: ast.Subscript) -> str | None:
+    return _literal_string(node.slice)
+
+
+def _attribute_chain_contains(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name
+    if isinstance(node, ast.Attribute):
+        return _attribute_chain_contains(node.value, name)
+    return False
+
+
+def _append_issue(issues: list[str], issue: str) -> None:
+    if issue not in issues:
+        issues.append(issue)
 
 
 def _path_names_from_expression(

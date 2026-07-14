@@ -148,9 +148,27 @@ class SessionDB:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def get_conversation_messages(
+        self, session_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Return user/assistant history, applying the limit after role filtering."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, role, content, timestamp, event_type, finish_reason
+                FROM messages
+                WHERE session_id = ? AND role IN ('user', 'assistant')
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def search_messages(
         self, query: str, *, session_id: str | None = None, limit: int = 20
     ) -> list[dict[str, Any]]:
+        fts_query = self._fts_literal_query(query)
         with self._connect() as connection:
             if session_id:
                 rows = connection.execute(
@@ -162,7 +180,7 @@ class SessionDB:
                     ORDER BY rank
                     LIMIT ?
                     """,
-                    (query, session_id, limit),
+                    (fts_query, session_id, limit),
                 ).fetchall()
             else:
                 rows = connection.execute(
@@ -174,9 +192,17 @@ class SessionDB:
                     ORDER BY rank
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (fts_query, limit),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _fts_literal_query(query: str) -> str:
+        """Treat user/model search text as terms, not raw FTS5 syntax."""
+        terms = [term for term in query.split() if term]
+        if not terms:
+            return '""'
+        return " AND ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
     def get_recent_tool_calls(self, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -283,7 +309,30 @@ class SessionDB:
             )
         if cursor.lastrowid is None:
             raise RuntimeError("SQLite did not return a tool call id")
-        return int(cursor.lastrowid)
+        record_id = int(cursor.lastrowid)
+        if not success:
+            self.log_failure(
+                session_id,
+                source_type="tool_call",
+                source_name=tool_name,
+                source_record_id=record_id,
+                stage_name=str(arguments.get("stage_name") or "") or None,
+                error_message=str(result.get("error") or "工具调用失败"),
+                generated_code=self._failure_generated_code(tool_name, arguments),
+                context={"arguments": arguments, "result": result},
+                preflight_failed=bool(result.get("preflight_failed")),
+            )
+        return record_id
+
+    @staticmethod
+    def _failure_generated_code(tool_name: str, arguments: dict[str, Any]) -> str | None:
+        if tool_name == "execute_gis_code":
+            return str(arguments.get("code") or "") or None
+        if tool_name == "record_pipeline_stage":
+            artifact = arguments.get("artifact")
+            if isinstance(artifact, dict):
+                return str(artifact.get("code") or "") or None
+        return None
 
     def log_code_execution(
         self,
@@ -329,7 +378,107 @@ class SessionDB:
             )
         if cursor.lastrowid is None:
             raise RuntimeError("SQLite did not return a code execution id")
+        record_id = int(cursor.lastrowid)
+        if not success:
+            self.log_failure(
+                session_id,
+                source_type="code_execution",
+                source_name="execute_gis_code",
+                source_record_id=record_id,
+                error_message=error_message or stderr or "代码执行失败",
+                generated_code=code,
+                context={
+                    "workspace_dir": workspace_dir,
+                    "expected_outputs": expected_outputs,
+                    "outputs": outputs,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                },
+            )
+        return record_id
+
+    def log_failure(
+        self,
+        session_id: str,
+        *,
+        source_type: str,
+        error_message: str,
+        source_name: str | None = None,
+        source_record_id: int | None = None,
+        stage_name: str | None = None,
+        generated_code: str | None = None,
+        context: dict[str, Any] | None = None,
+        attempt: int | None = None,
+        preflight_failed: bool = False,
+    ) -> int:
+        from ..backend.failure_analysis import classify_failure
+
+        classification = classify_failure(error_message, preflight_failed=preflight_failed)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT INTO failure_log (
+                    session_id, source_type, source_name, source_record_id, stage_name,
+                    error_code, error_message, cause, retryable, attempt,
+                    generated_code, context_json, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    source_type,
+                    source_name,
+                    source_record_id,
+                    stage_name,
+                    classification["error_code"],
+                    error_message,
+                    classification["cause"],
+                    1 if classification["retryable"] else 0,
+                    attempt,
+                    generated_code,
+                    json.dumps(context or {}, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a failure log id")
         return int(cursor.lastrowid)
+
+    def get_failure_records(
+        self, *, session_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM failure_log"
+        parameters: list[Any] = []
+        if session_id:
+            query += " WHERE session_id = ?"
+            parameters.append(session_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        parameters.append(max(1, limit))
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        records = []
+        for row in reversed(rows):
+            record = dict(row)
+            try:
+                record["context"] = json.loads(record.pop("context_json") or "{}")
+            except json.JSONDecodeError:
+                record["context"] = {}
+                record.pop("context_json", None)
+            records.append(record)
+        return records
+
+    def export_failure_records(
+        self, output_path: Path | str, *, session_id: str | None = None
+    ) -> Path:
+        path = Path(output_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = self.get_failure_records(session_id=session_id, limit=1_000_000)
+        with path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return path
 
     def log_stage_artifact(
         self,

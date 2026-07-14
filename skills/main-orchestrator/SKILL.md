@@ -57,6 +57,7 @@ tags: [orchestration, routing, gis]
 - 用户询问当前工程、图层列表、字段、CRS、范围、要素数时，优先使用 `list_layers` 或 `inspect_layer`。
 - 用户要求加载数据时，必须确认用户已提供明确的 `source` 路径或 QGIS 数据源 URI；缺失时先询问，不要猜测本地路径。
 - 从“加载 E:\data\roads.shp 数据”这类自然语言中提取真实路径 `E:\data\roads.shp` 作为 `load_layer.source`，不要把“加载”“数据”“图层”等说明性文字传给工具。
+- `inspect_layer` 返回图层 ID 后，后续检查优先传 `layer_id`，不要把数据源与图层组合显示名当成新的 `layer_name`。工具会兼容“数据源 — 图层”形式，但 ID 最稳定。
 - 用户要求删除、移除、导出覆盖类操作时，可以准备工具调用，但必须依赖工具确认流程；不要告诉用户已经完成，直到工具返回成功。
 - 用户要求“导出/生成”新的分析结果但没有提供目录时，不要追问保存文件夹；默认交给 `execute_gis_code` 输出到 `QGIS_AGENT_WORKSPACE` 并加载到 QGIS。
 - 只有用户明确要求把已有图层导出到某个外部目录时，才使用 `export_layer` 并要求 `output_path`。

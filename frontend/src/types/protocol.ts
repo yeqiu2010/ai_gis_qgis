@@ -80,6 +80,7 @@ export interface AppSettings {
     temperature?: number
     max_tokens?: number
     max_context_tokens?: number
+    request_timeout_seconds?: number
   }
   database?: Record<string, unknown>
   executor?: Record<string, unknown>

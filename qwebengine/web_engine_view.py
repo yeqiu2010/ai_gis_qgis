@@ -372,6 +372,11 @@ else:
             max_context_tokens_input.setSingleStep(4096)
             max_context_tokens_input.setValue(int(llm.get("max_context_tokens") or 32768))
 
+            request_timeout_input = QSpinBox(dialog)
+            request_timeout_input.setRange(10, 3600)
+            request_timeout_input.setSingleStep(30)
+            request_timeout_input.setValue(int(llm.get("request_timeout_seconds") or 300))
+
             form.addRow("提供商", provider_box)
             form.addRow("模型名", model_input)
             form.addRow("Base URL", base_url_input)
@@ -379,6 +384,7 @@ else:
             form.addRow("Temperature", temperature_input)
             form.addRow("Max Tokens", max_tokens_input)
             form.addRow("Context Window", max_context_tokens_input)
+            form.addRow("请求超时（秒）", request_timeout_input)
             dialog_layout.addLayout(form)
 
             if hasattr(QDialogButtonBox, "StandardButton"):
@@ -411,6 +417,7 @@ else:
                     "temperature": temperature_input.value(),
                     "max_tokens": max_tokens_input.value(),
                     "max_context_tokens": max_context_tokens_input.value(),
+                    "request_timeout_seconds": request_timeout_input.value(),
                 }
             )
             updated["llm"] = updated_llm

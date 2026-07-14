@@ -129,11 +129,29 @@ def _find_layer(identifier: str):
         if candidate.name() == identifier or candidate.name().lower() == identifier.lower()
     ]
     if not matches:
+        aliases = _layer_name_aliases(identifier)
+        matches = [
+            candidate
+            for candidate in project.mapLayers().values()
+            if candidate.name().casefold() in aliases
+        ]
+    if not matches:
         raise ValueError(f"找不到图层：{identifier}")
     if len(matches) > 1:
         names = ", ".join(f"{layer.name()}({layer.id()})" for layer in matches)
         raise ValueError(f"存在多个同名图层，请使用 layer_id：{names}")
     return matches[0]
+
+
+def _layer_name_aliases(identifier: str) -> set[str]:
+    """Extract a leaf layer name from UI labels such as 'database — layer'."""
+    aliases = set()
+    for separator in (" — ", " – ", " - ", "::"):
+        if separator in identifier:
+            leaf = identifier.rsplit(separator, 1)[-1].strip()
+            if leaf:
+                aliases.add(leaf.casefold())
+    return aliases
 
 
 def _inspect_layer(layer, sample_limit: int = 5) -> dict[str, Any]:

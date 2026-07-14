@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import types
@@ -12,10 +13,11 @@ from ai_gis_qgis.backend.executor.qgis_executor import QGISCodeExecutor
 from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
+    find_generated_code_issues,
     find_unwritten_expected_outputs,
     infer_expected_outputs_from_code,
 )
-from ai_gis_qgis.backend.tools.layer_ops import _normalize_source
+from ai_gis_qgis.backend.tools.layer_ops import _layer_name_aliases, _normalize_source
 from ai_gis_qgis.backend.tools.registry import ToolEntry, ToolRegistry
 from ai_gis_qgis.database.session_db import SessionDB
 
@@ -400,6 +402,12 @@ def test_load_layer_source_normalization_does_not_truncate_by_extension():
     assert _normalize_source('"E:/Desktop/test/2.gpkg"') == "E:/Desktop/test/2.gpkg"
 
 
+def test_layer_name_aliases_extract_leaf_from_combined_display_name():
+    assert _layer_name_aliases("地理底图 — 院落") == {"院落"}
+    assert _layer_name_aliases("database::Roads") == {"roads"}
+    assert _layer_name_aliases("院落") == set()
+
+
 def test_execute_gis_code_requires_confirmation_and_runs_worker(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="code flow", model="code-execution-test-model", source="test")
@@ -680,6 +688,21 @@ def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
     assert "代码没有写入" in result["error"]
     assert "missing.txt" in result["error"]
 
+    session_db.log_tool_call(
+        session.id,
+        "execute_gis_code",
+        {
+            "code": "print('missing.txt')",
+            "expected_outputs": [{"path": "missing.txt", "name": "missing", "type": "file"}],
+        },
+        result,
+        duration_ms=0,
+    )
+    failures = session_db.get_failure_records(session_id=session.id)
+    assert failures[-1]["error_code"] == "output_contract"
+    assert failures[-1]["source_type"] == "tool_call"
+    assert failures[-1]["generated_code"] == "print('missing.txt')"
+
 
 def test_infers_expected_outputs_from_generated_output_path():
     code = """
@@ -739,6 +762,85 @@ report_path.write_text("ok", encoding="utf-8")
             {"path": "report.txt", "name": "report", "type": "file"},
         ],
     ) == []
+
+
+def test_detects_recurrent_generated_pyqgis_mistakes():
+    code = """
+from PyQt5.QtCore import QVariant
+from qgis.core import QgsProject, QgsVectorFileWriter
+import processing
+
+layer = QgsProject.instance().mapLayersByName("建筑物")[0]
+feedback = processing.QgsProcessingFeedback()
+result = processing.run("native:extractbyexpression", {
+    "INPUT": layer,
+    "EXPRESSION": "1=1",
+    "OUTPUT": "result.gpkg",
+})
+output = result["OUTPUT"]
+print(output.featureCount())
+QgsVectorFileWriter.writeAsVectorFormatV3(layer, "result.gpkg", "UTF-8")
+QgsProject.instance().addVectorLayer("result.gpkg", "result", "ogr")
+"""
+
+    issues = find_generated_code_issues(code)
+
+    assert any("qgis.PyQt" in issue for issue in issues)
+    assert any("mapLayersByName" in issue for issue in issues)
+    assert any("QgsProcessingFeedback" in issue for issue in issues)
+    assert any("featureCount" in issue for issue in issues)
+    assert any("QgsVectorFileWriter" in issue for issue in issues)
+    assert any("addVectorLayer" in issue for issue in issues)
+
+
+def test_allows_guarded_processing_output_code():
+    code = """
+from pathlib import Path
+from qgis.core import QgsProject
+import processing
+
+matches = QgsProject.instance().mapLayersByName("建筑物")
+if not matches:
+    raise ValueError("找不到图层")
+output_path = str(Path(QGIS_AGENT_WORKSPACE) / "result.gpkg")
+processing.run("native:extractbyexpression", {
+    "INPUT": matches[0],
+    "EXPRESSION": "1=1",
+    "OUTPUT": output_path,
+})
+"""
+
+    assert find_generated_code_issues(code) == []
+
+
+def test_detects_processing_parameter_shapes_from_failure_logs():
+    code = """
+processing.run("native:joinattributesbylocation", {
+    "INPUT": buildings,
+    "PREDICATE": ["intersects"],
+    "OVERLAY": land,
+    "JOIN_FIELDS": [1, 27],
+    "OUTPUT": "joined.gpkg",
+})
+processing.run("native:aggregate", {
+    "INPUT": land,
+    "GROUP_BY": "district",
+    "AGGREGATES": {"aggregate": "sum", "input": "SHAPE_Area"},
+    "OUTPUT": "summary.gpkg",
+})
+if geometry.isGeosEmpty():
+    print("empty")
+print(feature["??_1"])
+"""
+
+    issues = find_generated_code_issues(code)
+
+    assert any("PREDICATE" in issue and "整数枚举" in issue for issue in issues)
+    assert any("JOIN_FIELDS" in issue and "字段名" in issue for issue in issues)
+    assert any("AGGREGATES" in issue and "object 列表" in issue for issue in issues)
+    assert any("参数名是 JOIN" in issue for issue in issues)
+    assert any("isGeosEmpty" in issue for issue in issues)
+    assert any("??" in issue and "字段名" in issue for issue in issues)
 
 
 def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
@@ -835,6 +937,33 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     assert "landuse" in memory
     assert "中山公园" in memory
     assert messages[-1].content == "导出公园地块"
+
+
+def test_conversation_limit_is_applied_after_role_filtering(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="role filtered history", model="test", source="test")
+    session_db.save_message(session.id, "user", "请分析建筑物", event_type="user")
+    for index in range(60):
+        session_db.save_message(
+            session.id,
+            "system",
+            f"工具调用过程 {index}",
+            event_type="process",
+        )
+
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+    messages = core._build_conversation_messages(session.id)
+    retry_messages = core._retry_messages_for_code_failure(
+        session.id,
+        {"code": "raise ValueError()"},
+        {"success": False, "error": "failed"},
+    )
+
+    assert any(message.role == "user" and message.content == "请分析建筑物" for message in messages)
+    assert any(
+        message.role == "user" and message.content == "请分析建筑物"
+        for message in retry_messages
+    )
 
 
 def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
@@ -1018,6 +1147,26 @@ def test_record_pipeline_stage_accepts_json_artifact_and_duplicate(tmp_path: Pat
     assert duplicate["already_recorded"] is True
     assert duplicate["expected_stage"] == "structured_query"
     assert session_db.list_pipeline_stage_names(session.id) == ["data_overview"]
+
+
+def test_record_pipeline_stage_recovers_wrapped_nested_json_artifact(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="pipeline wrapped artifact", model="test", source="test")
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    result = tool.handler(
+        {
+            "stage_name": "data_overview",
+            "artifact": '{"summary":"图层盘点完成"}\n</invoke>}',
+        }
+    )
+
+    assert result["success"] is True
+    assert result["artifact"]["summary"] == "图层盘点完成"
 
 
 def test_generated_code_stage_requires_passed_review(tmp_path: Path):
@@ -1268,6 +1417,32 @@ def test_agent_core_retries_llm_provider_failures(tmp_path: Path):
     assert len(retry_messages) == 2
     final_message = next(event for event in reversed(events) if event["type"] == "message")
     assert final_message["payload"]["content"] == "模型已恢复。"
+    failures = session_db.get_failure_records(session_id=session.id)
+    assert [item["error_code"] for item in failures] == ["timeout", "timeout"]
+    assert [item["attempt"] for item in failures] == [1, 2]
+
+    export_path = session_db.export_failure_records(tmp_path / "failures.jsonl")
+    exported = [json.loads(line) for line in export_path.read_text(encoding="utf-8").splitlines()]
+    assert len(exported) == 2
+    assert exported[0]["source_type"] == "llm_call"
+
+
+def test_search_messages_treats_dotted_query_as_literal_terms(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="search", model="test", source="test")
+    session_db.save_message(
+        session.id,
+        "assistant",
+        "generated_code 使用 processing.run 计算建筑密度和用地类型。",
+    )
+
+    matches = session_db.search_messages(
+        "processing.run 建筑密度 用地类型",
+        session_id=session.id,
+    )
+
+    assert len(matches) == 1
+    assert "processing.run" in matches[0]["content"]
 
 
 def test_agent_core_returns_agent_message_after_llm_retries_exhausted(tmp_path: Path):

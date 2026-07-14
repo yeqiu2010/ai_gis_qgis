@@ -31,7 +31,8 @@ const settingsForm = ref({
   api_key: '',
   temperature: 0.1,
   max_tokens: 4096,
-  max_context_tokens: 32768
+  max_context_tokens: 32768,
+  request_timeout_seconds: 300
 })
 const providerOptions = [
   { value: 'openai_compatible', label: 'OpenAI Compatible' },
@@ -219,7 +220,8 @@ async function loadSettings() {
     api_key: loaded.llm?.api_key || '',
     temperature: Number(loaded.llm?.temperature ?? 0.1),
     max_tokens: Number(loaded.llm?.max_tokens ?? 4096),
-    max_context_tokens: Number(loaded.llm?.max_context_tokens ?? 32768)
+    max_context_tokens: Number(loaded.llm?.max_context_tokens ?? 32768),
+    request_timeout_seconds: Number(loaded.llm?.request_timeout_seconds ?? 300)
   }
 }
 
@@ -244,7 +246,8 @@ async function saveSettings() {
         api_key: settingsForm.value.api_key.trim(),
         temperature: Number(settingsForm.value.temperature),
         max_tokens: Number(settingsForm.value.max_tokens),
-        max_context_tokens: Number(settingsForm.value.max_context_tokens)
+        max_context_tokens: Number(settingsForm.value.max_context_tokens),
+        request_timeout_seconds: Number(settingsForm.value.request_timeout_seconds)
       }
     })
     settings.value = saved
@@ -255,7 +258,8 @@ async function saveSettings() {
       api_key: saved.llm?.api_key || '',
       temperature: Number(saved.llm?.temperature ?? 0.1),
       max_tokens: Number(saved.llm?.max_tokens ?? 4096),
-      max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768)
+      max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768),
+      request_timeout_seconds: Number(saved.llm?.request_timeout_seconds ?? 300)
     }
     settingsMessage.value = '设置已保存。'
   } finally {
@@ -545,6 +549,16 @@ async function waitForPaint() {
             min="4096"
             max="1000000"
             step="4096"
+          />
+        </label>
+        <label>
+          <span>请求超时（秒）</span>
+          <input
+            v-model.number="settingsForm.request_timeout_seconds"
+            type="number"
+            min="10"
+            max="3600"
+            step="30"
           />
         </label>
       </div>

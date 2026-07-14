@@ -31,6 +31,17 @@ tags: [gis, pipeline, review]
 - `processing.run` 参数名与已读取的算法详情不一致。
 - 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
 - 用户未明确要求修复数据，却调用 `native:fixgeometries`；分析查询应通过 Processing context 的 `GeometrySkipInvalid` 排除空几何或无效几何要素。
+- 使用 `mapLayersByName(...)[0]` 而未先检查返回列表。
+- 对 `processing.run` 的文件 `OUTPUT` 路径字符串直接调用 `featureCount()`。
+- 使用 `processing.QgsProcessingFeedback()`；正确类位于 `qgis.core`。
+- Processing `PREDICATE` 传入 `"intersects"`/`"within"` 等字符串，而不是算法详情定义的整数枚举列表。
+- `JOIN_FIELDS` 传入字段索引而不是字段名；`native:aggregate` 的 `AGGREGATES` 不是 object 列表。
+- `native:joinattributesbylocation` 用 `OVERLAY` 代替 `JOIN`，或者其他参数名/类型与算法详情不一致。
+- 调用不存在的 `QgsGeometry.isGeosEmpty()`；空几何用 `isEmpty()`，无效几何由 `GeometrySkipInvalid` 排除。
+- 未检查空间连接/聚合输出的实际字段，就假定 `SHAPE_Area` 等源字段仍然存在。
+- 使用 `??_1` 等乱码/占位字段名，而不是来自 `inspect_layer` 或当前结果 `fields()` 的真实字段名。
+- 未读取精确 API 证据却直接调用 `QgsVectorFileWriter.create/writeAsVectorFormat*` 重载；常规矢量输出应使用 Processing。
+- 调用不存在的 `QgsProject.addVectorLayer`，或猜测未在算法详情中出现的结果键（如 `OUTPUT_COUNT`）。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
 - 创建 Polygon/Line/Point 输出图层，却没有为输出要素调用 `setGeometry`；纯统计结果
@@ -48,8 +59,7 @@ tags: [gis, pipeline, review]
 - Processing 输出参数必须是工作目录内路径字符串。
 - 输出 vector/raster 后，`expected_outputs.type` 应匹配。
 - 属性值探查不是最终产物时，不得虚构 `.txt` 预期输出；优先使用 `inspect_layer`，确需输出诊断文件时必须在代码中真实写入。
-- 写 GeoPackage 时明确设置 `SaveVectorOptions.driverName = "GPKG"` 和输出图层名，并检查
-  `QgsVectorFileWriter.writeAsVectorFormatV3` 返回状态。
+- 写 GeoPackage 时优先使用 Processing 算法的 `OUTPUT` 路径；只有取得当前 QGIS 版本精确 API 证据时才允许使用 Writer API。
 - 密度、覆盖率等比值必须审查分子与分母的统计粒度一致；按用地类型统计时，分母应为该
   类型唯一地块面积总量，不能使用任意单个地块面积。
 

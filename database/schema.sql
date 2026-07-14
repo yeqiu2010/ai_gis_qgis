@@ -82,3 +82,26 @@ CREATE TABLE IF NOT EXISTS code_execution_log (
     error_message TEXT,
     timestamp REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS failure_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    source_name TEXT,
+    source_record_id INTEGER,
+    stage_name TEXT,
+    error_code TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    cause TEXT,
+    retryable INTEGER DEFAULT 0,
+    attempt INTEGER,
+    generated_code TEXT,
+    context_json TEXT,
+    timestamp REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS failure_log_session_time
+ON failure_log(session_id, timestamp);
+
+CREATE INDEX IF NOT EXISTS failure_log_error_code
+ON failure_log(error_code);

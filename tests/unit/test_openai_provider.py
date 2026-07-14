@@ -5,6 +5,7 @@ import urllib.error
 
 from ai_gis_qgis.backend.llm.base_provider import ChatMessage
 from ai_gis_qgis.backend.llm.openai_provider import OpenAICompatibleProvider
+from ai_gis_qgis.backend.llm.provider_registry import create_provider
 
 
 class FakeHTTPResponse:
@@ -54,6 +55,46 @@ def test_openai_compatible_allows_local_ollama_without_api_key(monkeypatch):
     assert "Authorization" not in captured["headers"]
     assert captured["payload"]["model"] == "gemma-4-31B-it-Q4:latest"
     assert response.content == "this is a test"
+
+
+def test_provider_registry_passes_configured_request_timeout():
+    provider = create_provider(
+        {
+            "llm": {
+                "provider": "openai_compatible",
+                "model": "qwen",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "request_timeout_seconds": 480,
+            }
+        }
+    )
+
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.timeout_seconds == 480
+
+
+def test_timeout_error_reports_client_limit_and_request_size(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(
+        model="qwen",
+        base_url="http://127.0.0.1:8000/v1",
+        timeout_seconds=300,
+    )
+
+    try:
+        provider.chat(system="system", messages=[ChatMessage(role="user", content="测试")])
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected timeout")
+
+    assert "配置上限 300 秒" in message
+    assert "估算输入" in message
+    assert "最大输出" in message
+    assert "不代表服务端存在并发占用" in message
 
 
 class FakeHTTPErrorBody:
@@ -115,3 +156,26 @@ def test_openai_compatible_retries_with_bounded_max_tokens_after_context_error(m
 
     assert response.content == "this is a test"
     assert [payload["max_tokens"] for payload in payloads] == [24000, 23935]
+
+
+def test_tool_arguments_parser_recovers_json_before_invoke_markup():
+    provider = OpenAICompatibleProvider()
+    raw = (
+        '{"stage_name":"generated_code","artifact":{"summary":"完成"}}'
+        "\n</invoke>}"
+    )
+
+    assert provider._parse_tool_arguments(raw) == {
+        "stage_name": "generated_code",
+        "artifact": {"summary": "完成"},
+    }
+
+
+def test_tool_arguments_parser_closes_outer_object_before_invoke_markup():
+    provider = OpenAICompatibleProvider()
+    raw = '{"stage_name":"data_overview","artifact":{"summary":"完成"}\n</invoke>}'
+
+    assert provider._parse_tool_arguments(raw) == {
+        "stage_name": "data_overview",
+        "artifact": {"summary": "完成"},
+    }
