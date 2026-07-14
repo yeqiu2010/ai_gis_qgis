@@ -85,6 +85,7 @@ uv run python scripts/package_plugin.py
 - `请求超时（秒）`：等待 OpenAI-compatible/vLLM 完成一次非流式生成的最长时间，默认 300 秒。27B 等大模型或长工具调用建议设置为 300–600 秒。
 
 后端会根据当前输入上下文自动收敛本次 `max_tokens`，避免 `输入 token + 输出 token` 超过模型上下文长度。若 vLLM 返回精确的上下文越界错误，provider 会解析错误并用合法输出上限自动重试一次。
+复杂 GIS 脚本需要把完整 Python 代码放入工具参数；默认 `Max Tokens` 为 16384。若使用旧配置中的 4096/8192 并频繁看到“参数 JSON 不完整或被截断”，请在设置中提高到 16384，同时确保 Context Window 留有足够输出空间。Agent 主循环默认允许 40 次迭代和 50 次工具调用。
 
 默认配置见 [config/defaults.py](config/defaults.py)。
 

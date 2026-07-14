@@ -38,7 +38,8 @@ tags: [gis, pipeline, code]
 - 耗时 Processing 调用必须保留或传入 `QgsProcessingFeedback`，以支持进度、取消和界面事件刷新。
 - 每个用户任务只生成一次面向最终结果的 `execute_gis_code` 调用。不得先生成“打印唯一值”的诊断脚本，不得为 stdout 虚构 `.txt` 输出；字段和值已由用户指定时直接生成最终筛选结果。
 - 不得使用 `mapLayersByName(...)[0]`；先保存 `matches` 并检查非空，再取 `matches[0]`。
-- `processing.run` 写入文件时，结果字典中的 `OUTPUT` 通常是路径字符串，不能对其直接调用 `featureCount()`；需要计数时用 `QgsVectorLayer(result["OUTPUT"], "result", "ogr")` 验证有效后计数，或省略非必要计数。
+- `processing.run` 的 `OUTPUT` 返回类型取决于输出目标：`"memory:"`、`"TEMPORARY_OUTPUT"` 或 `QgsProcessing.TEMPORARY_OUTPUT` 通常直接返回图层对象，可以调用 `featureCount()`，不得再用 `QgsVectorLayer(..., "memory")` 包装；写入 `.gpkg`、`.shp`、`.geojson` 等文件路径时通常返回路径字符串，不能直接调用 `featureCount()`。文件结果需要计数时用 `QgsVectorLayer(result["OUTPUT"], "result", "ogr")` 验证有效后计数，或省略非必要计数。
+- `generated_code` artifact 必须一次性提交完整 JSON。为避免工具参数超过输出预算，代码只保留必要的校验、处理和结果摘要，省略逐步骤 banner、字段列表调试打印及重复注释；不要续写被截断的代码片段。
 - `QgsProcessingFeedback` 从 `qgis.core` 导入，不得写成 `processing.QgsProcessingFeedback()`。
 - 矢量筛选、裁剪、叠加和导出优先使用已检索的 Processing 算法及 `OUTPUT`。不得凭记忆调用 `QgsVectorFileWriter.create/writeAsVectorFormat*` 的重载签名。
 - 不得调用 `QgsProject.addVectorLayer`；最终输出由 `execute_gis_code` 自动加载。不得直接导入 `PyQt5` 或 `PyQt6`，统一使用 `qgis.PyQt`。
@@ -47,6 +48,7 @@ tags: [gis, pipeline, code]
 - `native:aggregate` 的 `AGGREGATES` 必须是聚合定义 object 列表，不得传单个 object 或 JSON 字符串。`native:joinattributesbylocation` 的连接图层参数是 `JOIN`，不得混用其他算法的 `OVERLAY`。
 - `QgsGeometry` 空几何判断使用 `isEmpty()`，不得调用不存在的 `isGeosEmpty()`。分析流程的无效几何仍交给 `GeometrySkipInvalid` 排除。
 - 空间连接、聚合等中间结果可能改名或丢弃字段。后续引用前必须检查实际 `result_layer.fields()`；不得假定 `SHAPE_Area` 等源字段一定存在。如果统计目标来自土地图层，应优先在原土地图层上聚合，不要反向依赖连接后的建筑物字段。
+- 用户明确指定“面积”等字段作为覆盖率分母时，必须检查该字段存在、值可转为数值且处理空值，并按用户定义汇总；不得悄悄改用 `geometry().area()`。若重叠面积来自投影后几何，必须确认它和面积字段单位一致；单位不明时应在 `structured_query` 阶段澄清，或在方案中明确改为对分子、分母使用同一投影几何口径。
 - 不得使用 `??_1` 等乱码或占位字段名。中间输出需自建字段时优先使用 ASCII 内部名，最终 CSV 表头再映射为中文。
 
 ## 常用 PyQGIS 函数和对象

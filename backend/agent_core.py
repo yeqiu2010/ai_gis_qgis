@@ -108,7 +108,7 @@ class AgentCore:
 
         tool_registry = self._build_tool_registry(session_id)
         try:
-            budget = IterationBudget(max_iterations=16, max_tool_calls=40)
+            budget = IterationBudget()
             response = None
             while not budget.exhausted:
                 if check_cancelled():

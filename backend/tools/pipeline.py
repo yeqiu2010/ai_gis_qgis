@@ -5,8 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from ...database.session_db import SessionDB
-from ..json_recovery import recover_json_object
-from .code_execution import find_unwritten_expected_outputs
+from ..json_recovery import (
+    is_probably_truncated_json,
+    recover_json_object,
+    unwrap_raw_arguments,
+)
+from .code_execution import find_generated_code_issues, find_unwritten_expected_outputs
 from .registry import ToolEntry
 
 PIPELINE_STAGES = [
@@ -21,6 +25,31 @@ PIPELINE_CYCLE_STATE_SUFFIX = "pipeline_cycle_start"
 
 def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_arguments = arguments.get("_raw_arguments")
+        had_raw_arguments = isinstance(raw_arguments, str)
+        arguments = unwrap_raw_arguments(arguments)
+        if had_raw_arguments and "_raw_arguments" in arguments:
+            if is_probably_truncated_json(raw_arguments):
+                return {
+                    "success": False,
+                    "error": (
+                        "record_pipeline_stage 的参数 JSON 不完整或被截断；"
+                        "通常是模型 max_tokens 太小。请精简代码中的注释和日志，"
+                        "完整重新生成 generated_code，不要续写或执行当前片段。"
+                    ),
+                    "error_code": "truncated_tool_arguments",
+                    "retryable": True,
+                    "received_stage": "generated_code"
+                    if '"generated_code"' in raw_arguments
+                    else "",
+                }
+            return {
+                "success": False,
+                "error": "record_pipeline_stage 的 _raw_arguments 不是可恢复的 JSON object。",
+                "error_code": "invalid_tool_arguments",
+                "retryable": False,
+                "received_stage": "",
+            }
         artifact = arguments.get("artifact") or {}
         if isinstance(artifact, str):
             recovered_artifact = recover_json_object(artifact)
@@ -114,7 +143,11 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
                 "summary": {"type": "string", "description": "阶段结果的简短中文摘要。"},
                 "artifact": {
                     "type": "object",
-                    "description": "该阶段的结构化产物，必须可 JSON 序列化。",
+                    "description": (
+                        "该阶段的结构化产物，必须直接作为 JSON object 传入，不得再次序列化成字符串，"
+                        "也不得放入 _raw_arguments。generated_code 阶段包含 code、expected_outputs、"
+                        "dependencies、assumptions、summary、review；代码应完整且精简。"
+                    ),
                 },
             },
             "required": ["artifact"],
@@ -220,6 +253,13 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
             return "generated_code 阶段缺少 review。"
         if review.get("passed") is not True:
             return "generated_code 的 review.passed 必须为 true；请修正代码后重新记录本阶段。"
+        code_issues = find_generated_code_issues(str(artifact.get("code") or ""))
+        if code_issues:
+            return (
+                "generated_code 未通过服务端代码检查："
+                + "；".join(code_issues)
+                + "。请修正代码后重新记录本阶段。"
+            )
         unwritten = find_unwritten_expected_outputs(
             str(artifact.get("code") or ""),
             artifact["expected_outputs"],

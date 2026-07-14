@@ -10,6 +10,7 @@ from ai_gis_qgis.backend.agent_core import AgentCore
 from ai_gis_qgis.backend.context.prompt_builder import PromptBuilder
 from ai_gis_qgis.backend.context.qgis_context import QGISContext
 from ai_gis_qgis.backend.executor.qgis_executor import QGISCodeExecutor
+from ai_gis_qgis.backend.failure_analysis import classify_failure
 from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
@@ -793,6 +794,60 @@ QgsProject.instance().addVectorLayer("result.gpkg", "result", "ogr")
     assert any("addVectorLayer" in issue for issue in issues)
 
 
+def test_detects_feature_count_on_processing_output_path_variants():
+    code = '''
+result = processing.run("native:extractbylocation", {
+    "INPUT": buildings,
+    "PREDICATE": [0],
+    "INTERSECT": buffer,
+    "OUTPUT": output_path,
+})
+direct_count = result["OUTPUT"].featureCount()
+first_alias = result["OUTPUT"]
+second_alias = first_alias
+aliased_count = second_alias.featureCount()
+'''
+
+    issues = find_generated_code_issues(code)
+
+    assert len([issue for issue in issues if "featureCount" in issue]) == 1
+
+
+def test_allows_feature_count_on_memory_processing_outputs():
+    code = '''
+memory_result = processing.run("native:extractbyexpression", {
+    "INPUT": layer,
+    "EXPRESSION": "1=1",
+    "OUTPUT": "memory:",
+})
+memory_layer = memory_result["OUTPUT"]
+print(memory_layer.featureCount())
+
+temporary_result = processing.run("native:buffer", {
+    "INPUT": memory_layer,
+    "DISTANCE": 500,
+    "OUTPUT": "TEMPORARY_OUTPUT",
+})
+print(temporary_result["OUTPUT"].featureCount())
+
+constant_result = processing.run("native:centroids", {
+    "INPUT": memory_layer,
+    "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
+})
+print(constant_result["OUTPUT"].featureCount())
+'''
+
+    assert find_generated_code_issues(code) == []
+
+
+def test_detects_generated_code_syntax_error():
+    issues = find_generated_code_issues("with open('result.csv', 'w'\n    pass")
+
+    assert len(issues) == 1
+    assert "SyntaxError" in issues[0]
+    assert "第 1 行" in issues[0]
+
+
 def test_allows_guarded_processing_output_code():
     code = """
 from pathlib import Path
@@ -1204,6 +1259,83 @@ def test_generated_code_stage_requires_passed_review(tmp_path: Path):
     assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
 
 
+def test_generated_code_stage_recovers_raw_arguments_wrapper(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="raw arguments", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+    raw_arguments = json.dumps(
+        {
+            "stage_name": "generated_code",
+            "summary": "代码生成完成",
+            "artifact": {
+                "code": "open('result.txt', 'w').write('ok')",
+                "expected_outputs": [
+                    {"path": "result.txt", "name": "result", "type": "file"}
+                ],
+                "review": {"passed": True},
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    result = tool.handler({"_raw_arguments": raw_arguments})
+
+    assert result["success"] is True
+    assert result["stage_name"] == "generated_code"
+    assert result["artifact"]["code"] == "open('result.txt', 'w').write('ok')"
+
+
+def test_pipeline_reports_unrecoverable_raw_arguments(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="bad raw arguments", model="test", source="test")
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    result = tool.handler({"_raw_arguments": "not json"})
+
+    assert result["success"] is False
+    assert "_raw_arguments 不是可恢复的 JSON object" in result["error"]
+
+
+def test_pipeline_identifies_truncated_generated_code_arguments(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="truncated arguments", model="test", source="test")
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+    truncated = (
+        '{"stage_name":"generated_code","artifact":{"code":"from pathlib import Path\\n'
+        "output_path = Path(QGIS_AGENT_WORKSPACE) / \\\"result.csv\\\"\\n"
+    )
+
+    result = tool.handler({"_raw_arguments": truncated})
+
+    assert result["success"] is False
+    assert result["error_code"] == "truncated_tool_arguments"
+    assert result["retryable"] is True
+    assert result["received_stage"] == "generated_code"
+    assert "max_tokens" in result["error"]
+    classification = classify_failure(result["error"])
+    assert classification["error_code"] == "truncated_tool_arguments"
+    assert classification["retryable"] is True
+
+
 def test_generated_code_stage_rejects_unwritten_output(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="output gate", model="test", source="test")
@@ -1236,6 +1368,55 @@ def test_generated_code_stage_rejects_unwritten_output(tmp_path: Path):
 
     assert result["success"] is False
     assert "没有写入" in result["error"]
+    assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
+
+
+def test_generated_code_stage_rejects_feature_count_on_processing_output(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="processing output gate", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+    code = '''
+result4 = processing.run("native:extractbylocation", {
+    "INPUT": buildings,
+    "PREDICATE": [0],
+    "INTERSECT": youth_road_buffer,
+    "OUTPUT": output_path,
+})
+output_layer = result4["OUTPUT"]
+final_count = output_layer.featureCount()
+'''
+
+    result = tool.handler(
+        {
+            "stage_name": "generated_code",
+            "artifact": {
+                "code": code,
+                "expected_outputs": [
+                    {
+                        "path": "youth_road_500m_buildings.gpkg",
+                        "name": "青年路500m建筑物",
+                        "type": "vector",
+                    }
+                ],
+                "review": {"passed": True},
+            },
+        }
+    )
+
+    assert result["success"] is False
+    assert "服务端代码检查" in result["error"]
+    assert "featureCount" in result["error"]
     assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
 
 

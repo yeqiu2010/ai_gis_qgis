@@ -2,15 +2,17 @@
 
 PLUGIN_NAME = "AI GIS Agent"
 FRONTEND_DIST_DIR = "resources/frontend_dist"
+CONFIG_VERSION = 2
 
 DEFAULT_CONFIG = {
+    "config_version": CONFIG_VERSION,
     "llm": {
         "provider": "openai_compatible",
         "model": "",
         "base_url": "",
         "api_key": "",
         "temperature": 0.1,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
         "max_context_tokens": 32768,
         "request_timeout_seconds": 300,
     },

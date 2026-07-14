@@ -5,6 +5,12 @@ from __future__ import annotations
 
 def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[str, object]:
     text = (message or "").lower()
+    if "参数 json 不完整或被截断" in text or "truncated_tool_arguments" in text:
+        return _result(
+            "truncated_tool_arguments",
+            "模型生成的工具参数超过输出预算或在 JSON 完成前被截断。",
+            True,
+        )
     if preflight_failed and any(
         marker in message
         for marker in (

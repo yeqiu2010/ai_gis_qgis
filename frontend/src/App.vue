@@ -30,7 +30,7 @@ const settingsForm = ref({
   model: '',
   api_key: '',
   temperature: 0.1,
-  max_tokens: 4096,
+  max_tokens: 16384,
   max_context_tokens: 32768,
   request_timeout_seconds: 300
 })
@@ -219,7 +219,7 @@ async function loadSettings() {
     model: loaded.llm?.model || '',
     api_key: loaded.llm?.api_key || '',
     temperature: Number(loaded.llm?.temperature ?? 0.1),
-    max_tokens: Number(loaded.llm?.max_tokens ?? 4096),
+    max_tokens: Number(loaded.llm?.max_tokens ?? 16384),
     max_context_tokens: Number(loaded.llm?.max_context_tokens ?? 32768),
     request_timeout_seconds: Number(loaded.llm?.request_timeout_seconds ?? 300)
   }
@@ -257,7 +257,7 @@ async function saveSettings() {
       model: saved.llm?.model || '',
       api_key: saved.llm?.api_key || '',
       temperature: Number(saved.llm?.temperature ?? 0.1),
-      max_tokens: Number(saved.llm?.max_tokens ?? 4096),
+      max_tokens: Number(saved.llm?.max_tokens ?? 16384),
       max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768),
       request_timeout_seconds: Number(saved.llm?.request_timeout_seconds ?? 300)
     }

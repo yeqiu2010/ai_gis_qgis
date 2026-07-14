@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from ..json_recovery import recover_json_object
+from ..json_recovery import recover_json_object, unwrap_raw_arguments
 from .base_provider import ChatMessage, ChatResponse, ToolCall
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32768
@@ -27,7 +27,7 @@ class OpenAICompatibleProvider:
         base_url: str = "https://api.openai.com/v1",
         api_key: str | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         timeout_seconds: int = 300,
     ):
@@ -69,6 +69,8 @@ class OpenAICompatibleProvider:
             arguments = function.get("arguments") or {}
             if isinstance(arguments, str):
                 arguments = self._parse_tool_arguments(arguments)
+            if isinstance(arguments, dict):
+                arguments = unwrap_raw_arguments(arguments)
             tool_calls.append(
                 ToolCall(
                     id=str(call.get("id") or ""),

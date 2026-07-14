@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .defaults import DEFAULT_CONFIG
+from .defaults import CONFIG_VERSION, DEFAULT_CONFIG
 
 SETTINGS_KEY = "qgis_hermes_agent/config"
 FALLBACK_SETTINGS_PATH = Path.home() / ".qgis_hermes_agent" / "settings.json"
@@ -20,12 +20,20 @@ class SettingsManager:
 
     def load(self) -> dict[str, Any]:
         config = copy.deepcopy(DEFAULT_CONFIG)
+        loaded_config_version = 0
         for stored in self._read_raw_values():
             if stored:
                 try:
-                    self._deep_update(config, json.loads(stored))
+                    parsed = json.loads(stored)
+                    self._deep_update(config, parsed)
+                    loaded_config_version = int(parsed.get("config_version") or 0)
                 except json.JSONDecodeError:
                     pass
+        if loaded_config_version < CONFIG_VERSION:
+            legacy_max_tokens = int(config.get("llm", {}).get("max_tokens") or 0)
+            if legacy_max_tokens in {4096, 8192}:
+                config["llm"]["max_tokens"] = DEFAULT_CONFIG["llm"]["max_tokens"]
+        config["config_version"] = CONFIG_VERSION
         return config
 
     def save(self, config: dict[str, Any]) -> dict[str, Any]:

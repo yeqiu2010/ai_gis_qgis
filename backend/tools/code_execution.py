@@ -321,11 +321,13 @@ def find_generated_code_issues(code: str) -> list[str]:
     """Detect recurrent PyQGIS mistakes observed in execution failure logs."""
     try:
         tree = ast.parse(code)
-    except SyntaxError:
-        return []
+    except SyntaxError as exc:
+        location = f"第 {exc.lineno} 行" if exc.lineno else "未知行"
+        return [f"生成代码存在 SyntaxError（{location}）：{exc.msg}"]
 
     issues: list[str] = []
     imported_roots: set[str] = set()
+    file_processing_result_names: set[str] = set()
     output_path_names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -338,11 +340,32 @@ def find_generated_code_issues(code: str) -> list[str]:
                 imported_roots.add("os")
             if module in {"PyQt5", "PyQt6"} or module.startswith(("PyQt5.", "PyQt6.")):
                 _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
-        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript):
-            if _subscript_string_key(node.value) == "OUTPUT":
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        output_path_names.add(target.id)
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    for node in assignments:
+        if not _processing_call_writes_file(node.value):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                file_processing_result_names.add(target.id)
+
+    # Propagate paths read from file-backed Processing results through simple
+    # aliases.  In-memory/TEMPORARY_OUTPUT results are QgsMapLayer objects and
+    # must not be classified as paths.
+    changed = True
+    while changed:
+        changed = False
+        for node in assignments:
+            value_is_output_path = _is_processing_output_path_expression(
+                node.value,
+                output_path_names,
+                file_processing_result_names,
+            )
+            if not value_is_output_path:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id not in output_path_names:
+                    output_path_names.add(target.id)
+                    changed = True
 
     uses_os = any(
         isinstance(node, ast.Name) and node.id == "os" and isinstance(getattr(node, "ctx", None), ast.Load)
@@ -385,8 +408,11 @@ def find_generated_code_issues(code: str) -> list[str]:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if (
                 node.func.attr == "featureCount"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in output_path_names
+                and _is_processing_output_path_expression(
+                    node.func.value,
+                    output_path_names,
+                    file_processing_result_names,
+                )
             ):
                 _append_issue(
                     issues,
@@ -413,6 +439,41 @@ def find_generated_code_issues(code: str) -> list[str]:
                     "字段名中包含 ?? 乱码占位符；必须使用 inspect_layer 返回的真实字段名，中间输出优先使用 ASCII 别名",
                 )
     return issues
+
+
+def _is_processing_output_path_expression(
+    node: ast.AST,
+    output_path_names: set[str],
+    file_processing_result_names: set[str],
+) -> bool:
+    """Return whether an expression is a Processing OUTPUT path value."""
+    if isinstance(node, ast.Name):
+        return node.id in output_path_names
+    return (
+        isinstance(node, ast.Subscript)
+        and _subscript_string_key(node) == "OUTPUT"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in file_processing_result_names
+    )
+
+
+def _processing_call_writes_file(node: ast.AST) -> bool:
+    """Return whether an assigned processing.run call has a file-backed OUTPUT."""
+    if not isinstance(node, ast.Call) or _call_name(node.func) != "processing.run":
+        return False
+    if len(node.args) < 2:
+        return False
+    output = _literal_dict_items(node.args[1]).get("OUTPUT")
+    if output is None:
+        return False
+    literal = (_literal_string(output) or "").strip()
+    if literal.lower().startswith("memory:") or literal.upper() == "TEMPORARY_OUTPUT":
+        return False
+    if isinstance(output, ast.Attribute) and _call_name(output) == "QgsProcessing.TEMPORARY_OUTPUT":
+        return False
+    # Generated final outputs are commonly variables such as output_path.  Any
+    # non-temporary OUTPUT is conservatively treated as file-backed.
+    return True
 
 
 def _check_processing_call(node: ast.Call, issues: list[str]) -> None:

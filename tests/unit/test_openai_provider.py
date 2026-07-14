@@ -9,6 +9,9 @@ from ai_gis_qgis.backend.llm.provider_registry import create_provider
 
 
 class FakeHTTPResponse:
+    def __init__(self, payload=None):
+        self.payload = payload
+
     def __enter__(self):
         return self
 
@@ -16,17 +19,16 @@ class FakeHTTPResponse:
         return False
 
     def read(self):
-        return json.dumps(
-            {
-                "model": "gemma-4-31B-it-Q4:latest",
-                "choices": [
-                    {
-                        "message": {"content": "this is a test"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        ).encode("utf-8")
+        payload = self.payload or {
+            "model": "gemma-4-31B-it-Q4:latest",
+            "choices": [
+                {
+                    "message": {"content": "this is a test"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        return json.dumps(payload).encode("utf-8")
 
 
 def test_openai_compatible_allows_local_ollama_without_api_key(monkeypatch):
@@ -71,6 +73,7 @@ def test_provider_registry_passes_configured_request_timeout():
 
     assert isinstance(provider, OpenAICompatibleProvider)
     assert provider.timeout_seconds == 480
+    assert provider.max_tokens == 16384
 
 
 def test_timeout_error_reports_client_limit_and_request_size(monkeypatch):
@@ -178,4 +181,52 @@ def test_tool_arguments_parser_closes_outer_object_before_invoke_markup():
     assert provider._parse_tool_arguments(raw) == {
         "stage_name": "data_overview",
         "artifact": {"summary": "完成"},
+    }
+
+
+def test_chat_unwraps_raw_arguments_object_from_compatible_server(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return FakeHTTPResponse(
+            {
+                "model": "test-model",
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "record_pipeline_stage",
+                                        "arguments": {
+                                            "_raw_arguments": json.dumps(
+                                                {
+                                                    "stage_name": "generated_code",
+                                                    "artifact": {"code": "print('ok')"},
+                                                },
+                                                ensure_ascii=False,
+                                            )
+                                        },
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider()
+
+    response = provider.chat(
+        system="",
+        messages=[ChatMessage(role="user", content="生成代码")],
+        tools=[{"type": "function", "function": {"name": "record_pipeline_stage"}}],
+    )
+
+    assert response.tool_calls[0].arguments == {
+        "stage_name": "generated_code",
+        "artifact": {"code": "print('ok')"},
     }

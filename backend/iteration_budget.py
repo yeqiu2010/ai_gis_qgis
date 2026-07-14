@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class IterationBudget:
-    max_iterations: int = 20
+    max_iterations: int = 40
     max_tool_calls: int = 50
     iterations: int = 0
     tool_calls: int = 0

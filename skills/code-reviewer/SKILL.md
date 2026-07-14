@@ -32,7 +32,7 @@ tags: [gis, pipeline, review]
 - 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
 - 用户未明确要求修复数据，却调用 `native:fixgeometries`；分析查询应通过 Processing context 的 `GeometrySkipInvalid` 排除空几何或无效几何要素。
 - 使用 `mapLayersByName(...)[0]` 而未先检查返回列表。
-- 对 `processing.run` 的文件 `OUTPUT` 路径字符串直接调用 `featureCount()`。
+- 对 `processing.run` 的文件 `OUTPUT` 路径字符串直接调用 `featureCount()`；但不得把 `"memory:"` 或 `TEMPORARY_OUTPUT` 返回的图层对象误判成路径，也不得用 `QgsVectorLayer(..., "memory")` 重新包装该对象。
 - 使用 `processing.QgsProcessingFeedback()`；正确类位于 `qgis.core`。
 - Processing `PREDICATE` 传入 `"intersects"`/`"within"` 等字符串，而不是算法详情定义的整数枚举列表。
 - `JOIN_FIELDS` 传入字段索引而不是字段名；`native:aggregate` 的 `AGGREGATES` 不是 object 列表。
@@ -49,6 +49,7 @@ tags: [gis, pipeline, review]
 - 分组统计中用赋值覆盖分母字段，例如遍历多栋建筑时反复执行
   `land_area = current_land_area`。地块面积必须按唯一地块去重汇总，不能按建筑重复累加，
   也不能只保留最后一个地块。
+- 用户指定面积字段作为覆盖率分母，但代码忽略该字段改用几何面积；或者分子使用投影后几何面积、分母使用单位不明的属性面积，却没有验证单位一致。
 
 ## GIS 正确性检查
 

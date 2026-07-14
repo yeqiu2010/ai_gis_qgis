@@ -24,7 +24,7 @@ def create_provider(config: dict[str, Any] | None = None) -> LLMProvider:
             base_url=llm_config.get("base_url") or "https://api.openai.com/v1",
             api_key=llm_config.get("api_key") or None,
             temperature=float(llm_config.get("temperature", 0.1)),
-            max_tokens=int(llm_config.get("max_tokens", 4096)),
+            max_tokens=int(llm_config.get("max_tokens", 16384)),
             max_context_tokens=int(llm_config.get("max_context_tokens", 32768)),
             timeout_seconds=int(llm_config.get("request_timeout_seconds", 300)),
         )
