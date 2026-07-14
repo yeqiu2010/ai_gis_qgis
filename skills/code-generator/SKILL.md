@@ -33,7 +33,7 @@ tags: [gis, pipeline, code]
   `execute_gis_code`。
 - 任一输入超过 10 万要素时，不得生成对两个图层执行 `getFeatures()` 的嵌套循环。
 - 大图层空间筛选必须使用 Processing/数据源空间索引，并先缩小候选范围再做精确判断。
-- 分析查询遇到空几何或无效几何时，使用 `QgsProcessingContext.setInvalidGeometryCheck(Qgis.InvalidGeometryCheck.GeometrySkipInvalid)` 排除这些要素，并在输出摘要中说明。除非用户明确要求修复数据，否则禁止生成 `native:fixgeometries`。
+- 分析查询遇到空几何或无效几何时，使用 `context = QgsProcessingContext()` 和 `context.setInvalidGeometryCheck(Qgis.InvalidGeometryCheck.GeometrySkipInvalid)` 排除这些要素，并在输出摘要中说明。`InvalidGeometryCheck` 枚举属于 `Qgis`，严禁写成 `QgsProcessingContext.InvalidGeometryCheck`。代码必须导入 `from qgis.core import Qgis, QgsProcessingContext`，或确认两者都在执行命名空间中。除非用户明确要求修复数据，否则禁止生成 `native:fixgeometries`。
 - 大数据任务的缓冲筛选默认溶解缓冲区，最终结果优先输出 GeoPackage。
 - 耗时 Processing 调用必须保留或传入 `QgsProcessingFeedback`，以支持进度、取消和界面事件刷新。
 - 每个用户任务只生成一次面向最终结果的 `execute_gis_code` 调用。不得先生成“打印唯一值”的诊断脚本，不得为 stdout 虚构 `.txt` 输出；字段和值已由用户指定时直接生成最终筛选结果。

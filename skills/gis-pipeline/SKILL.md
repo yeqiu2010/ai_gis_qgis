@@ -60,6 +60,15 @@ tags: [gis, pipeline]
 - 代码执行必须走 `execute_gis_code`，不要声称已经完成未执行的操作。
 - 工具失败时记录 `execution_result`，说明错误、stderr 和恢复建议。
 
+## 阶段状态交接
+
+- 阶段完成后，后端会用一个完整 JSON envelope 构造下一阶段提示词，不会附带历史对话或原始工具消息。
+- `structured_query` 接收 `original_user_request` 和前一阶段 `data_overview`。
+- `solution_plan` 只接收 `structured_query`；它已经是规范化后的用户需求。
+- `generated_code` 接收前一阶段 `solution_plan`，并额外携带 `structured_query`，确保代码不偏离用户需求。
+- `execution_result` 接收前一阶段 `generated_code`，并额外携带 `structured_query`。
+- 必须只依据 envelope 中的数据完成 `next_pipeline_stage`。不得要求恢复已被移除的历史消息，也不得输出或续写残缺 JSON。
+
 ## 复杂空间分析稳定流程
 
 对于“属性提取 + 缓冲区 + 空间相交/裁剪 + 输出文件”类任务，按以下方式推进：

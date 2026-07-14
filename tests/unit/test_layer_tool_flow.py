@@ -848,6 +848,35 @@ def test_detects_generated_code_syntax_error():
     assert "第 1 行" in issues[0]
 
 
+def test_detects_invalid_geometry_enum_on_processing_context():
+    invalid_code = '''
+context = QgsProcessingContext()
+context.setInvalidGeometryCheck(
+    QgsProcessingContext.InvalidGeometryCheck.GeometrySkipInvalid
+)
+'''
+    valid_code = '''
+context = QgsProcessingContext()
+context.setInvalidGeometryCheck(
+    Qgis.InvalidGeometryCheck.GeometrySkipInvalid
+)
+'''
+
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any("枚举属于 Qgis" in issue for issue in issues)
+    assert find_generated_code_issues(valid_code) == []
+
+
+def test_classifies_invalid_geometry_enum_runtime_failure():
+    classification = classify_failure(
+        "type object 'QgsProcessingContext' has no attribute 'InvalidGeometryCheck'"
+    )
+
+    assert classification["error_code"] == "generated_code_api"
+    assert "Qgis.InvalidGeometryCheck" in classification["cause"]
+
+
 def test_allows_guarded_processing_output_code():
     code = """
 from pathlib import Path
@@ -992,6 +1021,136 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     assert "landuse" in memory
     assert "中山公园" in memory
     assert messages[-1].content == "导出公园地块"
+
+
+def test_pipeline_stage_context_passes_only_structured_query_and_previous_stage(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="compact pipeline", model="test", source="test")
+    session_db.save_message(session.id, "user", "计算学校服务覆盖率", event_type="user")
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="data_overview",
+        artifact={"layers": ["学校", "城镇住宅区"], "fields": ["CCN", "面积", "XZQMC"]},
+        summary="数据已检查",
+    )
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="structured_query",
+        artifact={"task": "计算整体及分街道覆盖率"},
+        summary="需求已结构化",
+    )
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="solution_plan",
+        artifact={"algorithm_evidence": ["native:buffer", "native:intersection"]},
+        summary="方案已确认",
+    )
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+    raw_arguments = "x" * 20000
+    tool_results = [
+        {
+            "name": "record_pipeline_stage",
+            "arguments": {"_raw_arguments": raw_arguments},
+            "result": {
+                "success": False,
+                "error_code": "truncated_tool_arguments",
+                "error": "参数 JSON 不完整或被截断",
+                "expected_stage": "generated_code",
+            },
+        }
+    ]
+
+    messages = core._build_pipeline_stage_messages(session.id)
+    compact_results = core._compact_pipeline_tool_results(tool_results)
+
+    assert len(messages) == 1
+    assert messages[0].role == "user"
+    envelope = json.loads(messages[0].content)
+    assert envelope["next_pipeline_stage"] == "generated_code"
+    assert envelope["structured_query"] == {"task": "计算整体及分街道覆盖率"}
+    assert envelope["previous_stage"] == {
+        "stage_name": "solution_plan",
+        "artifact": {"algorithm_evidence": ["native:buffer", "native:intersection"]},
+    }
+    assert "original_user_request" not in envelope
+    assert "data_overview" not in envelope
+    assert "CCN" not in messages[0].content
+    assert core._pipeline_context_should_compact(tool_results) is True
+    assert "arguments" not in compact_results[0]
+    assert raw_arguments not in json.dumps(compact_results, ensure_ascii=False)
+    assert compact_results[0]["result"]["expected_stage"] == "generated_code"
+
+
+def test_structured_query_context_receives_original_request_and_data_overview(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="structured handoff", model="test", source="test")
+    session_db.save_message(
+        session.id,
+        "assistant",
+        "旧任务产生的历史回复，不应进入阶段交接。",
+        event_type="summary",
+    )
+    session_db.save_message(
+        session.id,
+        "user",
+        "计算中小学服务半径覆盖率",
+        event_type="user",
+    )
+    data_overview = {
+        "layers": ["学校", "城镇住宅区"],
+        "fields": ["CCN", "面积", "XZQMC"],
+    }
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="data_overview",
+        artifact=data_overview,
+        summary="数据已检查",
+    )
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+
+    messages = core._build_pipeline_stage_messages(session.id)
+
+    assert len(messages) == 1
+    envelope = json.loads(messages[0].content)
+    assert envelope["next_pipeline_stage"] == "structured_query"
+    assert envelope["original_user_request"] == "计算中小学服务半径覆盖率"
+    assert envelope["previous_stage"] == {
+        "stage_name": "data_overview",
+        "artifact": data_overview,
+    }
+    assert "旧任务产生的历史回复" not in messages[0].content
+
+
+def test_solution_plan_context_receives_only_structured_query(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="solution handoff", model="test", source="test")
+    session_db.save_message(session.id, "user", "原始自然语言需求", event_type="user")
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="data_overview",
+        artifact={"large_samples": ["不应传递"]},
+        summary="数据已检查",
+    )
+    structured_query = {
+        "task": "计算整体及分街道覆盖率",
+        "operations": ["筛选", "缓冲", "相交", "分组统计"],
+    }
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="structured_query",
+        artifact=structured_query,
+        summary="需求已结构化",
+    )
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+
+    messages = core._build_pipeline_stage_messages(session.id)
+
+    envelope = json.loads(messages[0].content)
+    assert envelope["next_pipeline_stage"] == "solution_plan"
+    assert envelope["structured_query"] == structured_query
+    assert "previous_stage" not in envelope
+    assert "original_user_request" not in envelope
+    assert "large_samples" not in messages[0].content
 
 
 def test_conversation_limit_is_applied_after_role_filtering(tmp_path: Path):

@@ -31,6 +31,7 @@ tags: [gis, pipeline, review]
 - `processing.run` 参数名与已读取的算法详情不一致。
 - 把完整任务拆成多个待确认执行调用，而不是一份完整脚本。
 - 用户未明确要求修复数据，却调用 `native:fixgeometries`；分析查询应通过 Processing context 的 `GeometrySkipInvalid` 排除空几何或无效几何要素。
+- 把枚举写成不存在的 `QgsProcessingContext.InvalidGeometryCheck`；正确写法必须是 `Qgis.InvalidGeometryCheck.GeometrySkipInvalid`。
 - 使用 `mapLayersByName(...)[0]` 而未先检查返回列表。
 - 对 `processing.run` 的文件 `OUTPUT` 路径字符串直接调用 `featureCount()`；但不得把 `"memory:"` 或 `TEMPORARY_OUTPUT` 返回的图层对象误判成路径，也不得用 `QgsVectorLayer(..., "memory")` 重新包装该对象。
 - 使用 `processing.QgsProcessingFeedback()`；正确类位于 `qgis.core`。

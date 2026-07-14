@@ -86,6 +86,7 @@ uv run python scripts/package_plugin.py
 
 后端会根据当前输入上下文自动收敛本次 `max_tokens`，避免 `输入 token + 输出 token` 超过模型上下文长度。若 vLLM 返回精确的上下文越界错误，provider 会解析错误并用合法输出上限自动重试一次。
 复杂 GIS 脚本需要把完整 Python 代码放入工具参数；默认 `Max Tokens` 为 16384。若使用旧配置中的 4096/8192 并频繁看到“参数 JSON 不完整或被截断”，请在设置中提高到 16384，同时确保 Context Window 留有足够输出空间。Agent 主循环默认允许 40 次迭代和 50 次工具调用。
+GIS Pipeline 会在阶段边界以完整 JSON envelope 传递最小状态：下一阶段只接收前一阶段 artifact，并在 `solution_plan` 之后继续携带 `structured_query` 中的结构化用户需求；历史对话、原始工具结果和更早阶段不会加入提示词，截断的 `_raw_arguments` 也不会再次回填。
 
 默认配置见 [config/defaults.py](config/defaults.py)。
 

@@ -291,6 +291,13 @@ class AgentCore:
                     budget.record_tool_call()
                     if check_cancelled():
                         return events
+                if active_skill == "gis-pipeline" and self._pipeline_context_should_compact(
+                    tool_results
+                ):
+                    messages = self._build_pipeline_stage_messages(session_id)
+                    result_context = self._compact_pipeline_tool_results(tool_results)
+                else:
+                    result_context = tool_results
                 messages.append(
                     ChatMessage(
                         role="assistant",
@@ -300,7 +307,7 @@ class AgentCore:
                             "只有确认已经完成或需要用户补充信息时，才给用户最终答复：\n"
                             "注意：如果某个工具 result.success 为 false，必须说明该工具执行失败及 error，"
                             "不要把失败结果解释为查询结果为空或操作成功。\n"
-                            f"{json.dumps(tool_results, ensure_ascii=False)}"
+                            f"{json.dumps(result_context, ensure_ascii=False)}"
                         ),
                     )
                 )
@@ -932,7 +939,9 @@ class AgentCore:
                     "可以直接使用当前 QGIS 环境中已有符号，或显式 `from qgis.core import ...`；"
                     "输出仍必须写入 QGIS_AGENT_WORKSPACE。"
                     "如果错误来自空几何或无效几何，应在 Processing context 中使用 "
-                    "GeometrySkipInvalid 排除这些要素；除非用户明确要求修复源数据，禁止调用 "
+                    "`Qgis.InvalidGeometryCheck.GeometrySkipInvalid` 排除这些要素；"
+                    "InvalidGeometryCheck 枚举不属于 QgsProcessingContext。"
+                    "除非用户明确要求修复源数据，禁止调用 "
                     "native:fixgeometries，也不得生成完整图层的修复副本。"
                     "如果错误提示必须提供 expected_outputs，必须在下一次 execute_gis_code 调用中"
                     "补上最终输出文件，例如 {\"path\":\"500m.shp\",\"name\":\"500m\",\"type\":\"vector\"}。\n"
@@ -954,6 +963,104 @@ class AgentCore:
         if memory_message is not None:
             messages.insert(0, memory_message)
         return messages
+
+    def _pipeline_context_should_compact(self, tool_results: list[dict[str, Any]]) -> bool:
+        for call in tool_results:
+            if call.get("name") != "record_pipeline_stage":
+                continue
+            result = call.get("result") if isinstance(call.get("result"), dict) else {}
+            if result.get("success") or result.get("error_code") == "truncated_tool_arguments":
+                return True
+        return False
+
+    def _compact_pipeline_tool_results(
+        self,
+        tool_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        compact = []
+        for call in tool_results:
+            result = call.get("result") if isinstance(call.get("result"), dict) else {}
+            if call.get("name") == "record_pipeline_stage":
+                compact.append(
+                    {
+                        "name": "record_pipeline_stage",
+                        "result": {
+                            key: result.get(key)
+                            for key in (
+                                "success",
+                                "stage_name",
+                                "summary",
+                                "expected_stage",
+                                "received_stage",
+                                "error_code",
+                                "retryable",
+                                "error",
+                            )
+                            if result.get(key) is not None
+                        },
+                    }
+                )
+            else:
+                compact.append(call)
+        return compact
+
+    def _build_pipeline_stage_messages(self, session_id: str) -> list[ChatMessage]:
+        """Pass only the minimum complete JSON state to the next Pipeline stage."""
+        cycle = current_pipeline_cycle(self.session_db, session_id)
+        recent = self.session_db.get_recent_stage_artifacts(session_id, limit=5)
+        latest_by_stage = {
+            str(item.get("stage_name") or ""): item
+            for item in recent
+            if str(item.get("stage_name") or "") in cycle
+        }
+        next_stage = next_pipeline_stage(self.session_db, session_id)
+        envelope: dict[str, Any] = {
+            "instruction": (
+                "只根据本 JSON 执行 next_pipeline_stage。不要引用更早的对话、工具结果或阶段；"
+                "输出必须作为完整 JSON object 传给 record_pipeline_stage。"
+            ),
+            "next_pipeline_stage": next_stage,
+        }
+
+        structured_item = latest_by_stage.get("structured_query")
+        if structured_item is not None and next_stage in {
+            "solution_plan",
+            "generated_code",
+            "execution_result",
+        }:
+            envelope["structured_query"] = structured_item.get("stage_artifact") or {}
+
+        next_index = PIPELINE_STAGES.index(next_stage)
+        previous_stage = PIPELINE_STAGES[next_index - 1] if next_index > 0 else ""
+        previous_item = latest_by_stage.get(previous_stage)
+        if previous_item is not None and previous_stage != "structured_query":
+            envelope["previous_stage"] = {
+                "stage_name": previous_stage,
+                "artifact": previous_item.get("stage_artifact") or {},
+            }
+
+        if next_stage in {"data_overview", "structured_query"}:
+            history = self.session_db.get_conversation_messages(session_id, limit=12)
+            latest_user_request = next(
+                (
+                    str(row.get("content") or "")
+                    for row in reversed(history)
+                    if row.get("role") == "user"
+                ),
+                "",
+            )
+            envelope["original_user_request"] = latest_user_request
+
+        return [
+            ChatMessage(
+                role="user",
+                content=json.dumps(
+                    envelope,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        ]
 
     def _build_memory_message(self, session_id: str) -> ChatMessage | None:
         tool_calls = self.session_db.get_recent_tool_calls(session_id, limit=8)

@@ -378,6 +378,16 @@ def find_generated_code_issues(code: str) -> list[str]:
         if isinstance(node, ast.Attribute):
             if (
                 isinstance(node.value, ast.Name)
+                and node.value.id == "QgsProcessingContext"
+                and node.attr == "InvalidGeometryCheck"
+            ):
+                _append_issue(
+                    issues,
+                    "InvalidGeometryCheck 枚举属于 Qgis，不属于 QgsProcessingContext；"
+                    "应使用 Qgis.InvalidGeometryCheck.GeometrySkipInvalid",
+                )
+            if (
+                isinstance(node.value, ast.Name)
                 and node.value.id == "processing"
                 and node.attr == "QgsProcessingFeedback"
             ):

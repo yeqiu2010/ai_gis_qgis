@@ -25,6 +25,7 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
             "AGGREGATES",
             "参数名是 JOIN",
             "isGeosEmpty",
+            "InvalidGeometryCheck",
         )
     ):
         return _result("generated_code_api", "生成代码命中了已知的 PyQGIS API 误用模式。", False)
@@ -69,6 +70,12 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
         )
     if "isgeosempty" in text:
         return _result("generated_code_api", "生成代码调用了不存在的 PyQGIS API。", False)
+    if "qgsprocessingcontext" in text and "invalidgeometrycheck" in text:
+        return _result(
+            "generated_code_api",
+            "生成代码把 Qgis.InvalidGeometryCheck 枚举错误地写在 QgsProcessingContext 下。",
+            False,
+        )
     if "syntaxerror" in text:
         return _result("syntax_error", "生成的 Python 代码存在语法错误。", False)
     if "nameerror" in text or "is not defined" in text:
