@@ -169,6 +169,53 @@ textarea {
   word-break: break-word;
 }
 
+.message-metrics {
+  align-items: center;
+  border-top: 1px solid #e2e8eb;
+  color: #68757d;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 4px 10px;
+  margin-top: 9px;
+  padding-top: 7px;
+}
+
+.message-metrics span {
+  color: inherit;
+  display: inline;
+  font-size: inherit;
+  font-weight: 500;
+  margin: 0;
+}
+
+.message-metrics em,
+.live-metrics em {
+  background: #edf3f5;
+  border-radius: 10px;
+  color: #65737b;
+  font-size: 10px;
+  font-style: normal;
+  padding: 2px 6px;
+}
+
+.live-metrics {
+  align-items: center;
+  background: #eaf5f4;
+  border-top: 1px solid #bedbd8;
+  color: #315b59;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 5px 12px;
+  padding: 7px 10px;
+}
+
+.live-metrics strong {
+  color: #0b6e69;
+  font-size: 11px;
+}
+
 .message-row.system p,
 .message-row.process p {
   font-size: 12px;

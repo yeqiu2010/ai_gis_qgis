@@ -33,8 +33,26 @@ CREATE TABLE IF NOT EXISTS messages (
     finish_reason TEXT,
     stage_name TEXT,
     stage_artifact TEXT,
-    event_type TEXT
+    event_type TEXT,
+    run_id TEXT
 );
+
+CREATE TABLE IF NOT EXISTS run_metrics (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    llm_calls INTEGER NOT NULL DEFAULT 0,
+    usage_estimated INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running'
+);
+
+CREATE INDEX IF NOT EXISTS run_metrics_session_started
+ON run_metrics(session_id, started_at);
 
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,

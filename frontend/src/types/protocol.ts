@@ -26,6 +26,7 @@ export interface RPCResponse {
 
 export type AgentEventType =
   | 'run_start'
+  | 'run_metrics'
   | 'thinking'
   | 'message_delta'
   | 'message'
@@ -60,6 +61,27 @@ export interface ChatMessage {
   content: string
   timestamp?: number
   event_type?: string
+  run_id?: string
+  duration_ms?: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  llm_calls?: number
+  usage_estimated?: boolean | number
+  metrics_status?: string
+}
+
+export interface RunMetrics {
+  run_id: string
+  started_at: number
+  duration_ms: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  llm_calls: number
+  usage_estimated: boolean
+  status: string
+  running: boolean
 }
 
 export interface PendingConfirmation {

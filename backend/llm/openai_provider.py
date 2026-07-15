@@ -78,12 +78,29 @@ class OpenAICompatibleProvider:
                     arguments=arguments,
                 )
             )
+        usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        input_tokens = self._usage_value(usage, "prompt_tokens", "input_tokens")
+        output_tokens = self._usage_value(usage, "completion_tokens", "output_tokens")
+        total_tokens = self._usage_value(usage, "total_tokens")
         return ChatResponse(
             content=message.get("content") or "",
             model=data.get("model", self.model),
             finish_reason=choice.get("finish_reason") or "stop",
             tool_calls=tool_calls,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens or input_tokens + output_tokens,
         )
+
+    @staticmethod
+    def _usage_value(usage: dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        return 0
 
     def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
         """Recover valid JSON arguments from common model wrapper artifacts."""

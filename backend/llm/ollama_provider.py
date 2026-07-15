@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from typing import Any
 
 from .base_provider import ChatMessage, ChatResponse
 
@@ -23,7 +24,12 @@ class OllamaProvider:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> ChatResponse:
+    def chat(
+        self,
+        system: str,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
         payload = {
             "model": self.model,
             "stream": False,
@@ -47,4 +53,8 @@ class OllamaProvider:
             content=message.get("content", ""),
             model=data.get("model", self.model),
             finish_reason=data.get("done_reason") or "stop",
+            input_tokens=int(data.get("prompt_eval_count") or 0),
+            output_tokens=int(data.get("eval_count") or 0),
+            total_tokens=int(data.get("prompt_eval_count") or 0)
+            + int(data.get("eval_count") or 0),
         )

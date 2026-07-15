@@ -18,6 +18,10 @@ class ChatResponse:
     model: str
     finish_reason: str = "stop"
     tool_calls: list[ToolCall] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    usage_estimated: bool = False
 
 
 @dataclass(frozen=True)

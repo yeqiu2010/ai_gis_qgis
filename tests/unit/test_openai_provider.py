@@ -59,6 +59,39 @@ def test_openai_compatible_allows_local_ollama_without_api_key(monkeypatch):
     assert response.content == "this is a test"
 
 
+def test_openai_compatible_reads_usage_tokens(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return FakeHTTPResponse(
+            {
+                "model": "usage-model",
+                "choices": [
+                    {
+                        "message": {"content": "完成"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 18,
+                    "total_tokens": 138,
+                },
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(model="usage-model")
+
+    response = provider.chat(
+        system="system",
+        messages=[ChatMessage(role="user", content="统计 token")],
+    )
+
+    assert response.input_tokens == 120
+    assert response.output_tokens == 18
+    assert response.total_tokens == 138
+    assert response.usage_estimated is False
+
+
 def test_provider_registry_passes_configured_request_timeout():
     provider = create_provider(
         {

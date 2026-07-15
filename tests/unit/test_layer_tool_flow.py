@@ -307,6 +307,34 @@ class SingleToolProvider:
         )
 
 
+class UsageTrackingProvider:
+    name = "usage-tracking-test"
+    model = "usage-tracking-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[ToolCall(id="call-1", name="list_layers", arguments={})],
+                input_tokens=100,
+                output_tokens=10,
+                total_tokens=110,
+            )
+        return ChatResponse(
+            content="统计完成。",
+            model=self.model,
+            input_tokens=200,
+            output_tokens=20,
+            total_tokens=220,
+        )
+
+
 class QVariantLike:
     __module__ = "qgis.PyQt.QtCore"
 
@@ -337,7 +365,7 @@ def test_agent_core_registers_and_executes_layer_tools(tmp_path: Path):
     assert "remove_layer" in provider.first_call_tools
     assert "execute_gis_code" not in provider.first_call_tools
     assert "search_skills" in provider.first_call_tools
-    event_types = [event["type"] for event in events]
+    event_types = [event["type"] for event in events if event["type"] != "run_metrics"]
     assert event_types[:4] == [
         "run_start",
         "thinking",
@@ -353,6 +381,40 @@ def test_agent_core_registers_and_executes_layer_tools(tmp_path: Path):
     assert "PyQGIS" in tool_end["payload"]["result"]["error"]
 
 
+def test_agent_core_accumulates_and_persists_run_metrics(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="metrics", model="usage-tracking-model")
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=UsageTrackingProvider(),
+        iface=None,
+    ).run(session_id=session.id, user_message="统计本轮消耗")
+
+    metric_events = [event for event in events if event["type"] == "run_metrics"]
+    assert len(metric_events) == 3
+    final_metrics = metric_events[-1]["payload"]
+    assert final_metrics["input_tokens"] == 300
+    assert final_metrics["output_tokens"] == 30
+    assert final_metrics["total_tokens"] == 330
+    assert final_metrics["llm_calls"] == 2
+    assert final_metrics["usage_estimated"] is False
+    assert final_metrics["running"] is False
+    assert final_metrics["status"] == "completed"
+    assert final_metrics["duration_ms"] >= 0
+
+    saved = session_db.get_messages(session.id, limit=20)
+    assistant = [message for message in saved if message["role"] == "assistant"][-1]
+    assert assistant["run_id"] == final_metrics["run_id"]
+    assert assistant["total_tokens"] == 330
+    assert assistant["llm_calls"] == 2
+    assert assistant["metrics_status"] == "completed"
+    stored_session = session_db.get_session(session.id)
+    assert stored_session is not None
+    assert stored_session["input_tokens"] == 300
+    assert stored_session["output_tokens"] == 30
+
+
 def test_agent_core_pauses_destructive_layer_tools_for_confirmation(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="confirm flow", model="confirming-test-model", source="test")
@@ -362,7 +424,7 @@ def test_agent_core_pauses_destructive_layer_tools_for_confirmation(tmp_path: Pa
         user_message="删除 roads 图层。",
     )
 
-    assert [event["type"] for event in events] == [
+    assert [event["type"] for event in events if event["type"] != "run_metrics"] == [
         "run_start",
         "thinking",
         "confirm_request",
@@ -384,8 +446,11 @@ def test_agent_core_pauses_destructive_layer_tools_for_confirmation(tmp_path: Pa
         approved=True,
     )
 
-    confirmed_event_types = [event["type"] for event in confirmed_events]
-    assert confirmed_event_types[:3] == [
+    confirmed_event_types = [
+        event["type"] for event in confirmed_events if event["type"] != "run_metrics"
+    ]
+    assert confirmed_event_types[:4] == [
+        "run_start",
         "confirm_resolved",
         "tool_start",
         "tool_end",
@@ -421,7 +486,7 @@ def test_execute_gis_code_requires_confirmation_and_runs_worker(tmp_path: Path):
 
     events = core.run(session_id=session.id, user_message="生成一个结果文件。")
 
-    assert [event["type"] for event in events] == [
+    assert [event["type"] for event in events if event["type"] != "run_metrics"] == [
         "run_start",
         "thinking",
         "confirm_request",
@@ -1327,7 +1392,7 @@ def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
         user_message="记录 pipeline 阶段。",
     )
 
-    event_types = [event["type"] for event in events]
+    event_types = [event["type"] for event in events if event["type"] != "run_metrics"]
     assert "stage_start" in event_types
     assert "stage_end" in event_types
     assert "code_generated" in event_types
@@ -1764,7 +1829,7 @@ def test_agent_core_continues_tool_loop_until_confirmation(tmp_path: Path):
     )
 
     assert provider.calls == 2
-    event_types = [event["type"] for event in events]
+    event_types = [event["type"] for event in events if event["type"] != "run_metrics"]
     assert event_types == [
         "run_start",
         "thinking",
@@ -1888,11 +1953,12 @@ def test_agent_core_stops_after_tool_returns_without_publishing_stale_result(tmp
         should_cancel=should_cancel,
     ).run(session_id=session.id, user_message="列出图层")
 
-    event_types = [event["type"] for event in events]
+    event_types = [event["type"] for event in events if event["type"] != "run_metrics"]
     assert "tool_start" in event_types
     assert "tool_end" not in event_types
     assert event_types[-2:] == ["message", "complete"]
-    assert events[-2]["payload"]["content"] == "任务已停止。"
+    final_message = next(event for event in reversed(events) if event["type"] == "message")
+    assert final_message["payload"]["content"] == "任务已停止。"
 
     saved = session_db.get_messages(session.id, limit=20)
     assert saved[-1]["content"] == "任务已停止。"

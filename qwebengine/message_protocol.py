@@ -18,6 +18,7 @@ RPC_METHODS = {
 
 AgentEventType = Literal[
     "run_start",
+    "run_metrics",
     "thinking",
     "message_delta",
     "message",

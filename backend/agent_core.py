@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from ..database.session_db import SessionDB
@@ -13,7 +14,7 @@ from ..qwebengine.message_protocol import agent_event
 from .context.prompt_builder import PromptBuilder
 from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
-from .llm.base_provider import ChatMessage, LLMProvider
+from .llm.base_provider import ChatMessage, ChatResponse, LLMProvider
 from .tools.code_execution import (
     build_execute_gis_code_tool,
     validate_execute_gis_code_arguments,
@@ -35,6 +36,84 @@ from .tools.skill_management import build_search_skills_tool, build_set_active_s
 
 EventCallback = Callable[[dict[str, Any]], None]
 CancelChecker = Callable[[], bool]
+
+
+class _RunMetricsTracker:
+    def __init__(self, session_db: SessionDB, session_id: str, run_id: str):
+        self.session_db = session_db
+        self.session_id = session_id
+        self.run_id = run_id
+        self.started_at = time.time()
+        self._started_monotonic = time.monotonic()
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.total_tokens = 0
+        self.llm_calls = 0
+        self.usage_estimated = False
+        self.status = "running"
+        self.finished = False
+        self.session_db.start_run_metrics(
+            run_id,
+            session_id,
+            started_at=self.started_at,
+        )
+
+    def _duration_ms(self) -> int:
+        return max(0, int((time.monotonic() - self._started_monotonic) * 1000))
+
+    def record_response(self, response: ChatResponse) -> dict[str, Any]:
+        self.input_tokens += max(0, int(response.input_tokens))
+        self.output_tokens += max(0, int(response.output_tokens))
+        self.total_tokens += max(
+            0,
+            int(response.total_tokens or response.input_tokens + response.output_tokens),
+        )
+        self.llm_calls += 1
+        self.usage_estimated = self.usage_estimated or response.usage_estimated
+        payload = self.payload()
+        self.session_db.update_run_metrics(
+            self.run_id,
+            duration_ms=payload["duration_ms"],
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            total_tokens=self.total_tokens,
+            llm_calls=self.llm_calls,
+            usage_estimated=self.usage_estimated,
+        )
+        return payload
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            "duration_ms": self._duration_ms(),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "llm_calls": self.llm_calls,
+            "usage_estimated": self.usage_estimated,
+            "status": self.status,
+            "running": not self.finished,
+        }
+
+    def finish(self, status: str) -> dict[str, Any]:
+        if self.finished:
+            return self.payload()
+        self.finished = True
+        self.status = status
+        payload = self.payload()
+        self.session_db.finish_run_metrics(
+            self.run_id,
+            ended_at=time.time(),
+            duration_ms=payload["duration_ms"],
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            total_tokens=self.total_tokens,
+            llm_calls=self.llm_calls,
+            usage_estimated=self.usage_estimated,
+            status=status,
+        )
+        return payload
 
 
 class AgentCore:
@@ -73,40 +152,107 @@ class AgentCore:
     ) -> list[dict[str, Any]]:
         run_id = str(uuid.uuid4())
         events: list[dict[str, Any]] = []
+        metrics = _RunMetricsTracker(self.session_db, session_id, run_id)
+        terminal_status = "completed"
 
-        def publish(event: dict[str, Any]) -> None:
+        def emit_event(event: dict[str, Any]) -> None:
             events.append(event)
             if emit is not None:
                 emit(event)
+
+        def publish(event: dict[str, Any]) -> None:
+            nonlocal terminal_status
+            if event.get("type") == "error":
+                terminal_status = "failed"
+            elif event.get("type") == "confirm_request":
+                terminal_status = "waiting_confirmation"
+            if event.get("type") == "complete" and not metrics.finished:
+                if bool((event.get("payload") or {}).get("cancelled")):
+                    terminal_status = "cancelled"
+                metrics_payload = metrics.finish(terminal_status)
+                emit_event(
+                    agent_event(
+                        "run_metrics",
+                        metrics_payload,
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
+                )
+                event.setdefault("payload", {})["metrics"] = metrics_payload
+            emit_event(event)
+
+        def record_response(response: ChatResponse) -> None:
+            publish(
+                agent_event(
+                    "run_metrics",
+                    metrics.record_response(response),
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+            )
 
         def check_cancelled() -> bool:
             if not self.should_cancel():
                 return False
             content = "任务已停止。"
-            self.session_db.save_message(session_id, "assistant", content, event_type="summary")
+            self.session_db.save_message(
+                session_id,
+                "assistant",
+                content,
+                event_type="summary",
+                run_id=run_id,
+            )
             publish(agent_event("message", {"role": "assistant", "content": content, "model": self.llm_provider.model}, session_id=session_id, run_id=run_id))
             publish(agent_event("complete", {"cancelled": True}, session_id=session_id, run_id=run_id))
             return True
 
-        publish(agent_event("run_start", {"provider": self.llm_provider.name}, session_id=session_id, run_id=run_id))
+        publish(
+            agent_event(
+                "run_start",
+                {"provider": self.llm_provider.name, **metrics.payload()},
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
         if check_cancelled():
             return events
-        self.session_db.save_message(session_id, "user", user_message, event_type="user")
-
-        if qgis_context is None:
-            qgis_context = self._collect_qgis_context()
-        active_skill = self.session_db.get_state(f"{session_id}:active_skill") or "main-orchestrator"
-        system_prompt = self.prompt_builder.build(
-            active_skill,
-            qgis_context,
+        self.session_db.save_message(
+            session_id,
+            "user",
+            user_message,
+            event_type="user",
+            run_id=run_id,
         )
-        thinking_message = "正在组织上下文"
-        self._save_process_message(session_id, thinking_message)
-        publish(agent_event("thinking", {"message": thinking_message}, session_id=session_id, run_id=run_id))
 
-        messages = self._build_conversation_messages(session_id)
+        try:
+            if qgis_context is None:
+                qgis_context = self._collect_qgis_context()
+            active_skill = (
+                self.session_db.get_state(f"{session_id}:active_skill")
+                or "main-orchestrator"
+            )
+            system_prompt = self.prompt_builder.build(
+                active_skill,
+                qgis_context,
+            )
+            thinking_message = "正在组织上下文"
+            self._save_process_message(session_id, thinking_message)
+            publish(
+                agent_event(
+                    "thinking",
+                    {"message": thinking_message},
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+            )
+            messages = self._build_conversation_messages(session_id)
+            tool_registry = self._build_tool_registry(session_id)
+        except Exception as exc:
+            content = self._format_llm_error(exc)
+            self._publish_final_error(content, publish, session_id, run_id)
+            publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
+            return events
 
-        tool_registry = self._build_tool_registry(session_id)
         try:
             budget = IterationBudget()
             response = None
@@ -120,6 +266,7 @@ class AgentCore:
                     publish=publish,
                     session_id=session_id,
                     run_id=run_id,
+                    on_response=record_response,
                 )
                 if check_cancelled():
                     return events
@@ -224,6 +371,7 @@ class AgentCore:
                             "assistant",
                             content,
                             event_type="confirm_request",
+                            run_id=run_id,
                         )
                         publish(
                             agent_event(
@@ -319,6 +467,7 @@ class AgentCore:
                     publish=publish,
                     session_id=session_id,
                     run_id=run_id,
+                    on_response=record_response,
                 )
                 if check_cancelled():
                     return events
@@ -341,6 +490,7 @@ class AgentCore:
                 response.content,
                 event_type="summary",
                 finish_reason=response.finish_reason,
+                run_id=run_id,
             )
             self._publish_message_deltas(
                 response.content,
@@ -378,11 +528,40 @@ class AgentCore:
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         run_id = str(uuid.uuid4())
+        metrics: _RunMetricsTracker
+        terminal_status = "completed"
 
-        def publish(event: dict[str, Any]) -> None:
+        def emit_event(event: dict[str, Any]) -> None:
             events.append(event)
             if emit is not None:
                 emit(event)
+
+        def publish(event: dict[str, Any]) -> None:
+            nonlocal terminal_status
+            if event.get("type") == "error":
+                terminal_status = "failed"
+            if event.get("type") == "complete" and not metrics.finished:
+                metrics_payload = metrics.finish(terminal_status)
+                emit_event(
+                    agent_event(
+                        "run_metrics",
+                        metrics_payload,
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
+                )
+                event.setdefault("payload", {})["metrics"] = metrics_payload
+            emit_event(event)
+
+        def record_response(response: ChatResponse) -> None:
+            publish(
+                agent_event(
+                    "run_metrics",
+                    metrics.record_response(response),
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+            )
 
         key = self._confirmation_key(session_id, confirmation_id)
         raw = self.session_db.get_state(key)
@@ -390,6 +569,16 @@ class AgentCore:
             raise ValueError(f"确认请求不存在或已处理：{confirmation_id}")
         pending = json.loads(raw)
         self.session_db.delete_state(key)
+        metrics = _RunMetricsTracker(self.session_db, session_id, run_id)
+
+        publish(
+            agent_event(
+                "run_start",
+                {"provider": self.llm_provider.name, **metrics.payload()},
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
 
         tool_name = str(pending.get("tool_name") or "")
         arguments = pending.get("arguments") or {}
@@ -408,8 +597,15 @@ class AgentCore:
         self._save_process_message(session_id, "已确认工具操作。" if approved else "已取消工具操作。")
 
         if not approved:
+            terminal_status = "cancelled"
             content = f"已取消工具 `{tool_name}`。"
-            self.session_db.save_message(session_id, "assistant", content, event_type="summary")
+            self.session_db.save_message(
+                session_id,
+                "assistant",
+                content,
+                event_type="summary",
+                run_id=run_id,
+            )
             publish(
                 agent_event(
                     "message",
@@ -460,6 +656,7 @@ class AgentCore:
                     tool_registry=tool_registry,
                     publish=publish,
                     run_id=run_id,
+                    on_response=record_response,
                 )
             except Exception as exc:
                 content = self._format_llm_error(exc)
@@ -482,7 +679,13 @@ class AgentCore:
             content = self._format_tool_success(tool_name, result)
         else:
             content = self._format_tool_failure(tool_name, result)
-        self.session_db.save_message(session_id, "assistant", content, event_type="summary")
+        self.session_db.save_message(
+            session_id,
+            "assistant",
+            content,
+            event_type="summary",
+            run_id=run_id,
+        )
         self._publish_message_deltas(
             content,
             publish=publish,
@@ -626,6 +829,7 @@ class AgentCore:
             "assistant",
             content,
             event_type="confirm_request",
+            run_id=run_id,
         )
         publish(
             agent_event(
@@ -725,13 +929,18 @@ class AgentCore:
         publish: EventCallback | None = None,
         session_id: str = "",
         run_id: str = "",
-    ):
+        on_response: Callable[[ChatResponse], None] | None = None,
+    ) -> ChatResponse:
         last_exc: Exception | None = None
         for attempt in range(1, self.llm_retry_attempts + 1):
             if self.should_cancel():
                 raise RuntimeError("任务已停止。")
             try:
-                return self.llm_provider.chat(system=system, messages=messages, tools=tools)
+                response = self.llm_provider.chat(
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                )
             except Exception as exc:
                 last_exc = exc
                 if session_id:
@@ -762,8 +971,77 @@ class AgentCore:
                     publish(agent_event("thinking", {"message": message}, session_id=session_id, run_id=run_id))
                 if self.llm_retry_delay_seconds > 0:
                     time.sleep(self.llm_retry_delay_seconds * attempt)
+            else:
+                response = self._ensure_response_usage(
+                    response,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                )
+                if on_response is not None:
+                    on_response(response)
+                return response
         reason = self._short_error(last_exc) if last_exc is not None else "未知错误"
         raise RuntimeError(f"LLM 调用失败，已重试 {self.llm_retry_attempts} 次：{reason}") from last_exc
+
+    def _ensure_response_usage(
+        self,
+        response: ChatResponse,
+        *,
+        system: str,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+    ) -> ChatResponse:
+        input_tokens = max(0, int(response.input_tokens))
+        output_tokens = max(0, int(response.output_tokens))
+        usage_estimated = bool(response.usage_estimated)
+        if input_tokens == 0:
+            input_payload: dict[str, Any] = {
+                "system": system,
+                "messages": [
+                    {"role": message.role, "content": message.content}
+                    for message in messages
+                ],
+            }
+            if tools:
+                input_payload["tools"] = tools
+            input_tokens = self._estimate_text_tokens(
+                json.dumps(input_payload, ensure_ascii=False, separators=(",", ":"))
+            )
+            usage_estimated = True
+        if output_tokens == 0:
+            output_payload = {
+                "content": response.content,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }
+                    for call in response.tool_calls
+                ],
+            }
+            output_tokens = self._estimate_text_tokens(
+                json.dumps(output_payload, ensure_ascii=False, separators=(",", ":"))
+            )
+            usage_estimated = True
+        total_tokens = max(
+            0,
+            int(response.total_tokens or input_tokens + output_tokens),
+        )
+        return replace(
+            response,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            usage_estimated=usage_estimated,
+        )
+
+    @staticmethod
+    def _estimate_text_tokens(text: str) -> int:
+        non_ascii = sum(1 for character in text if ord(character) > 127)
+        ascii_chars = len(text) - non_ascii
+        return max(1, int(ascii_chars / 4 + non_ascii * 1.1))
 
     def _format_llm_error(self, exc: Exception) -> str:
         return (
@@ -779,7 +1057,13 @@ class AgentCore:
         session_id: str,
         run_id: str,
     ) -> None:
-        self.session_db.save_message(session_id, "assistant", content, event_type="error")
+        self.session_db.save_message(
+            session_id,
+            "assistant",
+            content,
+            event_type="error",
+            run_id=run_id,
+        )
         self._publish_message_deltas(
             content,
             publish=publish,
@@ -847,6 +1131,7 @@ class AgentCore:
         tool_registry: ToolRegistry,
         publish: EventCallback,
         run_id: str,
+        on_response: Callable[[ChatResponse], None] | None = None,
     ) -> dict[str, Any] | None:
         messages = self._retry_messages_for_code_failure(session_id, failed_arguments, failed_result)
         system_prompt = self.prompt_builder.build(
@@ -874,6 +1159,7 @@ class AgentCore:
                 publish=publish,
                 session_id=session_id,
                 run_id=run_id,
+                on_response=on_response,
             )
             if not response.tool_calls:
                 if response.content:

@@ -103,6 +103,7 @@ class SessionDB:
         finish_reason: str | None = None,
         stage_name: str | None = None,
         stage_artifact: dict[str, Any] | None = None,
+        run_id: str | None = None,
     ) -> int:
         timestamp = time.time()
         artifact_json = json.dumps(stage_artifact, ensure_ascii=False) if stage_artifact else None
@@ -112,8 +113,8 @@ class SessionDB:
                 """
                 INSERT INTO messages (
                     session_id, role, content, timestamp, finish_reason,
-                    stage_name, stage_artifact, event_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    stage_name, stage_artifact, event_type, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -124,6 +125,7 @@ class SessionDB:
                     stage_name,
                     artifact_json,
                     event_type,
+                    run_id,
                 ),
             )
             connection.execute(
@@ -138,15 +140,126 @@ class SessionDB:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, role, content, timestamp, event_type, finish_reason
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY id DESC
+                SELECT
+                    m.id, m.role, m.content, m.timestamp, m.event_type,
+                    m.finish_reason, m.run_id,
+                    r.duration_ms, r.input_tokens, r.output_tokens,
+                    r.total_tokens, r.llm_calls, r.usage_estimated,
+                    r.status AS metrics_status
+                FROM messages AS m
+                LEFT JOIN run_metrics AS r ON r.run_id = m.run_id
+                WHERE m.session_id = ?
+                ORDER BY m.id DESC
                 LIMIT ?
                 """,
                 (session_id, limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def start_run_metrics(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        started_at: float,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO run_metrics(run_id, session_id, started_at, status)
+                VALUES (?, ?, ?, 'running')
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (run_id, session_id, started_at),
+            )
+
+    def update_run_metrics(
+        self,
+        run_id: str,
+        *,
+        duration_ms: int,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        llm_calls: int,
+        usage_estimated: bool,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE run_metrics
+                SET duration_ms = ?, input_tokens = ?, output_tokens = ?,
+                    total_tokens = ?, llm_calls = ?, usage_estimated = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (
+                    max(0, int(duration_ms)),
+                    max(0, int(input_tokens)),
+                    max(0, int(output_tokens)),
+                    max(0, int(total_tokens)),
+                    max(0, int(llm_calls)),
+                    1 if usage_estimated else 0,
+                    run_id,
+                ),
+            )
+
+    def finish_run_metrics(
+        self,
+        run_id: str,
+        *,
+        ended_at: float,
+        duration_ms: int,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        llm_calls: int,
+        usage_estimated: bool,
+        status: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT session_id, status FROM run_metrics WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                """
+                UPDATE run_metrics
+                SET ended_at = ?, duration_ms = ?, input_tokens = ?,
+                    output_tokens = ?, total_tokens = ?, llm_calls = ?,
+                    usage_estimated = ?, status = ?
+                WHERE run_id = ?
+                """,
+                (
+                    ended_at,
+                    max(0, int(duration_ms)),
+                    max(0, int(input_tokens)),
+                    max(0, int(output_tokens)),
+                    max(0, int(total_tokens)),
+                    max(0, int(llm_calls)),
+                    1 if usage_estimated else 0,
+                    status,
+                    run_id,
+                ),
+            )
+            if row["status"] == "running":
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET input_tokens = COALESCE(input_tokens, 0) + ?,
+                        output_tokens = COALESCE(output_tokens, 0) + ?
+                    WHERE id = ?
+                    """,
+                    (
+                        max(0, int(input_tokens)),
+                        max(0, int(output_tokens)),
+                        row["session_id"],
+                    ),
+                )
 
     def get_conversation_messages(
         self, session_id: str, limit: int = 50

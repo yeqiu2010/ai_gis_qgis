@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useBridge } from './composables/useBridge'
 import type {
   AppSettings,
   ChatMessage,
   PendingConfirmation,
+  RunMetrics,
   SessionSummary
 } from './types/protocol'
 
@@ -20,6 +21,10 @@ const streamingRunId = ref('')
 const streamingMessageIndex = ref<number | null>(null)
 const processRunId = ref('')
 const processMessageIndex = ref<number | null>(null)
+const runMetricsById = ref<Record<string, RunMetrics>>({})
+const activeMetricsRunId = ref('')
+const clockMs = ref(Date.now())
+let clockTimer: number | undefined
 const settingsOpen = ref(false)
 const settingsSaving = ref(false)
 const settingsMessage = ref('')
@@ -45,6 +50,23 @@ const { status, request } = useBridge((event) => {
   if (event.type === 'run_start') {
     processRunId.value = event.run_id || ''
     processMessageIndex.value = null
+    const runId = event.run_id || ''
+    if (runId) {
+      activeMetricsRunId.value = runId
+      updateRunMetrics(runId, event.payload, true)
+      for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+        if (messages.value[index].role === 'user' && !messages.value[index].run_id) {
+          messages.value[index] = { ...messages.value[index], run_id: runId }
+          break
+        }
+      }
+    }
+  }
+  if (event.type === 'run_metrics') {
+    const runId = event.run_id || String(event.payload.run_id || '')
+    if (runId) {
+      updateRunMetrics(runId, event.payload, Boolean(event.payload.running))
+    }
   }
   if (event.type === 'stage_start') {
     addProcessMessage(`Pipeline 阶段开始：${stageLabel(String(event.payload.stage_name || ''))}`, event.run_id || '')
@@ -121,7 +143,23 @@ const canSubmit = computed(() => {
 })
 
 onMounted(async () => {
+  clockTimer = window.setInterval(() => {
+    clockMs.value = Date.now()
+  }, 250)
   await bootstrapSession()
+})
+
+onUnmounted(() => {
+  if (clockTimer !== undefined) {
+    window.clearInterval(clockTimer)
+  }
+})
+
+const activeRunMetrics = computed(() => {
+  if (!activeMetricsRunId.value || !isSending.value) {
+    return null
+  }
+  return runMetricsById.value[activeMetricsRunId.value] || null
 })
 
 async function bootstrapSession() {
@@ -156,6 +194,8 @@ async function loadMessages() {
   streamingMessageIndex.value = null
   processRunId.value = ''
   processMessageIndex.value = null
+  runMetricsById.value = {}
+  activeMetricsRunId.value = ''
   await scrollConversation()
 }
 
@@ -169,6 +209,8 @@ async function createSession() {
   streamingMessageIndex.value = null
   processRunId.value = ''
   processMessageIndex.value = null
+  runMetricsById.value = {}
+  activeMetricsRunId.value = ''
   await scrollConversation()
 }
 
@@ -181,6 +223,7 @@ async function sendMessage() {
   draft.value = ''
   messages.value.push({ role: 'user', content: message, event_type: 'user' })
   isSending.value = true
+  activeMetricsRunId.value = ''
   processRunId.value = ''
   processMessageIndex.value = null
   await scrollConversation()
@@ -273,11 +316,18 @@ async function resolveConfirmation(approved: boolean) {
   }
   const confirmation = pendingConfirmation.value
   pendingConfirmation.value = null
-  await request('confirmToolCall', {
-    session_id: activeSessionId.value,
-    confirmation_id: confirmation.confirmation_id,
-    approved
-  })
+  isSending.value = true
+  activeMetricsRunId.value = ''
+  try {
+    await request('confirmToolCall', {
+      session_id: activeSessionId.value,
+      confirmation_id: confirmation.confirmation_id,
+      approved
+    })
+  } catch (error) {
+    isSending.value = false
+    throw error
+  }
 }
 
 function addProcessMessage(content: string, runId = '') {
@@ -297,7 +347,8 @@ function addProcessMessage(content: string, runId = '') {
     messages.value.push({
       role: 'system',
       content,
-      event_type: 'process'
+      event_type: 'process',
+      run_id: normalizedRunId
     })
     processRunId.value = normalizedRunId
     processMessageIndex.value = messages.value.length - 1
@@ -390,7 +441,8 @@ function appendAssistantDelta(runId: string, delta: string) {
     messages.value.push({
       role: 'assistant',
       content: '',
-      event_type: 'streaming'
+      event_type: 'streaming',
+      run_id: runId
     })
     streamingMessageIndex.value = messages.value.length - 1
   }
@@ -407,18 +459,92 @@ function finalizeAssistantMessage(runId: string, content: string) {
     messages.value[streamingMessageIndex.value] = {
       role: 'assistant',
       content,
-      event_type: 'summary'
+      event_type: 'summary',
+      run_id: runId
     }
   } else {
     messages.value.push({
       role: 'assistant',
       content,
-      event_type: 'summary'
+      event_type: 'summary',
+      run_id: runId
     })
   }
   streamingRunId.value = ''
   streamingMessageIndex.value = null
   void scrollConversation()
+}
+
+function updateRunMetrics(
+  runId: string,
+  payload: Record<string, unknown>,
+  running: boolean
+) {
+  const previous = runMetricsById.value[runId]
+  const startedAt = Number(payload.started_at ?? previous?.started_at ?? Date.now() / 1000)
+  const next: RunMetrics = {
+    run_id: runId,
+    started_at: Number.isFinite(startedAt) ? startedAt : Date.now() / 1000,
+    duration_ms: metricNumber(payload.duration_ms, previous?.duration_ms),
+    input_tokens: metricNumber(payload.input_tokens, previous?.input_tokens),
+    output_tokens: metricNumber(payload.output_tokens, previous?.output_tokens),
+    total_tokens: metricNumber(payload.total_tokens, previous?.total_tokens),
+    llm_calls: metricNumber(payload.llm_calls, previous?.llm_calls),
+    usage_estimated: Boolean(payload.usage_estimated ?? previous?.usage_estimated),
+    status: String(payload.status ?? previous?.status ?? (running ? 'running' : 'completed')),
+    running
+  }
+  runMetricsById.value = { ...runMetricsById.value, [runId]: next }
+}
+
+function metricNumber(value: unknown, fallback = 0) {
+  const number = Number(value ?? fallback)
+  return Number.isFinite(number) ? Math.max(0, number) : Math.max(0, fallback)
+}
+
+function metricsForMessage(message: ChatMessage): RunMetrics | null {
+  if (message.role !== 'assistant') {
+    return null
+  }
+  if (message.run_id && runMetricsById.value[message.run_id]) {
+    return runMetricsById.value[message.run_id]
+  }
+  if (message.duration_ms == null && message.total_tokens == null) {
+    return null
+  }
+  return {
+    run_id: message.run_id || '',
+    started_at: 0,
+    duration_ms: metricNumber(message.duration_ms),
+    input_tokens: metricNumber(message.input_tokens),
+    output_tokens: metricNumber(message.output_tokens),
+    total_tokens: metricNumber(message.total_tokens),
+    llm_calls: metricNumber(message.llm_calls),
+    usage_estimated: Boolean(message.usage_estimated),
+    status: message.metrics_status || 'completed',
+    running: false
+  }
+}
+
+function elapsedMs(metrics: RunMetrics) {
+  if (!metrics.running || !metrics.started_at) {
+    return metrics.duration_ms
+  }
+  return Math.max(metrics.duration_ms, clockMs.value - metrics.started_at * 1000)
+}
+
+function formatDuration(durationMs: number) {
+  const seconds = Math.max(0, durationMs) / 1000
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)} 秒`
+  }
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = Math.floor(seconds % 60)
+  return `${minutes} 分 ${remainingSeconds} 秒`
+}
+
+function formatTokens(tokens: number) {
+  return Math.max(0, Math.round(tokens)).toLocaleString()
 }
 
 async function scrollConversation() {
@@ -474,8 +600,30 @@ async function waitForPaint() {
       >
         <span>{{ message.role === 'user' ? '你' : message.role === 'system' ? '过程' : 'Agent' }}</span>
         <p>{{ message.content }}</p>
+        <div v-if="metricsForMessage(message)" class="message-metrics">
+          <span>耗时 {{ formatDuration(elapsedMs(metricsForMessage(message)!)) }}</span>
+          <span>
+            Token {{ formatTokens(metricsForMessage(message)!.total_tokens) }}
+            （输入 {{ formatTokens(metricsForMessage(message)!.input_tokens) }} /
+            输出 {{ formatTokens(metricsForMessage(message)!.output_tokens) }}）
+          </span>
+          <span>模型调用 {{ metricsForMessage(message)!.llm_calls }} 次</span>
+          <em v-if="metricsForMessage(message)!.usage_estimated">估算</em>
+        </div>
       </article>
       <div ref="conversationEndRef" class="conversation-end" aria-hidden="true" />
+    </section>
+
+    <section v-if="activeRunMetrics" class="live-metrics" aria-live="polite">
+      <strong>本轮任务</strong>
+      <span>耗时 {{ formatDuration(elapsedMs(activeRunMetrics)) }}</span>
+      <span>
+        Token {{ formatTokens(activeRunMetrics.total_tokens) }}
+        （输入 {{ formatTokens(activeRunMetrics.input_tokens) }} /
+        输出 {{ formatTokens(activeRunMetrics.output_tokens) }}）
+      </span>
+      <span>模型调用 {{ activeRunMetrics.llm_calls }} 次</span>
+      <em v-if="activeRunMetrics.usage_estimated">Token 为估算值</em>
     </section>
 
     <section v-if="pendingConfirmation" class="confirm-bar" aria-live="polite">
