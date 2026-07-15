@@ -3,7 +3,7 @@ name: code-reviewer
 description: 代码安全和 GIS 正确性审查
 tools:
   - record_pipeline_stage
-version: 2.0.0
+version: 2.1.0
 tags: [gis, pipeline, review]
 ---
 
@@ -52,6 +52,11 @@ tags: [gis, pipeline, review]
   `land_area = current_land_area`。地块面积必须按唯一地块去重汇总，不能按建筑重复累加，
   也不能只保留最后一个地块。
 - 用户指定面积字段作为覆盖率分母，但代码忽略该字段改用几何面积；或者分子使用投影后几何面积、分母使用单位不明的属性面积，却没有验证单位一致。
+- 密度、覆盖率、比例、均值、面积、长度或高度等小数派生字段被定义为文本类型（例如 `QVariant.String`、`native:aggregate`/`native:refactorfields` 映射中的文本类型 `type: 10`，或算法详情标记为 Text/String 的字段枚举），或者向有长度限制的 String 字段写入浮点数。此类字段必须使用 Double，并设置合理的数值长度和精度。
+- 代码准备写入已有 `dense` 等派生字段，却没有检查同名字段的实际类型；若原字段是文本型，必须先重构为唯一的 Double 字段，不能仅增加字符串长度或直接写入浮点数。
+- 比值计算没有处理 NULL、非数值、分母为 0，或把结果转换成 `str`、`nan`、`inf` 后写入属性表。
+- `native:fieldcalculator` 对密度/除法结果使用 `FIELD_TYPE=2`，即使旁边注释声称它是 Double 也必须阻断；该值实际表示 Text/String，Decimal/Double 应使用本次算法证据对应的枚举（当前算法通常为 0）。
+- 自动重试脚本只包含失败步骤，出现“中间结果已存在”，或把上一次 `QGIS_AGENT_WORKSPACE` 中的文件作为输入。每次执行使用新的空工作目录，重试必须从原始 QGIS 图层重新执行完整流程。
 
 ## GIS 正确性检查
 
@@ -65,6 +70,7 @@ tags: [gis, pipeline, review]
 - 写 GeoPackage 时优先使用 Processing 算法的 `OUTPUT` 路径；只有取得当前 QGIS 版本精确 API 证据时才允许使用 Writer API。
 - 密度、覆盖率等比值必须审查分子与分母的统计粒度一致；按用地类型统计时，分母应为该
   类型唯一地块面积总量，不能使用任意单个地块面积。
+- 派生字段审查必须同时核对“表达式返回类型”和“目标字段存储类型”；表达式得到浮点数并不代表文本型目标字段会自动安全转换。
 
 ## 审查产物
 

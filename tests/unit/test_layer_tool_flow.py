@@ -15,8 +15,10 @@ from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
     find_generated_code_issues,
+    find_uncreated_workspace_inputs,
     find_unwritten_expected_outputs,
     infer_expected_outputs_from_code,
+    validate_execute_gis_code_arguments,
 )
 from ai_gis_qgis.backend.tools.layer_ops import _layer_name_aliases, _normalize_source
 from ai_gis_qgis.backend.tools.registry import ToolEntry, ToolRegistry
@@ -795,6 +797,65 @@ def test_detects_expected_output_that_is_only_printed():
     ) == ["type_values_check.txt"]
 
 
+def test_preflight_rejects_text_field_type_for_density_calculation():
+    code = """
+from pathlib import Path
+workspace = Path(QGIS_AGENT_WORKSPACE)
+building_land_stats_path = str(workspace / "building_land_stats.gpkg")
+output_path = str(workspace / "result.gpkg")
+processing.run(
+    "native:fieldcalculator",
+    {
+        "INPUT": building_land_stats_path,
+        "FIELD_NAME": "dense",
+        "FIELD_TYPE": 2,
+        "FIELD_LENGTH": 30,
+        "FIELD_PRECISION": 10,
+        "FORMULA": '"sum_FAREA" / "land_sum_Shape_Area"',
+        "OUTPUT": output_path,
+    },
+)
+"""
+
+    result = validate_execute_gis_code_arguments(
+        {
+            "code": code,
+            "expected_outputs": [{"path": "result.gpkg", "name": "result", "type": "vector"}],
+        }
+    )
+
+    assert result is not None
+    assert result["preflight_failed"] is True
+    assert "FIELD_TYPE=2 是 Text/String，不是 Double" in result["error"]
+    assert "building_land_stats.gpkg" in result["error"]
+    assert "全新的空工作目录" in result["error"]
+
+
+def test_workspace_input_is_valid_when_current_script_creates_it_first():
+    code = """
+from pathlib import Path
+workspace = Path(QGIS_AGENT_WORKSPACE)
+intermediate_path = str(workspace / "building_land_stats.gpkg")
+output_path = str(workspace / "result.gpkg")
+processing.run(
+    "native:joinattributestable",
+    {"INPUT": source_layer, "INPUT_2": stats_layer, "OUTPUT": intermediate_path},
+)
+processing.run(
+    "native:fieldcalculator",
+    {
+        "INPUT": intermediate_path,
+        "FIELD_NAME": "dense",
+        "FIELD_TYPE": 0,
+        "FORMULA": '"sum_FAREA" / "land_sum_Shape_Area"',
+        "OUTPUT": output_path,
+    },
+)
+"""
+
+    assert find_uncreated_workspace_inputs(code) == []
+
+
 def test_invalid_output_contract_is_rejected_before_confirmation(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="preflight", model="test", source="test")
@@ -1305,6 +1366,30 @@ def test_conversation_limit_is_applied_after_role_filtering(tmp_path: Path):
         message.role == "user" and message.content == "请分析建筑物"
         for message in retry_messages
     )
+    retry_instruction = retry_messages[-1].content
+    assert "每次 execute_gis_code 都会创建全新的空工作目录" in retry_instruction
+    assert "严禁写‘中间结果已存在’" in retry_instruction
+
+
+def test_retry_prompt_preserves_original_full_script_after_partial_retry(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="retry context", model="test", source="test")
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+
+    messages = core._retry_messages_for_code_failure(
+        session.id,
+        {"code": "PARTIAL_STEP_6", "expected_outputs": []},
+        {"success": False, "error": "missing intermediate"},
+        original_failed_arguments={
+            "code": "FULL_STEPS_1_TO_6",
+            "expected_outputs": [{"path": "result.gpkg", "type": "vector"}],
+        },
+    )
+
+    retry_instruction = messages[-1].content
+    assert "FULL_STEPS_1_TO_6" in retry_instruction
+    assert "PARTIAL_STEP_6" in retry_instruction
+    assert "从当前 QGIS 原始图层开始" in retry_instruction
 
 
 def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
@@ -1357,6 +1442,11 @@ def test_prompt_builder_composes_pipeline_includes():
     assert "不允许在 `data_overview`、`structured_query`、`solution_plan`、`generated_code` 四个阶段完成之前调用 `execute_gis_code`" in prompt
     assert "优先一次调用 `inspect_layers`" in prompt
     assert "500m.shp" in prompt
+    assert "`dense` 必须规划为 Double" in prompt
+    assert "QgsField(\"dense\", double_type" in prompt
+    assert "若原字段是文本型，必须先重构为唯一的 Double 字段" in prompt
+    assert "FIELD_TYPE=2` 是 Text/String" in prompt
+    assert "上一次失败执行的中间文件不会继承" in prompt
 
 
 def test_prompt_builder_routes_complex_analysis_to_pipeline():

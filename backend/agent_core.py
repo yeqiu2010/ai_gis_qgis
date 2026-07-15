@@ -1198,7 +1198,12 @@ class AgentCore:
                 last_result = result
                 if result.get("success", True):
                     return result
-                messages = self._retry_messages_for_code_failure(session_id, call.arguments, result)
+                messages = self._retry_messages_for_code_failure(
+                    session_id,
+                    call.arguments,
+                    result,
+                    original_failed_arguments=failed_arguments,
+                )
         return last_result
 
     def _retry_messages_for_code_failure(
@@ -1206,6 +1211,8 @@ class AgentCore:
         session_id: str,
         failed_arguments: dict[str, Any],
         failed_result: dict[str, Any],
+        *,
+        original_failed_arguments: dict[str, Any] | None = None,
     ) -> list[ChatMessage]:
         history = self.session_db.get_conversation_messages(session_id, limit=20)
         messages = [
@@ -1216,12 +1223,47 @@ class AgentCore:
         memory_message = self._build_memory_message(session_id)
         if memory_message is not None:
             messages.insert(0, memory_message)
+        original_arguments = original_failed_arguments or failed_arguments
+        original_payload = {
+            key: original_arguments.get(key)
+            for key in (
+                "code",
+                "expected_outputs",
+                "delivery_outputs",
+                "timeout_seconds",
+            )
+            if original_arguments.get(key) is not None
+        }
+        latest_payload = {
+            key: failed_arguments.get(key)
+            for key in (
+                "code",
+                "expected_outputs",
+                "delivery_outputs",
+                "timeout_seconds",
+            )
+            if failed_arguments.get(key) is not None
+        }
+        failure_evidence = {
+            "success": failed_result.get("success"),
+            "error": failed_result.get("error"),
+            "stderr": str(failed_result.get("stderr") or "")[-4000:],
+            "stdout": str(failed_result.get("stdout") or "")[-1000:],
+            "workspace_dir": failed_result.get("workspace_dir"),
+            "preflight_failed": failed_result.get("preflight_failed"),
+        }
         messages.append(
             ChatMessage(
                 role="assistant",
                 content=(
-                    "execute_gis_code 执行失败，请根据错误重新生成修复后的代码并再次调用 execute_gis_code。"
-                    "不要重复相同错误。常见修复：如果使用 QgsProject/QgsVectorLayer 等 PyQGIS 类，"
+                    "execute_gis_code 执行失败。必须重新生成一份从当前 QGIS 原始图层开始、"
+                    "包含原脚本全部步骤的完整自包含代码，再次调用 execute_gis_code。"
+                    "每次 execute_gis_code 都会创建全新的空工作目录；上一次失败执行产生的"
+                    "临时或中间文件不会被复制到重试目录。严禁写‘中间结果已存在’、只重跑失败步骤、"
+                    "读取上次 workspace_dir，或假设任意 QGIS_AGENT_WORKSPACE 文件已存在。"
+                    "必须保留原始脚本中失败步骤之前的图层获取、检查、处理和中间结果生成步骤，"
+                    "只修正导致失败的代码。不要重复相同错误。"
+                    "常见修复：如果使用 QgsProject/QgsVectorLayer 等 PyQGIS 类，"
                     "可以直接使用当前 QGIS 环境中已有符号，或显式 `from qgis.core import ...`；"
                     "输出仍必须写入 QGIS_AGENT_WORKSPACE。"
                     "如果错误来自空几何或无效几何，应在 Processing context 中使用 "
@@ -1231,8 +1273,11 @@ class AgentCore:
                     "native:fixgeometries，也不得生成完整图层的修复副本。"
                     "如果错误提示必须提供 expected_outputs，必须在下一次 execute_gis_code 调用中"
                     "补上最终输出文件，例如 {\"path\":\"500m.shp\",\"name\":\"500m\",\"type\":\"vector\"}。\n"
-                    f"失败参数：{json.dumps(failed_arguments, ensure_ascii=False)}\n"
-                    f"失败结果：{json.dumps(failed_result, ensure_ascii=False)}"
+                    "native:fieldcalculator 中 FIELD_TYPE=2 是 Text/String，不是 Double；"
+                    "密度、比例或除法结果应使用算法证据中的 Decimal/Double 类型，不能仅增大 FIELD_LENGTH。\n"
+                    f"原始完整失败调用：{json.dumps(original_payload, ensure_ascii=False)}\n"
+                    f"最近失败调用：{json.dumps(latest_payload, ensure_ascii=False)}\n"
+                    f"失败证据：{json.dumps(failure_evidence, ensure_ascii=False)}"
                 ),
             )
         )

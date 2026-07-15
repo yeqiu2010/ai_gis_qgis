@@ -292,11 +292,19 @@ def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, 
     if not isinstance(expected_outputs, list):
         return None
     unwritten_outputs = find_unwritten_expected_outputs(code, expected_outputs)
+    uncreated_inputs = find_uncreated_workspace_inputs(code)
     issues = find_generated_code_issues(code)
     if unwritten_outputs:
         issues.insert(
             0,
             "以下文件已声明但代码没有写入：" + "、".join(unwritten_outputs),
+        )
+    if uncreated_inputs:
+        issues.insert(
+            0,
+            "以下工作目录输入在当前完整脚本中尚未创建："
+            + "、".join(uncreated_inputs)
+            + "；每次 execute_gis_code 都使用全新的空工作目录，重试必须从原始 QGIS 图层开始重新执行全部步骤",
         )
     if not issues:
         return None
@@ -451,6 +459,130 @@ def find_generated_code_issues(code: str) -> list[str]:
     return issues
 
 
+def find_uncreated_workspace_inputs(code: str) -> list[str]:
+    """Find file inputs which incorrectly assume a previous execution workspace."""
+    if not code.strip():
+        return []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    workspace_base_vars = {"QGIS_AGENT_WORKSPACE"}
+    workspace_path_vars: dict[str, set[str]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            referenced_names = {
+                node.id for node in ast.walk(assignment.value) if isinstance(node, ast.Name)
+            }
+            uses_workspace = bool(referenced_names.intersection(workspace_base_vars))
+            path_names = _workspace_path_names(
+                assignment.value,
+                workspace_base_vars,
+                workspace_path_vars,
+            )
+            for target in assignment.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if uses_workspace and target.id not in workspace_base_vars:
+                    workspace_base_vars.add(target.id)
+                    changed = True
+                if path_names and not path_names.issubset(
+                    workspace_path_vars.get(target.id, set())
+                ):
+                    workspace_path_vars.setdefault(target.id, set()).update(path_names)
+                    changed = True
+
+    written: set[str] = set()
+    missing: list[str] = []
+    calls = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
+    )
+    for call in calls:
+        func_name = _call_name(call.func)
+        if func_name == "open" and call.args:
+            path_names = _workspace_path_names(
+                call.args[0], workspace_base_vars, workspace_path_vars
+            )
+            mode = _literal_string(call.args[1]) if len(call.args) > 1 else "r"
+            if any(flag in (mode or "") for flag in "wax+"):
+                written.update(path_names)
+            else:
+                _append_missing_paths(missing, path_names.difference(written))
+            continue
+        if func_name.endswith((".write_text", ".write_bytes")) and isinstance(
+            call.func, ast.Attribute
+        ):
+            written.update(
+                _workspace_path_names(
+                    call.func.value,
+                    workspace_base_vars,
+                    workspace_path_vars,
+                )
+            )
+            continue
+        if func_name != "processing.run" or len(call.args) < 2:
+            continue
+        parameters = _literal_dict_items(call.args[1])
+        output_names: set[str] = set()
+        for key, value in parameters.items():
+            path_names = _workspace_path_names(
+                value,
+                workspace_base_vars,
+                workspace_path_vars,
+            )
+            if key in {"OUTPUT", "OUTPUT_LAYER", "OUTPUT_TABLE"}:
+                output_names.update(path_names)
+            elif key == "INPUT" or key.startswith("INPUT_") or key in {
+                "INPUT_2",
+                "JOIN",
+                "OVERLAY",
+                "MASK",
+            }:
+                _append_missing_paths(missing, path_names.difference(written))
+        written.update(output_names)
+    return missing
+
+
+def _workspace_path_names(
+    node: ast.AST,
+    workspace_base_vars: set[str],
+    workspace_path_vars: dict[str, set[str]],
+) -> set[str]:
+    if isinstance(node, ast.Name):
+        return set(workspace_path_vars.get(node.id, set()))
+    referenced_names = {
+        child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+    }
+    names = set()
+    for referenced_name in referenced_names:
+        names.update(workspace_path_vars.get(referenced_name, set()))
+    uses_workspace = bool(referenced_names.intersection(workspace_base_vars))
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Constant) or not isinstance(child.value, str):
+            continue
+        candidate = _candidate_output_path(child.value)
+        if not candidate:
+            continue
+        raw_path = child.value.strip()
+        is_relative = not Path(raw_path).is_absolute() and not PureWindowsPath(raw_path).drive
+        normalized_path = raw_path.replace("\\", "/").lower()
+        is_agent_workspace = ".qgis_hermes_agent/workspaces/" in normalized_path
+        if uses_workspace or is_relative or is_agent_workspace:
+            names.add(_output_filename(candidate))
+    return names
+
+
+def _append_missing_paths(missing: list[str], names: set[str]) -> None:
+    for name in sorted(names):
+        if name not in missing:
+            missing.append(name)
+
+
 def _is_processing_output_path_expression(
     node: ast.AST,
     output_path_names: set[str],
@@ -546,6 +678,29 @@ def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
                     f"必须在 AGGREGATES 中用 first_value 显式输出分组键 {group_field}（建议使用 ASCII 别名），"
                     "下游连接必须引用该输出别名",
                 )
+
+    if algorithm_id == "native:fieldcalculator":
+        field_name = (_literal_string(parameters.get("FIELD_NAME")) or "").lower()
+        formula = _literal_string(parameters.get("FORMULA")) or ""
+        field_type_node = parameters.get("FIELD_TYPE")
+        field_type = (
+            field_type_node.value
+            if isinstance(field_type_node, ast.Constant)
+            and isinstance(field_type_node.value, int)
+            and not isinstance(field_type_node.value, bool)
+            else None
+        )
+        numeric_name = any(
+            marker in field_name
+            for marker in ("dense", "density", "ratio", "rate", "coverage", "密度", "比例", "率")
+        )
+        if field_type == 2 and (numeric_name or "/" in formula):
+            _append_issue(
+                issues,
+                "native:fieldcalculator 的 FIELD_TYPE=2 是 Text/String，不是 Double；"
+                "密度或除法结果必须使用算法详情中的 Decimal/Double 类型（当前算法通常为 FIELD_TYPE=0），"
+                "不能靠增大 FIELD_LENGTH 修复",
+            )
 
     if algorithm_id == "native:joinattributesbylocation" and "OVERLAY" in parameters:
         _append_issue(

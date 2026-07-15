@@ -3,7 +3,7 @@ name: code-generator
 description: 生成 QGIS 当前环境可执行代码
 tools:
   - record_pipeline_stage
-version: 2.0.0
+version: 2.1.0
 tags: [gis, pipeline, code]
 ---
 
@@ -50,6 +50,11 @@ tags: [gis, pipeline, code]
 - 空间连接、聚合等中间结果可能改名或丢弃字段。后续引用前必须检查实际 `result_layer.fields()`；不得假定 `SHAPE_Area` 等源字段一定存在。如果统计目标来自土地图层，应优先在原土地图层上聚合，不要反向依赖连接后的建筑物字段。
 - 用户明确指定“面积”等字段作为覆盖率分母时，必须检查该字段存在、值可转为数值且处理空值，并按用户定义汇总；不得悄悄改用 `geometry().area()`。若重叠面积来自投影后几何，必须确认它和面积字段单位一致；单位不明时应在 `structured_query` 阶段澄清，或在方案中明确改为对分子、分母使用同一投影几何口径。
 - 不得使用 `??_1` 等乱码或占位字段名。中间输出需自建字段时优先使用 ASCII 内部名，最终 CSV 表头再映射为中文。
+- 新增或覆盖派生字段时，必须按业务语义显式定义字段类型。密度、覆盖率、比例、均值、面积、长度、高度和金额等带小数的结果必须是数值型 Double；不得定义成 `QVariant.String`、`native:aggregate`/`native:refactorfields` 字段映射中的文本类型 `type: 10`，也不得选择 Processing 算法详情标记为 Text/String 的字段枚举或先 `str(value)` 再写入。字段的 `length`/`precision` 是数值存储元数据，不能用字符串长度代替数值类型；一般比值可使用长度 20、精度 10，最终仍以输出格式和本次算法证据为准。
+- 写入用户指定的已有字段（例如 `dense`）前，必须检查同名字段的实际类型。若已有字段不是数值型，不得把浮点数直接写入该字段，也不得仅扩大文本长度；应在中间结果中删除/重构该字段后创建 Double 字段，或使用已检索的字段重构算法显式转换。最终写出前再次确认该字段为数值型。
+- 比值表达式必须处理 NULL、非数值和分母为 0：无有效分母时写入 NULL，不得写入字符串 `"NULL"`、`"nan"` 或 `"inf"`。除非用户明确要求显示格式，不要为了控制小数位把数值转成文本。
+- `native:fieldcalculator` 的枚举按该算法自身的证据解释：在当前 QGIS 算法中 `FIELD_TYPE=0` 是 Decimal/Double，`FIELD_TYPE=2` 是 Text/String。不得因注释写了 `# Double` 就把 2 当作 Double；密度或除法表达式使用 2 必须判定为错误。
+- 自动修复执行失败时仍必须重新生成包含原始全部步骤的完整脚本。每次 `execute_gis_code` 都使用全新的空 `QGIS_AGENT_WORKSPACE`，上一次失败执行的中间文件不会继承；严禁生成“中间结果已存在，直接执行步骤 N”的局部脚本，严禁读取上一次 `workspace_dir`。重试脚本必须从当前 QGIS 工程原始图层开始重新创建全部中间结果。
 
 ## 常用 PyQGIS 函数和对象
 
@@ -158,6 +163,50 @@ processing.run(
 ```
 
 `type`、`length`、`precision` 和其他参数仍必须以本次算法证据及输入字段类型为准，不得只照抄模板。地块面积必须从原始用地图层按唯一地块汇总，不能从“一栋建筑一条记录”的空间连接结果重复累加。
+
+## 推荐模板：计算密度等 Double 派生字段
+
+优先使用已在 `solution_plan.algorithm_evidence` 中读取详情的字段计算算法。下面的 `FIELD_TYPE=0` 仅在本次算法证据确认其含义为 Decimal/Double 时使用，不得脱离算法详情照抄：
+
+```python
+dense_result = processing.run(
+    "native:fieldcalculator",
+    {
+        "INPUT": joined_stats,
+        "FIELD_NAME": "dense",
+        "FIELD_TYPE": 0,  # 本次算法证据必须确认 0 = Decimal/Double
+        "FIELD_LENGTH": 20,
+        "FIELD_PRECISION": 10,
+        "NEW_FIELD": True,
+        "FORMULA": (
+            'CASE WHEN to_real("sum_land_area") IS NULL OR '
+            'to_real("sum_land_area") = 0 OR '
+            'to_real("sum_footprint") IS NULL '
+            'THEN NULL ELSE to_real("sum_footprint") / '
+            'to_real("sum_land_area") END'
+        ),
+        "OUTPUT": output_path,
+    },
+    context=context,
+    feedback=feedback,
+)
+```
+
+如果依据精确 API 证据自行创建字段，必须使用数值类型，而不是字符串：
+
+```python
+from qgis.PyQt.QtCore import QMetaType, QVariant
+from qgis.core import QgsField
+
+double_type = QMetaType.Type.Double if hasattr(QMetaType, "Type") else QVariant.Double
+provider.addAttributes([QgsField("dense", double_type, len=20, prec=10)])
+layer.updateFields()
+dense_index = layer.fields().indexFromName("dense")
+if dense_index < 0 or not layer.fields()[dense_index].isNumeric():
+    raise ValueError("dense 字段必须是数值型 Double")
+```
+
+若输入已经存在文本型 `dense`，不能直接运行上面的新增字段代码造成重名，也不能向原字段写浮点数；先通过方案中已检索的字段重构步骤生成唯一的 Double `dense` 字段。
 
 ## 推荐模板：按属性筛选并输出 GeoJSON
 
@@ -277,3 +326,6 @@ processing.run(
 - 是否避免了 `QgsApplication`、`subprocess`、`eval`、`exec`、删除文件？
 - `PREDICATE`、`JOIN_FIELDS`、`AGGREGATES` 的数值类型是否与算法详情完全一致？
 - 后续使用中间结果字段前，是否检查了该结果的实际字段名？
+- 密度、比例等派生字段是否为 Double，且没有复用同名 String 字段或把数值转成字符串？
+- 比值是否处理了 NULL、非数值和分母为 0？
+- 这是重试代码时，是否仍包含失败步骤之前的全部步骤，并且没有假设上次工作目录中的中间文件存在？

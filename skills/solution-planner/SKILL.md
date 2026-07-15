@@ -6,7 +6,7 @@ tools:
   - search_qgis_processing_tools
   - get_qgis_processing_tool
   - record_pipeline_stage
-version: 2.0.0
+version: 2.1.0
 tags: [gis, pipeline, plan]
 ---
 
@@ -26,6 +26,7 @@ tags: [gis, pipeline, plan]
 - `summary`：可执行方案摘要。
 - `retrieval_queries`：覆盖全部操作的一组中英文标准 GIS 查询。
 - `algorithm_evidence`：每个最终算法对应的 Catalog 描述、参数依据和选择理由。
+- `output_schema`：用户要求新增/覆盖的字段名、业务含义、存储类型、长度、精度和 NULL/零分母策略；例如 `dense` 必须规划为 Double，而不是 String。
 
 ## 规划规则
 
@@ -37,6 +38,7 @@ tags: [gis, pipeline, plan]
 - 最终输出文件必须在 `final_outputs` 中列出，例如 `500m.shp`。
 - 如果“政府办公”“公园”等业务概念无法通过字段或样例判断，应在 `risks` 中说明，并优先使用 `inspect_layer` 结果中的真实字段和值。
 - 如果风险不可接受，先询问用户，不继续生成代码。
+- 方案包含字段计算时，必须在步骤输出和 `output_schema` 中显式声明派生字段类型。密度、覆盖率、比例、均值、面积、长度和高度等小数结果使用 Double；已有同名字段时把类型冲突列入 `risks`，并规划字段重构或新建正确类型字段，不能规划为扩大字符串长度。
 
 ## 大数据量空间分析规则
 

@@ -17,6 +17,7 @@
 - 成功时优先直接回答 `stdout` 中的统计结果或结论；可补充输出文件或加载的图层名。不要在最终回答中展示工作目录，除非用户明确要求或需要排错。
 - 失败时说明 `error`，必要时摘录 `stderr`，并给出下一步修复建议。
 - 如果 `execute_gis_code` 返回失败，优先根据错误重新生成代码并再次调用 `execute_gis_code`，不要直接结束任务。
+- 每次 `execute_gis_code` 都会创建全新的空工作目录。失败后的重试必须提交从当前 QGIS 原始图层开始的完整脚本，重新生成所有中间结果；不得只执行失败步骤，不得声称“中间结果已存在”，不得读取上次返回的 `workspace_dir`。
 - 常见错误修复：
   - `NameError: QgsProject is not defined`：加入 `from qgis.core import QgsProject`，或直接使用当前命名空间中的 `QgsProject`。
   - `NameError: QgsProcessing is not defined`：加入 `from qgis.core import QgsProcessing`，或改成直接把 `OUTPUT` 写到 `Path(QGIS_AGENT_WORKSPACE) / "文件名"`，不要把 `QgsProcessing.TEMPORARY_OUTPUT` 当最终输出。
@@ -26,5 +27,6 @@
   - `必须提供 expected_outputs`：重新生成工具调用时补上用户要求的最终输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
   - `输出文件必须位于工作目录内`：把代码和 `expected_outputs.path` 改为工作目录内相对文件名，并用 `delivery_outputs` 指定用户外部路径。
   - Processing 算法失败：检查算法 ID、参数名、输入图层类型和输出路径。
+  - `native:fieldcalculator` 写入密度时报字符串超长：`FIELD_TYPE=2` 是 Text/String，不是 Double；依据算法详情改用 Decimal/Double 类型（当前算法通常为 0），并完整重跑所有步骤，不能仅扩大 `FIELD_LENGTH`。
   - 空几何或无效几何：使用 Processing context 的 `GeometrySkipInvalid` 排除对应要素；除非用户明确要求修复数据，不得调用 `native:fixgeometries`。
 - 用户取消确认时，不要重复执行，也不要声称工程已改变。

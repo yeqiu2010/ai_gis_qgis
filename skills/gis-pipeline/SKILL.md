@@ -18,7 +18,7 @@ includes:
   - code-generator
   - code-reviewer
   - executor
-version: 2.0.0
+version: 2.1.0
 tags: [gis, pipeline]
 ---
 
@@ -87,6 +87,8 @@ tags: [gis, pipeline]
 4. `generated_code`
    - 严格依据已读取的算法参数和示例，使用 `code-generator` 生成一份完整代码。
    - 使用 `code-reviewer` 阻断项自检。
+   - 新增密度、比例等小数派生字段时，核对表达式和目标字段均为 Double；已有同名 String 字段时必须先重构，不能直接写入浮点数。
+   - 失败重试也必须生成从原始图层开始的完整脚本；每次执行的工作目录都是全新的，不能只修复失败步骤或复用上次中间文件。
    - 确保最终输出路径和 `expected_outputs.path` 完全一致，例如 `500m.shp`。
 5. `execution_result`
    - 只调用一次 `execute_gis_code`，由用户确认整份脚本。
