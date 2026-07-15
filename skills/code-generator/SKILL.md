@@ -45,7 +45,7 @@ tags: [gis, pipeline, code]
 - 不得调用 `QgsProject.addVectorLayer`；最终输出由 `execute_gis_code` 自动加载。不得直接导入 `PyQt5` 或 `PyQt6`，统一使用 `qgis.PyQt`。
 - 不猜测 Processing 结果键（例如 `OUTPUT_COUNT`）或算法 ID/参数；只能使用 `algorithm_evidence` 中读取到的真实 outputs 和参数。
 - Processing 参数类型也必须与 `algorithm_evidence` 一致：`PREDICATE` 传整数枚举列表，不得传 `"intersects"`/`"within"` 等名称；`JOIN_FIELDS` 传字段名字符串列表，不得传字段索引。
-- `native:aggregate` 的 `AGGREGATES` 必须是聚合定义 object 列表，不得传单个 object 或 JSON 字符串。`native:joinattributesbylocation` 的连接图层参数是 `JOIN`，不得混用其他算法的 `OVERLAY`。
+- `native:aggregate` 的 `AGGREGATES` 必须是聚合定义 object 列表，不得传单个 object 或 JSON 字符串。`GROUP_BY` 只控制分组，不会自动成为输出字段；如果下游需要按分组键连接、排序或写表，必须在 `AGGREGATES` 中对分组字段增加 `first_value` 输出并使用明确别名，优先使用 ASCII 内部名，例如 `land_type`。下游 `FIELD`/`FIELD_2` 必须引用该真实输出别名，不能继续引用源字段名。`native:joinattributesbylocation` 的连接图层参数是 `JOIN`，不得混用其他算法的 `OVERLAY`。
 - `QgsGeometry` 空几何判断使用 `isEmpty()`，不得调用不存在的 `isGeosEmpty()`。分析流程的无效几何仍交给 `GeometrySkipInvalid` 排除。
 - 空间连接、聚合等中间结果可能改名或丢弃字段。后续引用前必须检查实际 `result_layer.fields()`；不得假定 `SHAPE_Area` 等源字段一定存在。如果统计目标来自土地图层，应优先在原土地图层上聚合，不要反向依赖连接后的建筑物字段。
 - 用户明确指定“面积”等字段作为覆盖率分母时，必须检查该字段存在、值可转为数值且处理空值，并按用户定义汇总；不得悄悄改用 `geometry().area()`。若重叠面积来自投影后几何，必须确认它和面积字段单位一致；单位不明时应在 `structured_query` 阶段澄清，或在方案中明确改为对分子、分母使用同一投影几何口径。
@@ -93,6 +93,71 @@ processing.run(
 ```
 
 其中 `[0]` 只是形状示例；具体枚举数值必须从本次 `inspect_processing_algorithm`/`get_qgis_processing_tool` 的结果取得。
+
+## 推荐模板：分组聚合后按分组键连接
+
+`native:aggregate` 不会因为设置了 `GROUP_BY` 就自动输出分组字段。下面显式把源字段 `用地_1` 物化为内部连接键 `land_type`，再汇总地块面积：
+
+```python
+land_agg_result = processing.run(
+    "native:aggregate",
+    {
+        "INPUT": land_layer,
+        "GROUP_BY": '"用地_1"',
+        "AGGREGATES": [
+            {
+                "aggregate": "first_value",
+                "input": '"用地_1"',
+                "name": "land_type",
+                "type": 10,
+                "length": 100,
+                "precision": 0,
+            },
+            {
+                "aggregate": "sum",
+                "input": '"Shape_Area"',
+                "name": "sum_land_area",
+                "type": 6,
+                "length": 20,
+                "precision": 2,
+            },
+        ],
+        "OUTPUT": "memory:",
+    },
+    context=context,
+    feedback=feedback,
+)
+land_stats = land_agg_result["OUTPUT"]
+
+land_stats_fields = [field.name() for field in land_stats.fields()]
+required_land_stats_fields = {"land_type", "sum_land_area"}
+missing = required_land_stats_fields.difference(land_stats_fields)
+if missing:
+    raise ValueError(f"地块聚合结果缺少字段：{sorted(missing)}")
+```
+
+建筑统计结果也应显式输出同名内部键 `land_type`。随后连接必须使用：
+
+```python
+processing.run(
+    "native:joinattributestable",
+    {
+        "INPUT": building_stats,
+        "FIELD": "land_type",
+        "INPUT_2": land_stats,
+        "FIELD_2": "land_type",
+        "FIELDS_TO_COPY": ["sum_land_area"],
+        "METHOD": 1,
+        "DISCARD_NONMATCHING": False,
+        "PREFIX": "land_",
+        "OUTPUT": "memory:",
+    },
+    context=context,
+    feedback=feedback,
+)
+```
+
+`type`、`length`、`precision` 和其他参数仍必须以本次算法证据及输入字段类型为准，不得只照抄模板。地块面积必须从原始用地图层按唯一地块汇总，不能从“一栋建筑一条记录”的空间连接结果重复累加。
 
 ## 推荐模板：按属性筛选并输出 GeoJSON
 

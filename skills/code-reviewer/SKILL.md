@@ -37,6 +37,7 @@ tags: [gis, pipeline, review]
 - 使用 `processing.QgsProcessingFeedback()`；正确类位于 `qgis.core`。
 - Processing `PREDICATE` 传入 `"intersects"`/`"within"` 等字符串，而不是算法详情定义的整数枚举列表。
 - `JOIN_FIELDS` 传入字段索引而不是字段名；`native:aggregate` 的 `AGGREGATES` 不是 object 列表。
+- `native:aggregate` 使用了 `GROUP_BY`，但没有在 `AGGREGATES` 中用 `first_value`（或等价的稳定聚合）显式输出分组键；或者下游属性连接仍引用聚合前的源字段名，而不是聚合结果中的真实别名。
 - `native:joinattributesbylocation` 用 `OVERLAY` 代替 `JOIN`，或者其他参数名/类型与算法详情不一致。
 - 调用不存在的 `QgsGeometry.isGeosEmpty()`；空几何用 `isEmpty()`，无效几何由 `GeometrySkipInvalid` 排除。
 - 未检查空间连接/聚合输出的实际字段，就假定 `SHAPE_Area` 等源字段仍然存在。

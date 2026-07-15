@@ -56,6 +56,18 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
         return _result("layer_not_found", "生成代码引用了不存在或名称不匹配的图层。", False)
     if "字段不存在" in message or "缺少" in message and "字段" in message:
         return _result("field_not_found", "生成代码引用了不存在或不匹配的字段。", False)
+    if "invalid join field" in text and "does not exist" in text:
+        return _result(
+            "field_not_found",
+            "属性连接引用了中间图层中不存在的字段；分组聚合可能没有显式输出连接键。",
+            False,
+        )
+    if "group_by 不会自动写入输出字段" in text:
+        return _result(
+            "generated_code_api",
+            "生成代码错误地假定 native:aggregate 会自动输出 GROUP_BY 分组字段。",
+            False,
+        )
     if any(marker in message for marker in ("PREDICATE", "JOIN_FIELDS", "AGGREGATES")):
         return _result(
             "processing_parameters",

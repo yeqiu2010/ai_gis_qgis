@@ -927,6 +927,68 @@ print(feature["??_1"])
     assert any("??" in issue and "字段名" in issue for issue in issues)
 
 
+def test_detects_aggregate_group_key_missing_from_output_schema():
+    invalid_code = '''
+land_result = processing.run("native:aggregate", {
+    "INPUT": land_layer,
+    "GROUP_BY": '"用地_1"',
+    "AGGREGATES": [
+        {
+            "aggregate": "sum",
+            "input": '"Shape_Area"',
+            "name": "sum_Shape_Area",
+            "type": 6,
+        },
+    ],
+    "OUTPUT": "memory:",
+})
+land_stats = land_result["OUTPUT"]
+processing.run("native:joinattributestable", {
+    "INPUT": building_stats,
+    "FIELD": "用地_1",
+    "INPUT_2": land_stats,
+    "FIELD_2": "用地_1",
+    "OUTPUT": "memory:",
+})
+'''
+    valid_code = '''
+land_result = processing.run("native:aggregate", {
+    "INPUT": land_layer,
+    "GROUP_BY": '"用地_1"',
+    "AGGREGATES": [
+        {
+            "aggregate": "first_value",
+            "input": '"用地_1"',
+            "name": "land_type",
+            "type": 10,
+        },
+        {
+            "aggregate": "sum",
+            "input": '"Shape_Area"',
+            "name": "sum_land_area",
+            "type": 6,
+        },
+    ],
+    "OUTPUT": "memory:",
+})
+'''
+
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any("GROUP_BY 不会自动写入输出字段" in issue for issue in issues)
+    assert any("ASCII 别名" in issue for issue in issues)
+    assert find_generated_code_issues(valid_code) == []
+
+
+def test_classifies_invalid_join_field_after_aggregate():
+    classification = classify_failure(
+        'Invalid join field from layer 1: “用地_1” does not exist'
+    )
+
+    assert classification["error_code"] == "field_not_found"
+    assert "没有显式输出连接键" in classification["cause"]
+
+
 def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="infer expected outputs", model="test", source="test")

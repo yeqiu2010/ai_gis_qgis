@@ -524,6 +524,28 @@ def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
                 issues,
                 "native:aggregate 的 AGGREGATES 必须是聚合定义 object 列表，不能传 dict 或 JSON 字符串",
             )
+        group_field = _simple_field_expression(parameters.get("GROUP_BY"))
+        if group_field and isinstance(aggregates, (ast.List, ast.Tuple)):
+            materializes_group_key = False
+            for aggregate_item in aggregates.elts:
+                item = _literal_dict_items(aggregate_item)
+                input_field = _simple_field_expression(item.get("input"))
+                aggregate_name = (_literal_string(item.get("aggregate")) or "").lower()
+                output_name = (_literal_string(item.get("name")) or "").strip()
+                if (
+                    input_field == group_field
+                    and aggregate_name in {"first_value", "minimum", "maximum"}
+                    and output_name
+                ):
+                    materializes_group_key = True
+                    break
+            if not materializes_group_key:
+                _append_issue(
+                    issues,
+                    "native:aggregate 的 GROUP_BY 不会自动写入输出字段；"
+                    f"必须在 AGGREGATES 中用 first_value 显式输出分组键 {group_field}（建议使用 ASCII 别名），"
+                    "下游连接必须引用该输出别名",
+                )
 
     if algorithm_id == "native:joinattributesbylocation" and "OVERLAY" in parameters:
         _append_issue(
@@ -541,6 +563,18 @@ def _literal_dict_items(node: ast.AST) -> dict[str, ast.AST]:
         if literal_key is not None:
             items[literal_key] = value
     return items
+
+
+def _simple_field_expression(node: ast.AST | None) -> str | None:
+    """Return a field name from a simple Processing field expression."""
+    if node is None:
+        return None
+    value = (_literal_string(node) or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1].replace('""', '"')
+    if not value or any(char in value for char in "()[]+-*/"):
+        return None
+    return value
 
 
 def _subscript_string_key(node: ast.Subscript) -> str | None:
