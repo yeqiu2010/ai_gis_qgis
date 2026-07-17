@@ -17,6 +17,7 @@ class SkillDocument:
     includes: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     version: str = ""
+    lifecycle: str = ""
 
 
 class SkillLoader:
@@ -48,6 +49,7 @@ class SkillLoader:
             includes=list(metadata.get("includes") or []),
             tags=list(metadata.get("tags") or []),
             version=str(metadata.get("version") or ""),
+            lifecycle=str(metadata.get("lifecycle") or ""),
             body=body.strip(),
             path=path,
         )

@@ -22,10 +22,15 @@ tags: [orchestration, routing, gis]
 ## 路由优先级
 
 1. 图层管理、图层查看、字段查看、加载数据、缩放、样式、导出等单步操作：直接使用对应图层工具。
-2. 用户请求可能匹配公司/用户自定义 Skill 时，先调用 `search_skills` 检索；命中后优先 `set_active_skill` 切换到该 Skill。
-3. 一个主要输入、一个明确标准 GIS 操作的简单任务切换到 `qgis-toolbox`。
-4. 两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务直接切换到 `gis-pipeline`。
-5. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
+2. 由当前 AI 将用户原始请求与系统提供的可路由 Skill 目录逐项做语义比较。不得使用程序分词结果、关键词计数或相关性分数代替判断。
+3. 内置或用户自定义的专用业务 Skill 完整覆盖任务时，优先调用 `set_active_skill` 切换到该 Skill。专用 Skill 的优先级高于通用 Pipeline。
+4. 没有专用业务 Skill 匹配时，一个主要输入、一个明确标准 GIS 操作的简单任务切换到 `qgis-toolbox`。
+5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务进入 `gis-pipeline`。
+6. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
+
+`search_skills` 只返回未排序的可路由 Skill 卡片，不替 AI 做匹配。需要刷新目录时传入未经改写的用户原始请求；收到结果后由当前 AI 比较每个 `description` 并选择。
+
+例如用户要求“从学校图层和城镇住宅区图层中计算出不同街道的中小学服务半径覆盖率”时，语义上完整匹配 `calculate-school-service-coverage`，必须优先切换到该专用 Skill，不得因为任务包含多个图层和统计汇总而先进入 `gis-pipeline`。
 
 ## QGIS Toolbox 简单任务
 
@@ -36,7 +41,7 @@ tags: [orchestration, routing, gis]
 - 坡度、坡向、山体阴影、栅格裁剪、重投影、栅格化、矢量化。
 ## 必须走 GIS Pipeline 的任务
 
-只要用户请求满足以下任意条件且没有匹配的自定义 Skill，直接进入 `gis-pipeline`：
+只要用户请求满足以下任意条件且没有匹配的内置或自定义专用业务 Skill，进入 `gis-pipeline`：
 
 - 包含两个及以上 GIS 操作。
 - 同时使用属性筛选和空间关系。
@@ -44,7 +49,7 @@ tags: [orchestration, routing, gis]
 - 需要确认字段含义、属性取值、CRS、距离/面积单位或中间结果。
 - 需要复杂 PyQGIS、制图布局、非 Processing 能力或业务逻辑。
 
-复杂任务的正确第一步是：
+未命中专用业务 Skill 的复杂任务，正确第一步是：
 
 ```json
 {"skill_name": "gis-pipeline"}
@@ -85,4 +90,4 @@ tags: [orchestration, routing, gis]
 
 - 工具返回 `success=false` 时，必须说明失败原因中的 `error`，不能把失败解释为空结果。
 - 工具执行成功后，用简短中文说明实际完成的动作、图层名称和关键结果。
-- 复杂任务刚识别出来时不要直接给方案性空话；应切换到 `gis-pipeline` 并继续推进。
+- 复杂任务刚识别出来时不要直接给方案性空话；先完成专用业务 Skill 的 AI 语义匹配，未命中时切换到 `gis-pipeline` 并继续推进。

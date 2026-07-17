@@ -90,6 +90,35 @@ class CodeExecutionProvider:
         )
 
 
+class SchoolCoverageExecutionProvider:
+    name = "school-coverage-test"
+    model = "school-coverage-test-model"
+
+    def chat(self, system, messages, tools=None):
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id="school-coverage",
+                    name="execute_school_service_coverage",
+                    arguments={
+                        "school_layer_id": "school-id",
+                        "residential_layer_id": "residential-id",
+                        "school_type_field": "CCN",
+                        "school_type_values": ["小学", "初中"],
+                        "residential_area_field": "面积",
+                        "area_unit": "square_meter",
+                        "group_field": "XZQMC",
+                        "service_distance_m": 500,
+                        "target_crs": "EPSG:4547",
+                    },
+                )
+            ],
+        )
+
+
 class RetryCodeExecutionProvider:
     name = "retry-code-test"
     model = "retry-code-test-model"
@@ -535,6 +564,41 @@ def test_execute_gis_code_requires_confirmation_and_runs_worker(tmp_path: Path):
         role == "assistant" and event_type == "summary" and "done" in content
         for role, content, event_type in message_rows
     )
+
+
+def test_one_shot_business_skill_resets_after_confirmed_execution(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="one shot", model="test", source="test")
+    session_db.set_state(
+        f"{session.id}:active_skill",
+        "calculate-school-service-coverage",
+    )
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=SchoolCoverageExecutionProvider(),
+        iface=None,
+        executor_config={"workspace_dir": str(tmp_path / "workspaces")},
+    )
+    tool = core._build_tool_registry(session.id).get("execute_school_service_coverage")
+    assert tool.requires_confirmation is True
+    assert "code" not in tool.parameters["properties"]
+    assert "expected_outputs" not in tool.parameters["properties"]
+    inspect_tool = core._build_tool_registry(session.id).get(
+        "inspect_school_service_coverage_inputs"
+    )
+    assert inspect_tool.requires_confirmation is False
+    assert inspect_tool.writes_project is False
+
+    events = core.run(session_id=session.id, user_message="计算中小学服务半径覆盖率")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    assert confirmation["payload"]["tool_name"] == "execute_school_service_coverage"
+    core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert session_db.get_state(f"{session.id}:active_skill") == "main-orchestrator"
 
 
 def test_code_executor_rejects_forbidden_imports(tmp_path: Path):
@@ -1456,7 +1520,10 @@ def test_prompt_builder_routes_complex_analysis_to_pipeline():
     )
 
     assert "两个及以上步骤" in prompt
-    assert "必须切换到 gis-pipeline" in prompt
+    assert "只有未匹配专用 Skill" in prompt
+    assert "calculate-school-service-coverage" in prompt
+    assert "由当前 AI 根据用户原始请求选择" in prompt
+    assert "不得依赖程序分词、关键词计数或相关性分数" in prompt
     assert "优先一次调用 inspect_layers" in prompt
     assert "QGIS_AGENT_WORKSPACE 是 execute_gis_code 执行器注入的运行时变量" in prompt
     assert "不要询问保存文件夹" in prompt

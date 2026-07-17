@@ -21,6 +21,33 @@ class SkillManager:
     def tool_allowlist(self) -> dict[str, list[str]]:
         return {name: document.tools for name, document in self._documents.items() if document.tools}
 
+    def routing_catalog(self, *, include_builtin: bool = True) -> list[dict[str, object]]:
+        """Return structurally routable Skill cards without semantic ranking."""
+        included_names = {
+            include_name
+            for document in self._documents.values()
+            for include_name in document.includes
+        }
+        catalog = []
+        for document in self._documents.values():
+            is_custom = ".qgis_hermes_agent" in str(document.path)
+            if not include_builtin and not is_custom:
+                continue
+            if document.name == "main-orchestrator" or document.name in included_names:
+                continue
+            if not document.description:
+                continue
+            catalog.append(
+                {
+                    "name": document.name,
+                    "description": document.description,
+                    "tags": list(document.tags),
+                    "custom": is_custom,
+                    "lifecycle": document.lifecycle or "persistent",
+                }
+            )
+        return sorted(catalog, key=lambda item: str(item["name"]))
+
     def compose_prompt(self, name: str) -> str:
         document = self.get(name)
         if document is None:

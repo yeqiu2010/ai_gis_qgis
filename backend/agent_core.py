@@ -31,6 +31,10 @@ from .tools.pipeline import (
 )
 from .tools.qgis_toolbox import build_qgis_toolbox_tools
 from .tools.registry import ToolRegistry
+from .tools.school_service_coverage import (
+    build_inspect_school_service_coverage_inputs_tool,
+    build_school_service_coverage_tool,
+)
 from .tools.search_tools import build_search_messages_tool
 from .tools.skill_management import build_search_skills_tool, build_set_active_skill_tool
 
@@ -597,6 +601,7 @@ class AgentCore:
         self._save_process_message(session_id, "已确认工具操作。" if approved else "已取消工具操作。")
 
         if not approved:
+            self._reset_one_shot_skill(session_id)
             terminal_status = "cancelled"
             content = f"已取消工具 `{tool_name}`。"
             self.session_db.save_message(
@@ -674,6 +679,7 @@ class AgentCore:
                 publish=publish,
                 run_id=run_id,
             )
+        self._reset_one_shot_skill(session_id)
 
         if result.get("success", True):
             content = self._format_tool_success(tool_name, result)
@@ -714,6 +720,20 @@ class AgentCore:
         registry.register(build_record_pipeline_stage_tool(self.session_db, session_id))
         registry.register(
             build_execute_gis_code_tool(
+                session_db=self.session_db,
+                session_id=session_id,
+                iface=self.iface,
+                qgis_executor=self.qgis_executor,
+                executor_config=self.executor_config,
+            )
+        )
+        registry.register(
+            build_inspect_school_service_coverage_inputs_tool(
+                qgis_executor=self.qgis_executor,
+            )
+        )
+        registry.register(
+            build_school_service_coverage_tool(
                 session_db=self.session_db,
                 session_id=session_id,
                 iface=self.iface,
@@ -888,6 +908,16 @@ class AgentCore:
                 f"{session_id}:active_skill",
                 "main-orchestrator",
             )
+
+    def _reset_one_shot_skill(self, session_id: str) -> None:
+        active_skill = self.session_db.get_state(f"{session_id}:active_skill") or ""
+        document = self.prompt_builder.skill_manager.get(active_skill)
+        if document is None or document.lifecycle != "one-shot":
+            return
+        self.session_db.set_state(
+            f"{session_id}:active_skill",
+            "main-orchestrator",
+        )
 
     def _confirmation_key(self, session_id: str, confirmation_id: str) -> str:
         return f"{session_id}:pending_confirmation:{confirmation_id}"
@@ -1089,7 +1119,7 @@ class AgentCore:
 
     def _format_tool_failure(self, tool_name: str, result: dict[str, Any]) -> str:
         lines = [f"工具 `{tool_name}` 执行失败：{result.get('error') or '未知错误'}"]
-        if tool_name == "execute_gis_code":
+        if tool_name in {"execute_gis_code", "execute_school_service_coverage"}:
             if result.get("workspace_dir"):
                 lines.append(f"工作目录：{result['workspace_dir']}")
             if result.get("stderr"):
@@ -1102,7 +1132,7 @@ class AgentCore:
         return "\n".join(lines)
 
     def _format_tool_success(self, tool_name: str, result: dict[str, Any]) -> str:
-        if tool_name != "execute_gis_code":
+        if tool_name not in {"execute_gis_code", "execute_school_service_coverage"}:
             return f"已确认并执行工具 `{tool_name}`。"
         stdout = str(result.get("stdout") or "").strip()
         lines = [stdout] if stdout else ["代码执行成功。"]
