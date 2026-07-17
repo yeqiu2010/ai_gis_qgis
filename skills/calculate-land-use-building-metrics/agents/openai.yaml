@@ -1,0 +1,4 @@
+interface:
+  display_name: "各类用地建筑量统计"
+  short_description: "按用地类型统计建筑规模、建筑高度、建筑面积与建筑密度"
+  default_prompt: "使用 $calculate-land-use-building-metrics 按用地类型统计建筑量和建筑密度。"

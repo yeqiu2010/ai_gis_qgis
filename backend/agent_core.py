@@ -21,6 +21,10 @@ from .tools.code_execution import (
 )
 from .tools.custom_tools import load_custom_tool_entries
 from .tools.gis_analysis import build_get_task_context_tool
+from .tools.land_use_building_metrics import (
+    build_inspect_land_use_building_metrics_inputs_tool,
+    build_land_use_building_metrics_tool,
+)
 from .tools.layer_ops import build_layer_tools
 from .tools.pipeline import (
     PIPELINE_STAGES,
@@ -733,7 +737,21 @@ class AgentCore:
             )
         )
         registry.register(
+            build_inspect_land_use_building_metrics_inputs_tool(
+                qgis_executor=self.qgis_executor,
+            )
+        )
+        registry.register(
             build_school_service_coverage_tool(
+                session_db=self.session_db,
+                session_id=session_id,
+                iface=self.iface,
+                qgis_executor=self.qgis_executor,
+                executor_config=self.executor_config,
+            )
+        )
+        registry.register(
+            build_land_use_building_metrics_tool(
                 session_db=self.session_db,
                 session_id=session_id,
                 iface=self.iface,
@@ -1119,7 +1137,11 @@ class AgentCore:
 
     def _format_tool_failure(self, tool_name: str, result: dict[str, Any]) -> str:
         lines = [f"工具 `{tool_name}` 执行失败：{result.get('error') or '未知错误'}"]
-        if tool_name in {"execute_gis_code", "execute_school_service_coverage"}:
+        if tool_name in {
+            "execute_gis_code",
+            "execute_land_use_building_metrics",
+            "execute_school_service_coverage",
+        }:
             if result.get("workspace_dir"):
                 lines.append(f"工作目录：{result['workspace_dir']}")
             if result.get("stderr"):
@@ -1132,7 +1154,11 @@ class AgentCore:
         return "\n".join(lines)
 
     def _format_tool_success(self, tool_name: str, result: dict[str, Any]) -> str:
-        if tool_name not in {"execute_gis_code", "execute_school_service_coverage"}:
+        if tool_name not in {
+            "execute_gis_code",
+            "execute_land_use_building_metrics",
+            "execute_school_service_coverage",
+        }:
             return f"已确认并执行工具 `{tool_name}`。"
         stdout = str(result.get("stdout") or "").strip()
         lines = [stdout] if stdout else ["代码执行成功。"]

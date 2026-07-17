@@ -601,6 +601,28 @@ def test_one_shot_business_skill_resets_after_confirmed_execution(tmp_path: Path
     assert session_db.get_state(f"{session.id}:active_skill") == "main-orchestrator"
 
 
+def test_land_use_building_metrics_tools_are_registered_with_expected_safety(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="land metrics", model="test", source="test")
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+        executor_config={"workspace_dir": str(tmp_path / "workspaces")},
+    )
+
+    registry = core._build_tool_registry(session.id)
+    inspect_tool = registry.get("inspect_land_use_building_metrics_inputs")
+    execute_tool = registry.get("execute_land_use_building_metrics")
+
+    assert inspect_tool.requires_confirmation is False
+    assert inspect_tool.writes_project is False
+    assert execute_tool.requires_confirmation is True
+    assert execute_tool.writes_project is True
+    assert "code" not in execute_tool.parameters["properties"]
+    assert "expected_outputs" not in execute_tool.parameters["properties"]
+
+
 def test_code_executor_rejects_forbidden_imports(tmp_path: Path):
     executor = QGISCodeExecutor({"workspace_dir": str(tmp_path / "workspaces"), "timeout_seconds": 5})
 

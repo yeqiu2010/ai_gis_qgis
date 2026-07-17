@@ -5,6 +5,13 @@ from pathlib import Path
 from ai_gis_qgis.backend.processing.toolbox_catalog import QGISToolboxCatalog
 from ai_gis_qgis.backend.skills.skill_manager import SkillManager
 from ai_gis_qgis.backend.tools.code_execution import validate_execute_gis_code_arguments
+from ai_gis_qgis.backend.tools.land_use_building_metrics import (
+    EXPECTED_OUTPUTS as LAND_USE_BUILDING_EXPECTED_OUTPUTS,
+)
+from ai_gis_qgis.backend.tools.land_use_building_metrics import (
+    _collect_value_domain,
+    build_land_use_building_metrics_code,
+)
 from ai_gis_qgis.backend.tools.qgis_toolbox import build_qgis_toolbox_tools
 from ai_gis_qgis.backend.tools.registry import ToolEntry, ToolRegistry
 from ai_gis_qgis.backend.tools.school_service_coverage import (
@@ -196,6 +203,90 @@ def test_school_type_domain_uses_actual_complete_field_values():
 
     assert domain["available_values"] == ["中小学", "幼托机构", "高等院校"]
     assert domain["value_counts"][0] == {"value": "中小学", "count": 2}
+    assert domain["null_count"] == 1
+    assert domain["domain_complete"] is True
+
+
+def test_land_use_building_metrics_skill_uses_fixed_inspection_and_execution():
+    skills_dir = Path(__file__).resolve().parents[2] / "skills"
+    manager = SkillManager(skills_dir)
+
+    skill = manager.get("calculate-land-use-building-metrics")
+
+    assert skill is not None
+    assert skill.version == "1.0.0"
+    assert skill.lifecycle == "one-shot"
+    assert skill.tools == [
+        "list_layers",
+        "inspect_layers",
+        "inspect_land_use_building_metrics_inputs",
+        "get_task_context",
+        "execute_land_use_building_metrics",
+    ]
+    assert "execute_gis_code" not in skill.tools
+    assert "scope_mode=full_layer" in skill.body
+    assert "面内点" in skill.body
+    assert "建筑密度固定为" in skill.body
+
+
+def test_land_use_building_metrics_builds_preflight_safe_fixed_code():
+    code = build_land_use_building_metrics_code(
+        {
+            "land_layer_id": "land-id",
+            "building_layer_id": "building-id",
+            "land_type_field": "用地_1",
+            "land_area_field": "Shape_Area",
+            "land_area_unit": "square_meter",
+            "building_height_field": "HEIGHT",
+            "building_footprint_field": "FAREA",
+            "building_floor_area_field": "GBAREA",
+            "building_area_unit": "square_meter",
+            "scope_mode": "boundary_layer",
+            "boundary_layer_id": "street-id",
+            "target_crs": "EPSG:4547",
+        }
+    )
+
+    assert "LAND_USE_BUILDING_PARAMETERS_JSON" in code
+    assert "pointOnSurface" in code
+    assert "scope_ratio" in code
+    assert "land_use_building_metrics.gpkg" in code
+    assert validate_execute_gis_code_arguments(
+        {"code": code, "expected_outputs": LAND_USE_BUILDING_EXPECTED_OUTPUTS}
+    ) is None
+
+
+def test_land_use_domain_uses_actual_complete_field_values():
+    class Fields:
+        def indexFromName(self, name):
+            return 0 if name == "用地类型" else -1
+
+    class Feature:
+        def __init__(self, value):
+            self.value = value
+
+        def __getitem__(self, index):
+            assert index == 0
+            return self.value
+
+    class Layer:
+        def fields(self):
+            return Fields()
+
+        def getFeatures(self):
+            return iter(
+                [
+                    Feature("居住用地"),
+                    Feature("商业用地"),
+                    Feature("居住用地"),
+                    Feature(None),
+                ]
+            )
+
+    domain = _collect_value_domain(Layer(), "用地类型")
+
+    assert domain["available_values"] == ["居住用地", "商业用地"]
+    assert domain["value_counts"][0] == {"value": "居住用地", "count": 2}
     assert domain["null_count"] == 1
     assert domain["domain_complete"] is True
 

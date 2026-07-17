@@ -42,17 +42,27 @@ class SkillLoader:
         raw = path.read_text(encoding="utf-8")
         metadata, body = self._split_frontmatter(raw)
         fallback_name = path.parent.name
+        tools = self._as_list(metadata.get("tools"))
+        if not tools:
+            tools = self._as_list(metadata.get("allowed-tools"))
         return SkillDocument(
             name=str(metadata.get("name") or fallback_name),
             description=str(metadata.get("description") or ""),
-            tools=list(metadata.get("tools") or []),
-            includes=list(metadata.get("includes") or []),
-            tags=list(metadata.get("tags") or []),
+            tools=tools,
+            includes=self._as_list(metadata.get("includes")),
+            tags=self._as_list(metadata.get("tags")),
             version=str(metadata.get("version") or ""),
             lifecycle=str(metadata.get("lifecycle") or ""),
             body=body.strip(),
             path=path,
         )
+
+    def _as_list(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [item for item in value.split() if item]
+        return []
 
     def _split_frontmatter(self, raw: str) -> tuple[dict[str, Any], str]:
         if not raw.startswith("---\n"):
