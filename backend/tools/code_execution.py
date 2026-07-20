@@ -15,7 +15,7 @@ from .registry import ToolEntry
 VECTOR_OUTPUT_EXTENSIONS = {".shp", ".gpkg", ".geojson", ".kml"}
 RASTER_OUTPUT_EXTENSIONS = {".tif", ".tiff"}
 TABLE_OUTPUT_EXTENSIONS = {".csv", ".xlsx", ".dbf"}
-FILE_OUTPUT_EXTENSIONS = {".txt", ".json", ".html", ".md"}
+FILE_OUTPUT_EXTENSIONS = {".txt", ".json", ".html", ".md", ".pdf", ".png"}
 OUTPUT_HINTS = ("output", "result", "save", "export", "write", "输出", "结果")
 SHAPEFILE_SIDECAR_EXTENSIONS = {
     ".shp",
@@ -276,6 +276,8 @@ def find_unwritten_expected_outputs(
         elif func_name.endswith(("writeAsVectorFormatV3", "writeAsVectorFormatV2")):
             if len(node.args) >= 2:
                 written.update(_path_names_from_expression(node.args[1], assignments))
+        elif func_name.endswith(("exportToImage", "exportToPdf")) and node.args:
+            written.update(_path_names_from_expression(node.args[0], assignments))
 
     missing = []
     for output in expected_outputs:

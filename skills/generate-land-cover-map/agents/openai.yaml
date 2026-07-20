@@ -1,0 +1,4 @@
+interface:
+  display_name: "土地覆盖专题图"
+  short_description: "使用分类影像或矢量数据，按全图或指定边界裁剪并生成土地覆盖专题图"
+  default_prompt: "使用 $generate-land-cover-map 按指定边界裁剪当前土地覆盖数据并生成专题图。"

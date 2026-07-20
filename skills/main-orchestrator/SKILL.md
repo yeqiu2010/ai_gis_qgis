@@ -1,18 +1,10 @@
 ---
 name: main-orchestrator
 description: 主调度与 Skill 路由
-tools:
-  - set_active_skill
-  - search_skills
-  - list_layers
-  - inspect_layer
-  - inspect_layers
-  - load_layer
-  - remove_layer
-  - zoom_to_layer
-  - export_layer
-version: 2.0.0
-tags: [orchestration, routing, gis]
+allowed-tools: set_active_skill search_skills list_layers inspect_layer inspect_layers load_layer remove_layer zoom_to_layer export_layer
+metadata:
+  version: 2.0.1
+  tags: [orchestration, routing, gis]
 ---
 
 # Main Orchestrator
@@ -31,6 +23,8 @@ tags: [orchestration, routing, gis]
 `search_skills` 只返回未排序的可路由 Skill 卡片，不替 AI 做匹配。需要刷新目录时传入未经改写的用户原始请求；收到结果后由当前 AI 比较每个 `description` 并选择。
 
 例如用户要求“从学校图层和城镇住宅区图层中计算出不同街道的中小学服务半径覆盖率”时，语义上完整匹配 `calculate-school-service-coverage`，必须优先切换到该专用 Skill，不得因为任务包含多个图层和统计汇总而先进入 `gis-pipeline`。
+
+例如用户要求“利用 CLCD 土地覆盖图层，并用 wuhan 边界图层裁剪后制作土地覆盖专题图”时，语义上完整匹配支持可选范围裁剪的 `generate-land-cover-map`，必须直接切换到该专用 Skill；不得因为请求同时包含裁剪和制图而进入 `gis-pipeline`。
 
 ## QGIS Toolbox 简单任务
 

@@ -21,6 +21,10 @@ from .tools.code_execution import (
 )
 from .tools.custom_tools import load_custom_tool_entries
 from .tools.gis_analysis import build_get_task_context_tool
+from .tools.land_cover_map import (
+    build_generate_land_cover_map_tool,
+    build_inspect_land_cover_map_inputs_tool,
+)
 from .tools.land_use_building_metrics import (
     build_inspect_land_use_building_metrics_inputs_tool,
     build_land_use_building_metrics_tool,
@@ -742,6 +746,11 @@ class AgentCore:
             )
         )
         registry.register(
+            build_inspect_land_cover_map_inputs_tool(
+                qgis_executor=self.qgis_executor,
+            )
+        )
+        registry.register(
             build_school_service_coverage_tool(
                 session_db=self.session_db,
                 session_id=session_id,
@@ -752,6 +761,15 @@ class AgentCore:
         )
         registry.register(
             build_land_use_building_metrics_tool(
+                session_db=self.session_db,
+                session_id=session_id,
+                iface=self.iface,
+                qgis_executor=self.qgis_executor,
+                executor_config=self.executor_config,
+            )
+        )
+        registry.register(
+            build_generate_land_cover_map_tool(
                 session_db=self.session_db,
                 session_id=session_id,
                 iface=self.iface,
@@ -1139,6 +1157,7 @@ class AgentCore:
         lines = [f"工具 `{tool_name}` 执行失败：{result.get('error') or '未知错误'}"]
         if tool_name in {
             "execute_gis_code",
+            "generate_land_cover_map",
             "execute_land_use_building_metrics",
             "execute_school_service_coverage",
         }:
@@ -1156,6 +1175,7 @@ class AgentCore:
     def _format_tool_success(self, tool_name: str, result: dict[str, Any]) -> str:
         if tool_name not in {
             "execute_gis_code",
+            "generate_land_cover_map",
             "execute_land_use_building_metrics",
             "execute_school_service_coverage",
         }:
