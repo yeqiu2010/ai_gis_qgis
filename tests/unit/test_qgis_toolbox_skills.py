@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
+import pytest
 from ai_gis_qgis.backend.processing.toolbox_catalog import QGISToolboxCatalog
 from ai_gis_qgis.backend.skills.skill_manager import SkillManager
 from ai_gis_qgis.backend.tools.code_execution import validate_execute_gis_code_arguments
@@ -17,6 +20,8 @@ from ai_gis_qgis.backend.tools.registry import ToolEntry, ToolRegistry
 from ai_gis_qgis.backend.tools.school_service_coverage import (
     EXPECTED_OUTPUTS,
     _collect_school_type_domain,
+    _resolve_execution_layer_ids,
+    _validate_target_crs,
     build_school_service_coverage_code,
 )
 from ai_gis_qgis.backend.tools.skill_management import build_search_skills_tool
@@ -130,7 +135,7 @@ def test_school_service_coverage_skill_uses_dynamic_inspection_and_single_execut
     skill = manager.get("calculate-school-service-coverage")
 
     assert skill is not None
-    assert skill.version == "2.1.0"
+    assert skill.version == "2.1.2"
     assert skill.lifecycle == "one-shot"
     assert skill.tools == [
         "list_layers",
@@ -169,6 +174,77 @@ def test_school_service_coverage_builds_preflight_safe_fixed_code():
     assert validate_execute_gis_code_arguments(
         {"code": code, "expected_outputs": EXPECTED_OUTPUTS}
     ) is None
+
+
+def test_school_service_coverage_resolves_layer_names_to_live_ids(monkeypatch):
+    class Layer:
+        def __init__(self, layer_id):
+            self._layer_id = layer_id
+
+        def id(self):
+            return self._layer_id
+
+        def isValid(self):
+            return True
+
+    layers = {
+        "学校": Layer("school-live-id"),
+        "城镇住宅区": Layer("residential-live-id"),
+    }
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.tools.school_service_coverage._find_layer",
+        lambda reference: layers[reference],
+    )
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.tools.school_service_coverage._layer_type_name",
+        lambda layer: "vector",
+    )
+
+    resolved = _resolve_execution_layer_ids(
+        {
+            "school_layer_id": "学校",
+            "residential_layer_id": "城镇住宅区",
+            "area_unit": "square_meter",
+        }
+    )
+
+    assert resolved["school_layer_id"] == "school-live-id"
+    assert resolved["residential_layer_id"] == "residential-live-id"
+    assert resolved["area_unit"] == "square_meter"
+
+
+def test_school_service_coverage_rejects_geographic_target_crs_before_execution(
+    monkeypatch,
+):
+    qgis_module = types.ModuleType("qgis")
+    qgis_core_module = types.ModuleType("qgis.core")
+
+    class FakeCrs:
+        def __init__(self, auth_id):
+            self.auth_id = auth_id
+
+        def isValid(self):
+            return True
+
+        def isGeographic(self):
+            return self.auth_id == "EPSG:4490"
+
+        def mapUnits(self):
+            return "meters"
+
+    class FakeQgis:
+        class DistanceUnit:
+            Meters = "meters"
+
+    qgis_core_module.__dict__["Qgis"] = FakeQgis
+    qgis_core_module.__dict__["QgsCoordinateReferenceSystem"] = FakeCrs
+    monkeypatch.setitem(sys.modules, "qgis", qgis_module)
+    monkeypatch.setitem(sys.modules, "qgis.core", qgis_core_module)
+
+    with pytest.raises(ValueError, match="必须是有效的投影 CRS"):
+        _validate_target_crs("EPSG:4490")
+
+    _validate_target_crs("EPSG:4526")
 
 
 def test_school_type_domain_uses_actual_complete_field_values():

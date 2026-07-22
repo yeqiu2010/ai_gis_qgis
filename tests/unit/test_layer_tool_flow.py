@@ -119,6 +119,43 @@ class SchoolCoverageExecutionProvider:
         )
 
 
+class IncompleteSchoolCoverageProvider:
+    name = "incomplete-school-coverage-test"
+    model = "incomplete-school-coverage-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="incomplete-school-coverage",
+                        name="execute_school_service_coverage",
+                        arguments={
+                            "school_layer_id": "school-id",
+                            "residential_layer_id": "residential-id",
+                            "school_type_field": "CCN",
+                            "school_type_values": ["中小学"],
+                            "area_unit": "square_meter",
+                            "group_field": "XZQMC",
+                            "service_distance_m": 1000,
+                            "target_crs": "EPSG:4526",
+                        },
+                    )
+                ],
+            )
+        return ChatResponse(
+            content="还缺少已确认的居住区面积字段，请补全后再执行。",
+            model=self.model,
+        )
+
+
 class RetryCodeExecutionProvider:
     name = "retry-code-test"
     model = "retry-code-test-model"
@@ -566,7 +603,14 @@ def test_execute_gis_code_requires_confirmation_and_runs_worker(tmp_path: Path):
     )
 
 
-def test_one_shot_business_skill_resets_after_confirmed_execution(tmp_path: Path):
+def test_one_shot_business_skill_resets_after_confirmed_execution(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.tools.school_service_coverage._prepare_execution_parameters",
+        lambda arguments, qgis_executor=None: dict(arguments),
+    )
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="one shot", model="test", source="test")
     session_db.set_state(
@@ -599,6 +643,29 @@ def test_one_shot_business_skill_resets_after_confirmed_execution(tmp_path: Path
     )
 
     assert session_db.get_state(f"{session.id}:active_skill") == "main-orchestrator"
+
+
+def test_school_coverage_preflight_blocks_incomplete_call_before_confirmation(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="preflight", model="test", source="test")
+    session_db.set_state(
+        f"{session.id}:active_skill",
+        "calculate-school-service-coverage",
+    )
+    provider = IncompleteSchoolCoverageProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="CRS 使用 EPSG:4526",
+        qgis_context=QGISContext(project_path="", layer_count=0, layers=[]),
+    )
+
+    assert provider.calls == 2
+    assert not any(event["type"] == "confirm_request" for event in events)
+    tool_end = next(event for event in events if event["type"] == "tool_end")
+    assert tool_end["payload"]["result"]["preflight_failed"] is True
+    assert "residential_area_field" in tool_end["payload"]["result"]["error"]
 
 
 def test_land_use_building_metrics_tools_are_registered_with_expected_safety(tmp_path: Path):
@@ -1269,7 +1336,12 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
         {"layer_name": "建筑物"},
         {
             "success": True,
-            "layer": {"name": "建筑物", "type": "vector", "crs": "EPSG:4326"},
+            "layer": {
+                "id": "buildings-live-id",
+                "name": "建筑物",
+                "type": "vector",
+                "crs": "EPSG:4326",
+            },
             "fields": [
                 {"name": "leisure", "type": "String"},
                 {"name": "landuse", "type": "String"},
@@ -1291,10 +1363,80 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     assert messages[0].role == "assistant"
     assert "会话记忆" in memory
     assert "建筑物" in memory
+    assert "buildings-live-id" in memory
     assert "leisure" in memory
     assert "landuse" in memory
     assert "中山公园" in memory
     assert messages[-1].content == "导出公园地块"
+
+
+def test_agent_core_preserves_school_coverage_binding_for_unit_followup(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="school coverage memory", model="test", source="test")
+    session_db.log_tool_call(
+        session.id,
+        "inspect_school_service_coverage_inputs",
+        {"school_layer_id": "school-live-id", "school_type_field": "CCN"},
+        {
+            "success": True,
+            "school_layer": {"id": "school-live-id", "name": "学校"},
+            "school_type_field": "CCN",
+            "available_values": ["中小学", "高等院校"],
+            "domain_complete": True,
+        },
+        duration_ms=5,
+    )
+    session_db.save_message(session.id, "user", "面积的单位是平方米", event_type="user")
+
+    messages = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_conversation_messages(session.id)
+
+    memory = messages[0].content
+    assert "school_layer_id=school-live-id" in memory
+    assert "school_type_field=CCN" in memory
+    assert 'available_values=["中小学", "高等院校"]' in memory
+    assert "domain_complete=True" in memory
+
+
+def test_agent_core_preserves_failed_school_execution_arguments_for_crs_followup(
+    tmp_path: Path,
+):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="failed binding memory", model="test", source="test")
+    arguments = {
+        "school_layer_id": "school-live-id",
+        "residential_layer_id": "residential-live-id",
+        "school_type_field": "CCN",
+        "school_type_values": ["中小学"],
+        "residential_area_field": "面积",
+        "area_unit": "square_meter",
+        "group_field": "XZQMC",
+        "service_distance_m": 1000,
+        "target_crs": "EPSG:4490",
+    }
+    session_db.log_tool_call(
+        session.id,
+        "execute_school_service_coverage",
+        arguments,
+        {"success": False, "error": "target_crs 必须是有效的投影 CRS。"},
+        duration_ms=15,
+    )
+    session_db.save_message(session.id, "user", "CRS 使用 EPSG:4526", event_type="user")
+
+    messages = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_conversation_messages(session.id)
+
+    memory = messages[0].content
+    assert '"residential_area_field": "面积"' in memory
+    assert '"area_unit": "square_meter"' in memory
+    assert '"group_field": "XZQMC"' in memory
+    assert '"target_crs": "EPSG:4490"' in memory
 
 
 def test_pipeline_stage_context_passes_only_structured_query_and_previous_stage(tmp_path: Path):

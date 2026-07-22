@@ -304,6 +304,7 @@ class AgentCore:
                     if check_cancelled():
                         return events
                     entry = tool_registry.get(call.name)
+                    call_arguments = call.arguments
                     if call.name == "execute_gis_code":
                         preflight_result = validate_execute_gis_code_arguments(call.arguments)
                         if preflight_result is not None:
@@ -347,12 +348,68 @@ class AgentCore:
                             )
                             budget.record_tool_call()
                             continue
+                    if entry.requires_confirmation and entry.preflight is not None:
+                        publish(
+                            agent_event(
+                                "tool_start",
+                                {"name": call.name, "arguments": call_arguments},
+                                session_id=session_id,
+                                run_id=run_id,
+                            )
+                        )
+                        self._save_process_message(session_id, f"执行前检查工具参数：{call.name}")
+                        started = time.monotonic()
+                        try:
+                            preflight_result = entry.preflight(call_arguments)
+                        except Exception as exc:
+                            preflight_result = {
+                                "success": False,
+                                "error": str(exc),
+                                "preflight_failed": True,
+                            }
+                        duration_ms = int((time.monotonic() - started) * 1000)
+                        self.session_db.log_tool_call(
+                            session_id,
+                            call.name,
+                            call_arguments,
+                            preflight_result,
+                            duration_ms=duration_ms,
+                        )
+                        publish(
+                            agent_event(
+                                "tool_end",
+                                {
+                                    "name": call.name,
+                                    "result": preflight_result,
+                                    "duration_ms": duration_ms,
+                                },
+                                session_id=session_id,
+                                run_id=run_id,
+                            )
+                        )
+                        if not preflight_result.get("success"):
+                            tool_results.append(
+                                {
+                                    "name": call.name,
+                                    "arguments": call_arguments,
+                                    "result": preflight_result,
+                                }
+                            )
+                            self._save_process_message(
+                                session_id,
+                                f"工具参数预检失败：{call.name}\nerror：{preflight_result.get('error')}",
+                            )
+                            budget.record_tool_call()
+                            continue
+                        normalized_arguments = preflight_result.get("arguments")
+                        if isinstance(normalized_arguments, dict):
+                            call_arguments = normalized_arguments
                     if entry.requires_confirmation:
                         confirmation_id = str(uuid.uuid4())
                         pending = {
                             "confirmation_id": confirmation_id,
                             "tool_name": call.name,
-                            "arguments": call.arguments,
+                            "arguments": call_arguments,
                             "run_id": run_id,
                         }
                         self.session_db.set_state(
@@ -365,7 +422,7 @@ class AgentCore:
                                 {
                                     "confirmation_id": confirmation_id,
                                     "tool_name": call.name,
-                                    "arguments": call.arguments,
+                                    "arguments": call_arguments,
                                     "destructive": entry.destructive,
                                     "writes_project": entry.writes_project,
                                     "description": entry.description,
@@ -399,14 +456,14 @@ class AgentCore:
                     publish(
                         agent_event(
                             "tool_start",
-                            {"name": call.name, "arguments": call.arguments},
+                            {"name": call.name, "arguments": call_arguments},
                             session_id=session_id,
                             run_id=run_id,
                         )
                     )
                     self._save_process_message(session_id, f"调用工具：{call.name}")
                     self._publish_stage_start_if_needed(call.name, call.arguments, publish, session_id, run_id)
-                    result, duration_ms = tool_registry.execute(call.name, call.arguments)
+                    result, duration_ms = tool_registry.execute(call.name, call_arguments)
                     if check_cancelled():
                         return events
                     if call.name == "set_active_skill" and result.get("success"):
@@ -418,11 +475,11 @@ class AgentCore:
                     self.session_db.log_tool_call(
                         session_id,
                         call.name,
-                        call.arguments,
+                        call_arguments,
                         result,
                         duration_ms=duration_ms,
                     )
-                    tool_results.append({"name": call.name, "arguments": call.arguments, "result": result})
+                    tool_results.append({"name": call.name, "arguments": call_arguments, "result": result})
                     publish(
                         agent_event(
                             "tool_end",
@@ -1513,9 +1570,35 @@ class AgentCore:
                     sample_hint = f"，样例={json.dumps(samples[:2], ensure_ascii=False)[:500]}"
                 lines.append(
                     f"- inspect: 图层={layer.get('name') or arguments.get('layer_name')}, "
+                    f"ID={layer.get('id') or arguments.get('layer_id') or ''}, "
                     f"类型={layer.get('type')}, CRS={layer.get('crs')}, 字段={field_names}{sample_hint}"
                 )
             return lines
+        if name == "inspect_school_service_coverage_inputs":
+            school_layer = (
+                result.get("school_layer")
+                if isinstance(result.get("school_layer"), dict)
+                else {}
+            )
+            available_values = (
+                result.get("available_values")
+                if isinstance(result.get("available_values"), list)
+                else []
+            )
+            return [
+                "- inspect_school_service_coverage_inputs: "
+                f"学校图层={school_layer.get('name') or ''}, "
+                f"school_layer_id={school_layer.get('id') or arguments.get('school_layer_id') or ''}, "
+                f"school_type_field={result.get('school_type_field') or arguments.get('school_type_field') or ''}, "
+                f"available_values={json.dumps(available_values, ensure_ascii=False)}, "
+                f"domain_complete={result.get('domain_complete')}"
+            ]
+        if name == "execute_school_service_coverage":
+            status = "成功" if call.get("success") else f"失败：{call.get('error_message') or ''}"
+            return [
+                "- execute_school_service_coverage: "
+                f"{status}；已绑定参数={json.dumps(arguments, ensure_ascii=False)}"
+            ]
         if name in {"list_layers", "load_layer", "export_layer", "execute_gis_code"}:
             compact = json.dumps(result, ensure_ascii=False)
             return [f"- {name}: {compact[:800]}"]

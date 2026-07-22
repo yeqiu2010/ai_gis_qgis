@@ -23,6 +23,7 @@ class ToolEntry:
     requires_confirmation: bool = False
     destructive: bool = False
     writes_project: bool = False
+    preflight: ToolHandler | None = None
 
     def definition(self) -> dict[str, Any]:
         return {

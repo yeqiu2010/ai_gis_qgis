@@ -151,6 +151,72 @@ def build_school_service_coverage_code(arguments: dict[str, Any]) -> str:
     return f"SCHOOL_SERVICE_PARAMETERS_JSON = {payload!r}\n{script}"
 
 
+def _resolve_execution_layer_ids(
+    arguments: dict[str, Any],
+    *,
+    qgis_executor=None,
+) -> dict[str, Any]:
+    """Resolve persisted layer references to live project IDs before execution.
+
+    Follow-up turns may preserve a layer name or a UI display label instead of
+    the opaque QGIS layer ID.  Inspection tools already accept those references,
+    so the execution tool must apply the same resolution rule rather than pass a
+    name to ``QgsProject.mapLayer()``, which only accepts an exact ID.
+    """
+
+    def operation() -> dict[str, Any]:
+        resolved = dict(arguments)
+        for parameter_name, role in (
+            ("school_layer_id", "学校"),
+            ("residential_layer_id", "居住区"),
+        ):
+            reference = str(arguments.get(parameter_name) or "").strip()
+            if not reference:
+                raise ValueError(f"缺少必要参数：{parameter_name}")
+            layer = _find_layer(reference)
+            if not layer.isValid():
+                raise ValueError(f"{role}图层无效：{reference}")
+            if _layer_type_name(layer) != "vector":
+                raise ValueError(f"{role}图层必须是矢量图层。")
+            resolved[parameter_name] = layer.id()
+        return resolved
+
+    return _run_qgis(qgis_executor, operation)
+
+
+def _validate_target_crs(target_crs: str, *, qgis_executor=None) -> None:
+    """Reject invalid, geographic, or non-metre CRSs before confirmation."""
+
+    def operation() -> None:
+        try:
+            from qgis.core import Qgis, QgsCoordinateReferenceSystem
+        except Exception as exc:
+            raise RuntimeError("当前运行环境未提供 PyQGIS，无法验证 target_crs。") from exc
+
+        crs = QgsCoordinateReferenceSystem(target_crs)
+        if not crs.isValid() or crs.isGeographic():
+            raise ValueError("target_crs 必须是有效的投影 CRS。")
+        meter_unit = getattr(getattr(Qgis, "DistanceUnit", object), "Meters", None)
+        if meter_unit is not None and crs.mapUnits() != meter_unit:
+            raise ValueError("target_crs 的线性单位必须是米。")
+
+    _run_qgis(qgis_executor, operation)
+
+
+def _prepare_execution_parameters(
+    arguments: dict[str, Any],
+    *,
+    qgis_executor=None,
+) -> dict[str, Any]:
+    """Normalize and validate the complete binding without running analysis."""
+    # Normalize first so missing follow-up parameters fail without touching QGIS.
+    normalized = _normalize_parameters(arguments)
+    resolved = _resolve_execution_layer_ids(normalized, qgis_executor=qgis_executor)
+    parameters = _normalize_parameters(resolved)
+    _validate_target_crs(parameters["target_crs"], qgis_executor=qgis_executor)
+    return parameters
+
+
 def build_school_service_coverage_tool(
     *,
     session_db: SessionDB | None,
@@ -167,10 +233,34 @@ def build_school_service_coverage_tool(
         executor_config=executor_config,
     )
 
+    def preflight(arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parameters = _prepare_execution_parameters(
+                arguments,
+                qgis_executor=qgis_executor,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "preflight_failed": True,
+            }
+        return {
+            "success": True,
+            "arguments": {
+                **arguments,
+                **parameters,
+            },
+        }
+
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         try:
-            code = build_school_service_coverage_code(arguments)
-        except (OSError, ValueError) as exc:
+            parameters = _prepare_execution_parameters(
+                arguments,
+                qgis_executor=qgis_executor,
+            )
+            code = build_school_service_coverage_code(parameters)
+        except (OSError, RuntimeError, ValueError) as exc:
             return {"success": False, "error": str(exc)}
         result = code_executor.handler(
             {
@@ -181,7 +271,7 @@ def build_school_service_coverage_tool(
         )
         return {
             **result,
-            "analysis_parameters": _normalize_parameters(arguments),
+            "analysis_parameters": parameters,
             "fixed_script": SCRIPT_PATH.name,
         }
 
@@ -258,6 +348,7 @@ def build_school_service_coverage_tool(
         category="school_service_coverage",
         requires_confirmation=True,
         writes_project=True,
+        preflight=preflight,
     )
 
 
@@ -294,8 +385,11 @@ def _normalize_parameters(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("area_unit 必须是 square_meter、hectare、mu 或 square_kilometer。")
     parameters["area_unit"] = area_unit
 
+    raw_distance = arguments.get("service_distance_m")
+    if raw_distance is None:
+        raise ValueError("service_distance_m 必须是数值。")
     try:
-        distance = float(arguments.get("service_distance_m"))
+        distance = float(raw_distance)
     except (TypeError, ValueError) as exc:
         raise ValueError("service_distance_m 必须是数值。") from exc
     if not 0 < distance <= 100000:

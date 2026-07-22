@@ -7,7 +7,7 @@ tools:
   - inspect_school_service_coverage_inputs
   - get_task_context
   - execute_school_service_coverage
-version: 2.1.0
+version: 2.1.2
 lifecycle: one-shot
 tags: [school, education, service-area, coverage, residential, street-statistics]
 ---
@@ -56,6 +56,10 @@ tags: [school, education, service-area, coverage, residential, street-statistics
 4. 确认学校图层是点或面，居住区图层是面。
 5. 确认面积字段为数值型，分组字段真实存在。
 6. 确认学校类型字段后，必须调用 `inspect_school_service_coverage_inputs` 获取该字段完整的实际唯一值及计数。不得仅根据 `inspect_layers` 的少量样例确定类别值。
+
+用户补充面积单位等缺失参数后，继续使用前序检查结果中的真实图层 ID、字段和值域；不得把图层名称改填到 `school_layer_id` 或 `residential_layer_id`。执行工具会在调用时将名称或 UI 显示引用重新解析为当前工程的唯一真实 ID，并在同名歧义时停止。
+
+用户只回答多个待确认参数中的一部分时，保留全部已确认绑定并继续询问其余缺项，不得猜测后执行。尤其不得把输入图层的地理 CRS（例如 `EPSG:4490`）当作米制投影 CRS。执行调用失败后，只修正错误涉及的参数并复用失败调用中的其他完整参数，不得从用户最新短句重新构造整套参数。
 
 `school_type_values` 必须遵循以下证据约束：
 
