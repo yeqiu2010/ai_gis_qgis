@@ -301,11 +301,11 @@ class QGISCodeExecutor:
             )
             return original_run(*mutable_args, **kwargs)
 
-        processing.run = responsive_run
+        processing.run = responsive_run  # type: ignore[attr-defined]
         try:
             yield
         finally:
-            processing.run = original_run
+            processing.run = original_run  # type: ignore[attr-defined]
 
     def _qgis_symbols(self) -> dict[str, Any]:
         symbols: dict[str, Any] = {}

@@ -20,6 +20,7 @@ from .tools.code_execution import (
     validate_execute_gis_code_arguments,
 )
 from .tools.custom_tools import load_custom_tool_entries
+from .tools.delegation import build_invoke_skill_tool
 from .tools.gis_analysis import build_get_task_context_tool
 from .tools.land_cover_map import (
     build_generate_land_cover_map_tool,
@@ -44,7 +45,18 @@ from .tools.school_service_coverage import (
     build_school_service_coverage_tool,
 )
 from .tools.search_tools import build_search_messages_tool
-from .tools.skill_management import build_search_skills_tool, build_set_active_skill_tool
+from .tools.skill_management import (
+    build_inspect_skill_tool,
+    build_list_loaded_skills_tool,
+    build_load_skill_reference_tool,
+    build_load_skill_tool,
+    build_search_skills_tool,
+    build_set_active_skill_tool,
+    build_unload_skill_tool,
+    read_loaded_skills,
+    write_loaded_skills,
+)
+from .tools.task_planning import build_task_planning_tools, verify_task_completion
 
 EventCallback = Callable[[dict[str, Any]], None]
 CancelChecker = Callable[[], bool]
@@ -243,9 +255,23 @@ class AgentCore:
                 self.session_db.get_state(f"{session_id}:active_skill")
                 or "main-orchestrator"
             )
+            loaded_skills = read_loaded_skills(
+                self.session_db.get_state,
+                session_id,
+                self.prompt_builder.skill_manager,
+            )
+            if active_skill not in loaded_skills:
+                active_skill = next(
+                    (name for name in reversed(loaded_skills) if name != "main-orchestrator"),
+                    "main-orchestrator",
+                )
+            # Build the registry first so Hermes availability metadata can be
+            # evaluated against the tools/toolsets that are actually active.
+            tool_registry = self._build_tool_registry(session_id)
             system_prompt = self.prompt_builder.build(
                 active_skill,
                 qgis_context,
+                loaded_skills=loaded_skills,
             )
             thinking_message = "正在组织上下文"
             self._save_process_message(session_id, thinking_message)
@@ -258,7 +284,6 @@ class AgentCore:
                 )
             )
             messages = self._build_conversation_messages(session_id)
-            tool_registry = self._build_tool_registry(session_id)
         except Exception as exc:
             content = self._format_llm_error(exc)
             self._publish_final_error(content, publish, session_id, run_id)
@@ -274,7 +299,7 @@ class AgentCore:
                 response = self._chat_with_retries(
                     system=system_prompt,
                     messages=messages,
-                    tools=tool_registry.definitions_for_skill(active_skill),
+                    tools=tool_registry.definitions_for_skills(loaded_skills),
                     publish=publish,
                     session_id=session_id,
                     run_id=run_id,
@@ -283,15 +308,19 @@ class AgentCore:
                 if check_cancelled():
                     return events
                 budget.record_iteration()
-                if not response.tool_calls and self._pipeline_must_continue(session_id, active_skill):
-                    expected_stage = next_pipeline_stage(self.session_db, session_id)
+                task_must_continue = self._managed_task_must_continue(session_id)
+                if not response.tool_calls and task_must_continue:
+                    expected = (
+                        "当前通用计划尚未完成。请读取 get_task_state，继续未完成步骤；"
+                        "需要用户补充时先把对应步骤标记为 waiting_for_user，"
+                        "所有步骤完成后调用 finalize_task。"
+                    )
                     messages.append(
                         ChatMessage(
                             role="assistant",
                             content=(
-                                "当前 GIS Pipeline 尚未完成，不能把上一段不完整文本作为最终回复。"
-                                f"下一阶段必须是 {expected_stage}。请继续调用必要工具并记录该阶段；"
-                                "只有 structured_query 明确包含需要用户回答的问题时才可暂停。"
+                                "当前任务尚未满足完成条件，不能把上一段不完整文本作为最终回复。"
+                                f"{expected}"
                             ),
                         )
                     )
@@ -416,6 +445,11 @@ class AgentCore:
                             self._confirmation_key(session_id, confirmation_id),
                             json.dumps(pending, ensure_ascii=False),
                         )
+                        active_task = self.session_db.get_active_task(session_id)
+                        if active_task is not None:
+                            self.session_db.update_task(
+                                str(active_task["id"]), status="waiting_confirmation"
+                            )
                         publish(
                             agent_event(
                                 "confirm_request",
@@ -468,10 +502,48 @@ class AgentCore:
                         return events
                     if call.name == "set_active_skill" and result.get("success"):
                         next_skill = str(result.get("active_skill") or active_skill)
+                        loaded_skills = write_loaded_skills(
+                            self.session_db.set_state,
+                            session_id,
+                            self.prompt_builder.skill_manager,
+                            [*loaded_skills, next_skill],
+                        )
                         if next_skill == "gis-pipeline" and active_skill != "gis-pipeline":
                             start_pipeline_cycle(self.session_db, session_id)
                         active_skill = next_skill
-                        system_prompt = self.prompt_builder.build(active_skill, qgis_context)
+                        system_prompt = self.prompt_builder.build(
+                            active_skill,
+                            qgis_context,
+                            loaded_skills=loaded_skills,
+                        )
+                    elif call.name == "load_skill" and result.get("success"):
+                        previous_skill = active_skill
+                        loaded_skills = [str(name) for name in result.get("loaded_skills") or loaded_skills]
+                        active_skill = str(result.get("skill_name") or active_skill)
+                        if active_skill == "gis-pipeline" and previous_skill != "gis-pipeline":
+                            start_pipeline_cycle(self.session_db, session_id)
+                        system_prompt = self.prompt_builder.build(
+                            active_skill,
+                            qgis_context,
+                            loaded_skills=loaded_skills,
+                        )
+                        self._record_main_loop_skill_invocation(
+                            session_id,
+                            active_skill,
+                            call.arguments,
+                            result,
+                        )
+                    elif call.name == "unload_skill" and result.get("success"):
+                        loaded_skills = [str(name) for name in result.get("loaded_skills") or loaded_skills]
+                        active_skill = (
+                            self.session_db.get_state(f"{session_id}:active_skill")
+                            or "main-orchestrator"
+                        )
+                        system_prompt = self.prompt_builder.build(
+                            active_skill,
+                            qgis_context,
+                            loaded_skills=loaded_skills,
+                        )
                     self.session_db.log_tool_call(
                         session_id,
                         call.name,
@@ -490,16 +562,13 @@ class AgentCore:
                     )
                     self._save_process_message(session_id, self._format_tool_process(call.name, result))
                     self._publish_stage_end_if_needed(call.name, result, publish, session_id, run_id)
-                    execution_arguments = self._execution_arguments_from_generated_stage(
-                        call.name,
-                        result,
-                    )
-                    if execution_arguments is not None:
+                    requested_tool_call = self._requested_tool_call_from_result(result)
+                    if requested_tool_call is not None:
                         self._request_tool_confirmation(
                             session_id=session_id,
                             run_id=run_id,
-                            tool_name="execute_gis_code",
-                            arguments=execution_arguments,
+                            tool_name=requested_tool_call["name"],
+                            arguments=requested_tool_call["arguments"],
                             tool_registry=tool_registry,
                             publish=publish,
                             model=response.model,
@@ -542,7 +611,7 @@ class AgentCore:
                     return events
             elif budget.exhausted and (
                 response.tool_calls
-                or self._pipeline_must_continue(session_id, active_skill)
+                or self._managed_task_must_continue(session_id)
             ):
                 response = type(response)(
                     content="任务未完成：已达到本轮工具调用预算。请缩小任务范围或补充更明确的图层、字段和输出要求后重试。",
@@ -665,6 +734,13 @@ class AgentCore:
         )
         self._save_process_message(session_id, "已确认工具操作。" if approved else "已取消工具操作。")
 
+        active_task = self.session_db.get_active_task(session_id)
+        if active_task is not None:
+            self.session_db.update_task(
+                str(active_task["id"]),
+                status="running" if approved else "waiting_for_user",
+            )
+
         if not approved:
             self._reset_one_shot_skill(session_id)
             terminal_status = "cancelled"
@@ -736,6 +812,7 @@ class AgentCore:
             if retry_result is not None:
                 result = retry_result
 
+        self._capture_confirmed_tool_artifacts(session_id, tool_name, result)
         if tool_name == "execute_gis_code":
             self._record_pipeline_execution_result(
                 session_id=session_id,
@@ -750,6 +827,7 @@ class AgentCore:
             content = self._format_tool_success(tool_name, result)
         else:
             content = self._format_tool_failure(tool_name, result)
+        self._finalize_ready_task(session_id, content)
         self.session_db.save_message(
             session_id,
             "assistant",
@@ -778,8 +856,45 @@ class AgentCore:
     def _build_tool_registry(self, session_id: str) -> ToolRegistry:
         registry = ToolRegistry()
         registry.set_skill_tools(self.prompt_builder.skill_manager.tool_allowlist())
-        registry.register(build_set_active_skill_tool(self.session_db.set_state, session_id))
+        registry.register(
+            build_set_active_skill_tool(
+                self.session_db.set_state,
+                session_id,
+                self.prompt_builder.skill_manager,
+            )
+        )
         registry.register(build_search_skills_tool(self.prompt_builder.skill_manager))
+        registry.register(
+            build_load_skill_tool(
+                self.prompt_builder.skill_manager,
+                self.session_db.get_state,
+                self.session_db.set_state,
+                session_id,
+            )
+        )
+        registry.register(
+            build_unload_skill_tool(
+                self.prompt_builder.skill_manager,
+                self.session_db.get_state,
+                self.session_db.set_state,
+                session_id,
+            )
+        )
+        registry.register(
+            build_list_loaded_skills_tool(
+                self.prompt_builder.skill_manager,
+                self.session_db.get_state,
+                session_id,
+            )
+        )
+        registry.register(build_inspect_skill_tool(self.prompt_builder.skill_manager))
+        registry.register(build_load_skill_reference_tool(self.prompt_builder.skill_manager))
+        for entry in build_task_planning_tools(
+            self.session_db,
+            session_id,
+            self.prompt_builder.skill_manager,
+        ):
+            registry.register(entry)
         registry.register(build_get_task_context_tool(self.iface, qgis_executor=self.qgis_executor))
         registry.register(build_search_messages_tool(self.session_db, session_id))
         registry.register(build_record_pipeline_stage_tool(self.session_db, session_id))
@@ -851,7 +966,211 @@ class AgentCore:
             registry.register(entry)
         for entry in load_custom_tool_entries(self.custom_tools_dir):
             registry.register(entry)
+        registry.register(
+            build_invoke_skill_tool(
+                session_db=self.session_db,
+                session_id=session_id,
+                llm_provider=self.llm_provider,
+                skill_manager=self.prompt_builder.skill_manager,
+                tool_registry=registry,
+                should_cancel=self.should_cancel,
+            )
+        )
+        self.prompt_builder.skill_manager.set_runtime_capabilities(
+            available_tools=registry.tool_names(),
+            active_toolsets=registry.toolsets(),
+        )
         return registry
+
+    def _managed_task_must_continue(self, session_id: str) -> bool:
+        task = self.session_db.get_active_task(session_id)
+        if task is None or task.get("status") in {
+            "completed",
+            "failed",
+            "cancelled",
+            "waiting_for_user",
+            "waiting_confirmation",
+        }:
+            return False
+        steps = self.session_db.get_plan_steps(str(task["id"]))
+        return bool(steps)
+
+    def _record_main_loop_skill_invocation(
+        self,
+        session_id: str,
+        skill_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        task = self.session_db.get_active_task(session_id)
+        if task is None:
+            return
+        steps = self.session_db.get_plan_steps(str(task["id"]))
+        step = next(
+            (
+                item
+                for item in steps
+                if item.get("skill_name") == skill_name
+                and item.get("status") in {"pending", "in_progress", "waiting_for_user"}
+            ),
+            None,
+        )
+        invocation_id = self.session_db.start_skill_invocation(
+            str(task["id"]),
+            skill_name,
+            step_id=str(step["id"]) if step else None,
+            execution_mode="main_loop",
+            arguments=arguments,
+        )
+        self.session_db.finish_skill_invocation(
+            invocation_id,
+            status="loaded",
+            result={
+                "loaded_skills": result.get("loaded_skills") or [],
+                "already_loaded": bool(result.get("already_loaded")),
+            },
+        )
+
+    def _capture_confirmed_tool_artifacts(
+        self,
+        session_id: str,
+        tool_name: str,
+        result: dict[str, Any],
+    ) -> None:
+        task = self.session_db.get_active_task(session_id)
+        if task is None:
+            return
+        task_id = str(task["id"])
+        steps = self.session_db.get_plan_steps(task_id)
+        active_skill = self.session_db.get_state(f"{session_id}:active_skill") or ""
+        step = next(
+            (
+                item
+                for item in steps
+                if item.get("status") == "in_progress"
+                and (not item.get("skill_name") or item.get("skill_name") == active_skill)
+            ),
+            None,
+        ) or next(
+            (
+                item
+                for item in steps
+                if item.get("status") == "pending"
+                and (not item.get("skill_name") or item.get("skill_name") == active_skill)
+            ),
+            None,
+        )
+        if step is None:
+            return
+        step_id = str(step["id"])
+        if not result.get("success", True):
+            self.session_db.update_plan_step(
+                task_id,
+                step_id,
+                status="in_progress",
+                error=str(result.get("error") or "工具执行失败"),
+            )
+            self.session_db.update_task(task_id, status="running")
+            return
+
+        artifacts = self._artifacts_from_tool_result(tool_name, result)
+        artifact_ids = []
+        for artifact in artifacts:
+            artifact_ids.append(
+                self.session_db.register_artifact(
+                    task_id,
+                    str(artifact["artifact_type"]),
+                    step_id=step_id,
+                    name=str(artifact.get("name") or "") or None,
+                    uri=str(artifact.get("uri") or "") or None,
+                    payload=artifact.get("payload") or {},
+                    producer=active_skill or tool_name,
+                    verified=bool(artifact.get("verified", True)),
+                )
+            )
+        outputs = {
+            "tool_name": tool_name,
+            "artifacts": artifact_ids,
+            "outputs": result.get("outputs") or [],
+            "loaded_layers": result.get("loaded_layers") or [],
+        }
+        self.session_db.update_plan_step(
+            task_id,
+            step_id,
+            status="completed",
+            outputs=outputs,
+            error="",
+        )
+        self.session_db.update_task(task_id, status="running")
+
+    @staticmethod
+    def _artifacts_from_tool_result(
+        tool_name: str,
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        type_map = {
+            "execute_school_service_coverage": ["coverage_layer", "group_statistics"],
+            "execute_land_use_building_metrics": ["metrics_layer", "metrics_table"],
+            "generate_land_cover_map": ["map_png", "map_pdf"],
+        }
+        mapped_types = type_map.get(tool_name, [])
+        artifacts: list[dict[str, Any]] = []
+        for index, output in enumerate(result.get("outputs") or []):
+            if not isinstance(output, dict):
+                continue
+            artifact_type = (
+                mapped_types[index]
+                if index < len(mapped_types)
+                else str(output.get("type") or "file")
+            )
+            artifacts.append(
+                {
+                    "artifact_type": artifact_type,
+                    "name": output.get("name") or output.get("path"),
+                    "uri": output.get("path") or output.get("absolute_path"),
+                    "payload": output,
+                    "verified": True,
+                }
+            )
+        if tool_name == "generate_land_cover_map":
+            artifacts.append(
+                {
+                    "artifact_type": "layout",
+                    "name": str((result.get("map_parameters") or {}).get("title") or "土地覆盖专题图"),
+                    "payload": {"loaded_layers": result.get("loaded_layers") or []},
+                    "verified": True,
+                }
+            )
+        if tool_name == "execute_gis_code" and artifacts:
+            artifacts.append(
+                {
+                    "artifact_type": "execution_outputs",
+                    "name": "GIS execution outputs",
+                    "payload": {"outputs": result.get("outputs") or []},
+                    "verified": True,
+                }
+            )
+        return artifacts
+
+    def _finalize_ready_task(self, session_id: str, summary: str) -> None:
+        task = self.session_db.get_active_task(session_id)
+        if task is None:
+            return
+        state = self.session_db.get_task_state(str(task["id"]))
+        if state is None:
+            return
+        if verify_task_completion(state, self.prompt_builder.skill_manager):
+            return
+        self.session_db.update_task(
+            str(task["id"]),
+            status="completed",
+            summary=summary,
+            finalization={
+                "summary": summary,
+                "automatic_after_confirmation": True,
+                "artifacts": [artifact["id"] for artifact in state.get("artifacts") or []],
+            },
+        )
 
     def _pipeline_must_continue(self, session_id: str, active_skill: str) -> bool:
         if active_skill != "gis-pipeline":
@@ -866,37 +1185,20 @@ class AgentCore:
                 return False
         return True
 
-    def _execution_arguments_from_generated_stage(
-        self,
-        tool_name: str,
+    @staticmethod
+    def _requested_tool_call_from_result(
         result: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if tool_name != "record_pipeline_stage" or not result.get("success"):
+        if not result.get("success") or result.get("already_recorded"):
             return None
-        if result.get("already_recorded"):
+        request = result.get("requested_tool_call")
+        if not isinstance(request, dict):
             return None
-        if result.get("stage_name") != "generated_code":
+        name = str(request.get("name") or "").strip()
+        arguments = request.get("arguments")
+        if not name or not isinstance(arguments, dict):
             return None
-        artifact = result.get("artifact")
-        if not isinstance(artifact, dict):
-            return None
-        review = artifact.get("review")
-        if not isinstance(review, dict) or review.get("passed") is not True:
-            return None
-        return {
-            "code": str(artifact.get("code") or ""),
-            "expected_outputs": artifact.get("expected_outputs") or [],
-            **(
-                {"delivery_outputs": artifact["delivery_outputs"]}
-                if artifact.get("delivery_outputs")
-                else {}
-            ),
-            **(
-                {"timeout_seconds": artifact["timeout_seconds"]}
-                if artifact.get("timeout_seconds")
-                else {}
-            ),
-        }
+        return {"name": name, "arguments": arguments}
 
     def _request_tool_confirmation(
         self,
@@ -921,6 +1223,11 @@ class AgentCore:
             self._confirmation_key(session_id, confirmation_id),
             json.dumps(pending, ensure_ascii=False),
         )
+        active_task = self.session_db.get_active_task(session_id)
+        if active_task is not None:
+            self.session_db.update_task(
+                str(active_task["id"]), status="waiting_confirmation"
+            )
         publish(
             agent_event(
                 "confirm_request",
@@ -1007,9 +1314,16 @@ class AgentCore:
         document = self.prompt_builder.skill_manager.get(active_skill)
         if document is None or document.lifecycle != "one-shot":
             return
-        self.session_db.set_state(
-            f"{session_id}:active_skill",
-            "main-orchestrator",
+        loaded = read_loaded_skills(
+            self.session_db.get_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+        )
+        write_loaded_skills(
+            self.session_db.set_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+            [name for name in loaded if name != active_skill],
         )
 
     def _confirmation_key(self, session_id: str, confirmation_id: str) -> str:
@@ -1267,9 +1581,19 @@ class AgentCore:
         on_response: Callable[[ChatResponse], None] | None = None,
     ) -> dict[str, Any] | None:
         messages = self._retry_messages_for_code_failure(session_id, failed_arguments, failed_result)
+        active_skill = (
+            self.session_db.get_state(f"{session_id}:active_skill")
+            or "main-orchestrator"
+        )
+        loaded_skills = read_loaded_skills(
+            self.session_db.get_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+        )
         system_prompt = self.prompt_builder.build(
-            self.session_db.get_state(f"{session_id}:active_skill") or "main-orchestrator",
+            active_skill,
             self._collect_qgis_context(),
+            loaded_skills=loaded_skills,
         )
         last_result: dict[str, Any] | None = None
         for retry_index in range(1, 3):
@@ -1288,7 +1612,7 @@ class AgentCore:
             response = self._chat_with_retries(
                 system=system_prompt,
                 messages=messages,
-                tools=tool_registry.definitions_for_skill("gis-pipeline"),
+                tools=tool_registry.definitions_for_skills(loaded_skills),
                 publish=publish,
                 session_id=session_id,
                 run_id=run_id,
@@ -1432,7 +1756,8 @@ class AgentCore:
         for call in tool_results:
             if call.get("name") != "record_pipeline_stage":
                 continue
-            result = call.get("result") if isinstance(call.get("result"), dict) else {}
+            raw_result = call.get("result")
+            result: dict[str, Any] = dict(raw_result) if isinstance(raw_result, dict) else {}
             if result.get("success") or result.get("error_code") == "truncated_tool_arguments":
                 return True
         return False
@@ -1443,7 +1768,8 @@ class AgentCore:
     ) -> list[dict[str, Any]]:
         compact = []
         for call in tool_results:
-            result = call.get("result") if isinstance(call.get("result"), dict) else {}
+            raw_result = call.get("result")
+            result: dict[str, Any] = dict(raw_result) if isinstance(raw_result, dict) else {}
             if call.get("name") == "record_pipeline_stage":
                 compact.append(
                     {
@@ -1530,6 +1856,46 @@ class AgentCore:
         tool_calls = self.session_db.get_recent_tool_calls(session_id, limit=8)
         stage_artifacts = self.session_db.get_recent_stage_artifacts(session_id, limit=5)
         lines = []
+        loaded_skills = read_loaded_skills(
+            self.session_db.get_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+        )
+        if loaded_skills:
+            lines.append("当前已加载 Skills：" + ", ".join(loaded_skills))
+        active_task = self.session_db.get_active_task(session_id)
+        if active_task is not None:
+            task_state = self.session_db.get_task_state(str(active_task["id"]))
+            if task_state is not None:
+                compact_task = {
+                    "id": task_state.get("id"),
+                    "objective": task_state.get("objective"),
+                    "status": task_state.get("status"),
+                    "steps": [
+                        {
+                            "id": step.get("id"),
+                            "skill_name": step.get("skill_name"),
+                            "status": step.get("status"),
+                            "outputs": step.get("outputs"),
+                            "error": step.get("error"),
+                        }
+                        for step in task_state.get("steps") or []
+                    ],
+                    "artifacts": [
+                        {
+                            "id": artifact.get("id"),
+                            "type": artifact.get("artifact_type"),
+                            "name": artifact.get("name"),
+                            "uri": artifact.get("uri"),
+                            "verified": artifact.get("verified"),
+                        }
+                        for artifact in task_state.get("artifacts") or []
+                    ],
+                }
+                lines.append(
+                    "当前通用任务状态："
+                    + json.dumps(compact_task, ensure_ascii=False, separators=(",", ":"))
+                )
         if tool_calls:
             lines.append("最近工具记忆：")
             for call in tool_calls:
@@ -1553,18 +1919,26 @@ class AgentCore:
 
     def _summarize_tool_memory(self, call: dict[str, Any]) -> list[str]:
         name = str(call.get("tool_name") or "")
-        result = call.get("result") if isinstance(call.get("result"), dict) else {}
-        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        raw_result = call.get("result")
+        result: dict[str, Any] = dict(raw_result) if isinstance(raw_result, dict) else {}
+        raw_arguments = call.get("arguments")
+        arguments: dict[str, Any] = (
+            dict(raw_arguments) if isinstance(raw_arguments, dict) else {}
+        )
         if name in {"inspect_layer", "inspect_layers"}:
-            layers = result.get("layers") if isinstance(result.get("layers"), list) else [result]
+            raw_layers = result.get("layers")
+            layers: list[Any] = list(raw_layers) if isinstance(raw_layers, list) else [result]
             lines = []
             for item in layers[:6]:
                 if not isinstance(item, dict):
                     continue
-                layer = item.get("layer") if isinstance(item.get("layer"), dict) else {}
-                fields = item.get("fields") if isinstance(item.get("fields"), list) else []
+                raw_layer = item.get("layer")
+                layer: dict[str, Any] = dict(raw_layer) if isinstance(raw_layer, dict) else {}
+                raw_fields = item.get("fields")
+                fields: list[Any] = list(raw_fields) if isinstance(raw_fields, list) else []
                 field_names = [str(field.get("name")) for field in fields[:30] if isinstance(field, dict)]
-                samples = item.get("sample_features") if isinstance(item.get("sample_features"), list) else []
+                raw_samples = item.get("sample_features")
+                samples: list[Any] = list(raw_samples) if isinstance(raw_samples, list) else []
                 sample_hint = ""
                 if samples:
                     sample_hint = f"，样例={json.dumps(samples[:2], ensure_ascii=False)[:500]}"
@@ -1575,15 +1949,13 @@ class AgentCore:
                 )
             return lines
         if name == "inspect_school_service_coverage_inputs":
-            school_layer = (
-                result.get("school_layer")
-                if isinstance(result.get("school_layer"), dict)
-                else {}
+            raw_school_layer = result.get("school_layer")
+            school_layer: dict[str, Any] = (
+                dict(raw_school_layer) if isinstance(raw_school_layer, dict) else {}
             )
-            available_values = (
-                result.get("available_values")
-                if isinstance(result.get("available_values"), list)
-                else []
+            raw_available_values = result.get("available_values")
+            available_values: list[Any] = (
+                list(raw_available_values) if isinstance(raw_available_values, list) else []
             )
             return [
                 "- inspect_school_service_coverage_inputs: "

@@ -6,9 +6,19 @@ tools:
   - inspect_layer
   - record_pipeline_stage
   - execute_gis_code
-  - set_active_skill
-version: 1.0.1
-tags: [gis, fast-path]
+  - load_skill
+version: 2.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [gis, fast-path]
+    related_skills: [qgis-toolbox, gis-pipeline]
+  qgis_agent:
+    side_effects:
+      writes_files: true
+      requires_confirmation: true
 ---
 
 # Fast Path

@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ..backend.agent_core import AgentCore
-from ..backend.context.qgis_context import QGISContext
 from ..backend.context.prompt_builder import PromptBuilder
+from ..backend.context.qgis_context import QGISContext
 from ..backend.llm.provider_registry import create_provider
+from ..backend.tools.skill_management import read_loaded_skills
 from ..config.settings import SettingsManager
 from ..database.session_db import SessionDB
 from .main_thread_executor import MainThreadExecutor
@@ -40,6 +41,8 @@ class RPCController:
             "createSession": self.create_session,
             "listSessions": self.list_sessions,
             "getMessages": self.get_messages,
+            "getTaskState": self.get_task_state,
+            "listLoadedSkills": self.list_loaded_skills,
             "chat": self.chat,
             "confirmToolCall": self.confirm_tool_call,
             "cancelRun": self.cancel_run,
@@ -70,6 +73,27 @@ class RPCController:
     def get_messages(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         session_id = self._require_session_id(params)
         return self.session_db.get_messages(session_id, limit=int(params.get("limit", 100)))
+
+    def get_task_state(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        session_id = self._require_session_id(params)
+        task_id = str(params.get("task_id") or "").strip()
+        if task_id:
+            task = self.session_db.get_task(task_id)
+            if task is None or task.get("session_id") != session_id:
+                raise ValueError(f"任务不存在或不属于当前会话：{task_id}")
+            return self.session_db.get_task_state(task_id)
+        active = self.session_db.get_active_task(session_id)
+        return self.session_db.get_task_state(str(active["id"])) if active else None
+
+    def list_loaded_skills(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        session_id = self._require_session_id(params)
+        manager = self.agent_core.prompt_builder.skill_manager
+        names = read_loaded_skills(self.session_db.get_state, session_id, manager)
+        return [
+            inspected
+            for name in names
+            if (inspected := manager.inspect(name, include_body=False)) is not None
+        ]
 
     def chat(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(params)

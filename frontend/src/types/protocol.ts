@@ -2,6 +2,8 @@ export type RPCMethod =
   | 'createSession'
   | 'listSessions'
   | 'getMessages'
+  | 'getTaskState'
+  | 'listLoadedSkills'
   | 'chat'
   | 'confirmToolCall'
   | 'cancelRun'
@@ -91,6 +93,53 @@ export interface PendingConfirmation {
   description?: string
   destructive?: boolean
   writes_project?: boolean
+}
+
+export interface LoadedSkillSummary {
+  name: string
+  description: string
+  version?: string
+  tags: string[]
+  related_skills: string[]
+  available: boolean
+  inputs?: Record<string, unknown>
+  outputs?: Record<string, unknown>
+  side_effects?: Record<string, unknown>
+}
+
+export interface PlanStepState {
+  id: string
+  position: number
+  skill_name?: string
+  instruction: string
+  dependencies: string[]
+  status: 'pending' | 'in_progress' | 'waiting_for_user' | 'completed' | 'failed' | 'skipped'
+  inputs: Record<string, unknown>
+  outputs: Record<string, unknown>
+  error?: string
+}
+
+export interface TaskArtifact {
+  id: string
+  step_id?: string
+  artifact_type: string
+  name?: string
+  uri?: string
+  payload: Record<string, unknown>
+  producer?: string
+  verified: boolean
+}
+
+export interface TaskState {
+  id: string
+  session_id: string
+  objective: string
+  status: string
+  plan_version: number
+  summary?: string
+  steps: PlanStepState[]
+  artifacts: TaskArtifact[]
+  skill_invocations: Array<Record<string, unknown>>
 }
 
 export interface AppSettings {

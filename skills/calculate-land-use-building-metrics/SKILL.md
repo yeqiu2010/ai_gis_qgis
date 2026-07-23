@@ -1,11 +1,40 @@
 ---
 name: calculate-land-use-building-metrics
 description: 按用地类型统计建筑单体数量、建筑高度、建筑占地面积、建筑面积总量和建筑密度。适用于“各类用地建筑量”“不同用地性质中的建筑规模”“分用地类型建筑密度”等任务；支持默认统计完整用地与建筑图层，也支持使用街道、行政区或研究区面图层限定计算范围。图层名和字段名可以不同，必须根据当前 QGIS 工程动态绑定。
-allowed-tools: list_layers inspect_layers inspect_land_use_building_metrics_inputs get_task_context execute_land_use_building_metrics
+tools: [list_layers, inspect_layers, inspect_land_use_building_metrics_inputs, get_task_context, execute_land_use_building_metrics]
+version: 1.0.0
+lifecycle: one-shot
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
 metadata:
-  version: 1.0.0
-  lifecycle: one-shot
-  tags: [land-use, building, height, floor-area, footprint, density, boundary]
+  hermes:
+    tags: [land-use, building, height, floor-area, footprint, density, boundary]
+    requires_tools: [list_layers, inspect_layers, inspect_land_use_building_metrics_inputs, execute_land_use_building_metrics]
+  qgis_agent:
+    inputs:
+      required:
+        land_layer_id: {type: qgis_vector_layer, geometry: [Polygon, MultiPolygon]}
+        building_layer_id: {type: qgis_vector_layer, geometry: [Polygon, MultiPolygon]}
+        land_type_field: {type: field_name}
+        land_area_field: {type: field_name}
+        land_area_unit: {type: enum}
+        building_height_field: {type: field_name}
+        building_footprint_field: {type: field_name}
+        building_floor_area_field: {type: field_name}
+        building_area_unit: {type: enum}
+        target_crs: {type: crs}
+    outputs:
+      metrics_layer: {type: qgis_vector_layer}
+      metrics_table: {type: table}
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+    completion:
+      required_artifacts: [metrics_layer, metrics_table]
+      checks: [output_layer_exists, statistics_fields_complete]
 ---
 
 # 各类用地建筑量与建筑密度

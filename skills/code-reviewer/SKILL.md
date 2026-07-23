@@ -4,7 +4,12 @@ description: 代码安全和 GIS 正确性审查
 tools:
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, review]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, review]
+    requires_tools: [record_pipeline_stage]
 ---
 
 # Code Reviewer

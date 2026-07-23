@@ -9,7 +9,37 @@ tools:
   - execute_school_service_coverage
 version: 2.1.2
 lifecycle: one-shot
-tags: [school, education, service-area, coverage, residential, street-statistics]
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [school, education, service-area, coverage, residential, street-statistics]
+    related_skills: [generate-land-cover-map]
+    requires_tools: [list_layers, inspect_layers, inspect_school_service_coverage_inputs, execute_school_service_coverage]
+  qgis_agent:
+    inputs:
+      required:
+        school_layer_id: {type: qgis_vector_layer}
+        residential_layer_id: {type: qgis_vector_layer, geometry: [Polygon, MultiPolygon]}
+        school_type_field: {type: field_name}
+        school_type_values: {type: array}
+        residential_area_field: {type: field_name}
+        area_unit: {type: enum}
+        group_field: {type: field_name}
+        service_distance_m: {type: number, unit: metre}
+        target_crs: {type: crs}
+    outputs:
+      coverage_layer: {type: qgis_vector_layer}
+      group_statistics: {type: table}
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+    completion:
+      required_artifacts: [coverage_layer, group_statistics]
+      checks: [output_layer_exists, statistics_fields_complete, coverage_rate_in_valid_range]
 ---
 
 # 中小学服务半径覆盖率

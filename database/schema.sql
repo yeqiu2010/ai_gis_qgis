@@ -123,3 +123,70 @@ ON failure_log(session_id, timestamp);
 
 CREATE INDEX IF NOT EXISTS failure_log_error_code
 ON failure_log(error_code);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    plan_version INTEGER NOT NULL DEFAULT 1,
+    summary TEXT,
+    finalization_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS task_runs_session_updated
+ON task_runs(session_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS plan_steps (
+    id TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    skill_name TEXT,
+    instruction TEXT NOT NULL,
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    inputs TEXT NOT NULL DEFAULT '{}',
+    outputs TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(task_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS plan_steps_task_position
+ON plan_steps(task_id, position);
+
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    step_id TEXT,
+    skill_name TEXT NOT NULL,
+    execution_mode TEXT NOT NULL DEFAULT 'main_loop',
+    status TEXT NOT NULL DEFAULT 'running',
+    arguments TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT '{}',
+    started_at REAL NOT NULL,
+    ended_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS skill_invocations_task_started
+ON skill_invocations(task_id, started_at);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    step_id TEXT,
+    artifact_type TEXT NOT NULL,
+    name TEXT,
+    uri TEXT,
+    payload TEXT NOT NULL DEFAULT '{}',
+    producer TEXT,
+    verified INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS artifacts_task_created
+ON artifacts(task_id, created_at);

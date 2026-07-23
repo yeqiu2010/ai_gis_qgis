@@ -1,10 +1,15 @@
 ---
 name: main-orchestrator
 description: 主调度与 Skill 路由
-allowed-tools: set_active_skill search_skills list_layers inspect_layer inspect_layers load_layer remove_layer zoom_to_layer export_layer
+version: 3.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+tools: [search_skills, load_skill, unload_skill, list_loaded_skills, inspect_skill, create_plan, revise_plan, get_task_state, update_plan_step, complete_plan_step, register_artifact, finalize_task, invoke_skill, list_layers, inspect_layer, inspect_layers, load_layer, remove_layer, zoom_to_layer, export_layer]
 metadata:
-  version: 2.0.1
-  tags: [orchestration, routing, gis]
+  hermes:
+    tags: [orchestration, routing, gis, multi-skill]
+    requires_tools: [search_skills, load_skill, create_plan, finalize_task]
 ---
 
 # Main Orchestrator
@@ -15,9 +20,9 @@ metadata:
 
 1. 图层管理、图层查看、字段查看、加载数据、缩放、样式、导出等单步操作：直接使用对应图层工具。
 2. 由当前 AI 将用户原始请求与系统提供的可路由 Skill 目录逐项做语义比较。不得使用程序分词结果、关键词计数或相关性分数代替判断。
-3. 内置或用户自定义的专用业务 Skill 完整覆盖任务时，优先调用 `set_active_skill` 切换到该 Skill。专用 Skill 的优先级高于通用 Pipeline。
-4. 没有专用业务 Skill 匹配时，一个主要输入、一个明确标准 GIS 操作的简单任务切换到 `qgis-toolbox`。
-5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务进入 `gis-pipeline`。
+3. 内置或用户自定义的专用业务 Skill 完整覆盖任务时，优先调用 `load_skill` 加载该 Skill。专用 Skill 的优先级高于通用 Pipeline。
+4. 没有专用业务 Skill 匹配时，一个主要输入、一个明确标准 GIS 操作的简单任务加载 `qgis-toolbox`。
+5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务加载 `gis-pipeline`。
 6. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
 
 `search_skills` 只返回未排序的可路由 Skill 卡片，不替 AI 做匹配。需要刷新目录时传入未经改写的用户原始请求；收到结果后由当前 AI 比较每个 `description` 并选择。
@@ -28,7 +33,7 @@ metadata:
 
 ## QGIS Toolbox 简单任务
 
-以下任务只有在单步且参数明确时，才调用 `set_active_skill({"skill_name":"qgis-toolbox"})`：
+以下任务只有在单步且参数明确时，才调用 `load_skill({"skill_name":"qgis-toolbox"})`：
 
 - 缓冲、裁剪、相交、联合、差集、按位置提取。
 - 属性筛选、表达式筛选、字段计算、属性连接、统计汇总。
@@ -43,13 +48,13 @@ metadata:
 - 需要确认字段含义、属性取值、CRS、距离/面积单位或中间结果。
 - 需要复杂 PyQGIS、制图布局、非 Processing 能力或业务逻辑。
 
-未命中专用业务 Skill 的复杂任务，正确第一步是：
+未命中专用业务 Skill 的复杂任务，应先调用 `create_plan`，再加载：
 
 ```json
 {"skill_name": "gis-pipeline"}
 ```
 
-切换后由 `gis-pipeline` 依次完成 `data_overview`、`structured_query`、`solution_plan`、`generated_code`、`execution_result`。
+加载后由 `gis-pipeline` 依次完成 `data_overview`、`structured_query`、`solution_plan`、`generated_code`、`execution_result`。每个真正完成的任务步骤使用 `complete_plan_step` 登记输出，最后调用 `finalize_task`。
 
 ## 图层管理路由
 

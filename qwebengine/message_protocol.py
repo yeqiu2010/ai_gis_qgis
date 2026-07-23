@@ -9,6 +9,8 @@ RPC_METHODS = {
     "createSession",
     "listSessions",
     "getMessages",
+    "getTaskState",
+    "listLoadedSkills",
     "chat",
     "confirmToolCall",
     "cancelRun",

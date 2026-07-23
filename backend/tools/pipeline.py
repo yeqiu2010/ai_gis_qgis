@@ -118,13 +118,33 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
             artifact=artifact,
             summary=summary or None,
         )
-        return {
+        _sync_pipeline_task_state(
+            session_db,
+            session_id,
+            stage_name=stage_name,
+            artifact=artifact,
+        )
+        response = {
             "success": True,
             "stage_name": stage_name,
             "summary": summary,
             "artifact": artifact,
             "message_id": message_id,
         }
+        if stage_name == "generated_code":
+            execution_arguments = {
+                "code": str(artifact.get("code") or ""),
+                "expected_outputs": artifact.get("expected_outputs") or [],
+            }
+            for optional_name in ("delivery_outputs", "timeout_seconds"):
+                if artifact.get(optional_name):
+                    execution_arguments[optional_name] = artifact[optional_name]
+            response["requested_tool_call"] = {
+                "name": "execute_gis_code",
+                "arguments": execution_arguments,
+                "reason": "generated_code 阶段已通过审查，等待用户确认执行。",
+            }
+        return response
 
     return ToolEntry(
         name="record_pipeline_stage",
@@ -275,3 +295,83 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
     ):
         return "execution_result 必须包含真实执行结果：success、stdout、stderr、outputs 或 error。"
     return None
+
+
+def _sync_pipeline_task_state(
+    session_db: SessionDB,
+    session_id: str,
+    *,
+    stage_name: str,
+    artifact: dict[str, Any],
+) -> None:
+    """Represent the legacy five stages as ordinary persisted plan steps."""
+    task = session_db.get_active_task(session_id)
+    if task is None or task.get("status") in {"completed", "failed", "cancelled"}:
+        history = session_db.get_conversation_messages(session_id, limit=12)
+        objective = next(
+            (
+                str(item.get("content") or "").strip()
+                for item in reversed(history)
+                if item.get("role") == "user" and str(item.get("content") or "").strip()
+            ),
+            "完成 GIS Pipeline 分析",
+        )
+        task_id = session_db.create_task(session_id, objective)
+        task = session_db.get_task(task_id)
+    assert task is not None
+    task_id = str(task["id"])
+    steps = session_db.get_plan_steps(task_id)
+    if not steps:
+        session_db.replace_plan_steps(
+            task_id,
+            [
+                {
+                    "id": f"pipeline_{name}",
+                    "position": index,
+                    "skill_name": "gis-pipeline",
+                    "instruction": f"完成 GIS Pipeline 阶段：{name}",
+                    "dependencies": [f"pipeline_{PIPELINE_STAGES[index - 2]}"]
+                    if index > 1
+                    else [],
+                    "status": "pending",
+                    "inputs": {},
+                    "outputs": {},
+                }
+                for index, name in enumerate(PIPELINE_STAGES, start=1)
+            ],
+        )
+        steps = session_db.get_plan_steps(task_id)
+
+    step_id = f"pipeline_{stage_name}"
+    if not any(str(step.get("id")) == step_id for step in steps):
+        # A Coordinator-created business plan may model the Pipeline as one
+        # coarse step. It remains authoritative and is completed after the
+        # confirmed execution result instead of being replaced here.
+        return
+    questions = artifact.get("questions") if stage_name == "structured_query" else []
+    if isinstance(questions, list) and questions:
+        session_db.update_plan_step(
+            task_id,
+            step_id,
+            status="waiting_for_user",
+            outputs={"artifact": artifact},
+        )
+        session_db.update_task(task_id, status="waiting_for_user")
+        return
+    session_db.update_plan_step(
+        task_id,
+        step_id,
+        status="completed",
+        outputs={"artifact": artifact},
+        error="",
+    )
+    session_db.register_artifact(
+        task_id,
+        "pipeline_stage",
+        step_id=step_id,
+        name=stage_name,
+        payload=artifact,
+        producer="gis-pipeline",
+        verified=True,
+    )
+    session_db.update_task(task_id, status="running")

@@ -9,21 +9,45 @@ from .qgis_context import QGISContext
 
 
 class PromptBuilder:
-    def __init__(self, skill_manager: SkillManager | None = None, skills_dir: Path | str | None = None):
+    def __init__(
+        self,
+        skill_manager: SkillManager | None = None,
+        skills_dir: Path | str | list[Path | str] | None = None,
+    ):
         if skill_manager is not None:
             self.skill_manager = skill_manager
         else:
-            default_dir = skills_dir or [
+            default_dir: Path | str | list[Path | str] = skills_dir or [
                 Path(__file__).resolve().parents[2] / "skills",
                 Path.home() / ".qgis_hermes_agent" / "custom_skills",
             ]
             self.skill_manager = SkillManager(default_dir)
 
-    def build(self, active_skill: str, qgis_context: QGISContext) -> str:
+    def build(
+        self,
+        active_skill: str,
+        qgis_context: QGISContext,
+        *,
+        loaded_skills: list[str] | None = None,
+    ) -> str:
         layer_names = ", ".join(layer["name"] for layer in qgis_context.layers) or "无"
-        skill_guidance = self._skill_guidance(active_skill)
-        skill_prompt = self.skill_manager.compose_prompt(active_skill)
-        routing_catalog = self._routing_catalog_prompt() if active_skill == "main-orchestrator" else ""
+        normalized_loaded = self.skill_manager.normalize_loaded_skills(
+            loaded_skills if loaded_skills is not None else [active_skill],
+        )
+        if active_skill not in normalized_loaded and self.skill_manager.get(active_skill):
+            normalized_loaded = self.skill_manager.normalize_loaded_skills(
+                [*normalized_loaded, active_skill]
+            )
+        skill_guidance = self._skill_guidance(active_skill, normalized_loaded)
+        if loaded_skills is None:
+            # Keep the original single-Skill formatting for direct callers.
+            skill_prompt = self.skill_manager.compose_prompt(active_skill)
+        else:
+            skill_prompt = self.skill_manager.compose_loaded_prompt(
+                normalized_loaded,
+                active_skill=active_skill,
+            )
+        routing_catalog = self._routing_catalog_prompt()
         return (
             "你是 Agent，一个运行在 QGIS 桌面插件中的 GIS 助手。"
             "当前已启用基础对话、会话存储、轻量 QGIS 上下文感知和图层管理工具。"
@@ -40,23 +64,28 @@ class PromptBuilder:
             "对于分析、筛选、提取、缓冲、裁剪、叠加等会产生结果的任务，"
             "如果信息已足够，不能把“我将执行/我会使用某方法”作为最终答复；"
             "必须继续调用工具完成任务，或明确说明缺少哪些信息。\n\n"
-            "能力选择遵循 Skill-first：主调度必须由当前 AI 将用户原始请求与可路由 Skill 目录中的"
+            "能力选择遵循 Skill-first：Skill 是按需加载的操作指导文档，Tool 才是实际执行函数；"
+            "加载 Skill 不会创建子 Agent。主调度必须由当前 AI 将用户原始请求与可路由 Skill 目录中的"
             "description 做语义比较，不得依赖程序分词、关键词计数或相关性分数。"
-            "如果某个专用业务 Skill 完整覆盖任务，必须优先切换到该 Skill；"
-            "自定义工具只能由已匹配或已激活的 Skill 声明和调用，不能作为主调度独立路由目标。"
-            "只有没有专用业务 Skill 匹配时，单个明确的标准 GIS 操作才切换到 qgis-toolbox；"
+            "如果某个专用业务 Skill 完整覆盖任务，必须调用 load_skill 按需加载；"
+            "同一任务可以依次加载多个 Skill 并共享计划、参数、QGIS 图层 ID 和产物。"
+            "自定义工具只能由已匹配或已加载的 Skill 声明和调用，不能作为主调度独立路由目标。"
+            "只有没有专用业务 Skill 匹配时，单个明确的标准 GIS 操作才加载 qgis-toolbox；"
             "没有专用业务 Skill 匹配且包含两个及以上步骤、多个输入、CRS/字段推断、"
-            "统计汇总或中间依赖时，才进入 gis-pipeline。"
+            "统计汇总或中间依赖时，才加载 gis-pipeline。"
             "QGIS 算法目录只提供描述、参数和示例；分析统一生成完整脚本并通过 execute_gis_code 一次确认执行。\n\n"
+            "复杂 GIS 执行任务应先调用 create_plan 建立通用计划；完成步骤后调用 complete_plan_step，"
+            "登记输出产物并最终调用 finalize_task。不能仅以自然语言声称任务完成。\n\n"
             "会话具备记忆：用户使用“导出它”“继续”“按刚才的条件”“导出公园地块”等短句时，"
             "必须结合会话记忆、上一轮工具结果和最近对话补全图层、字段、筛选条件和待办事项；"
             "不要重复询问已经由历史工具结果确认过的信息。\n\n"
             "包含多个标准 Processing 步骤且没有专用业务 Skill 匹配的 GIS 分析，"
-            "必须切换到 gis-pipeline 统一规划、检索、生成和审查脚本；"
+            "必须加载 gis-pipeline 统一规划、检索、生成和审查脚本；"
             "不要在 main-orchestrator 中直接调用 execute_gis_code。\n\n"
             "当用户说“加载 <路径> 数据/图层”时，你负责从自然语言中提取真实路径作为 load_layer.source，"
             "source 不应包含“数据”“图层”“加载”等说明性文字。\n\n"
-            f"当前 Skill：{active_skill}\n"
+            f"当前活动 Skill：{active_skill}\n"
+            f"当前已加载 Skills：{', '.join(normalized_loaded) or '无'}\n"
             f"当前工程路径：{qgis_context.project_path or '未保存'}\n"
             f"当前图层数量：{qgis_context.layer_count}\n"
             f"当前图层：{layer_names}\n\n"
@@ -73,12 +102,13 @@ class PromptBuilder:
             "可路由 Skill 目录（未做程序语义排序，由当前 AI 根据用户原始请求选择）："
         ]
         for item in catalog:
-            tags = ", ".join(str(tag) for tag in item.get("tags") or [])
+            raw_tags = item.get("tags")
+            tags = ", ".join(str(tag) for tag in raw_tags) if isinstance(raw_tags, list) else ""
             suffix = f"；tags={tags}" if tags else ""
             lines.append(f"- {item['name']}：{item['description']}{suffix}")
         return "\n".join(lines)
 
-    def _skill_guidance(self, active_skill: str) -> str:
+    def _skill_guidance(self, active_skill: str, loaded_skills: list[str]) -> str:
         if active_skill == "data-manager":
             return (
                 "Data Manager 规则：优先使用图层管理工具处理图层列表、检查、加载、移除、"
@@ -88,19 +118,21 @@ class PromptBuilder:
             )
         if active_skill != "main-orchestrator":
             return (
-                "Active Skill 规则：当前已经完成路由，优先遵循当前 Skill 的专用工作流并继续任务。"
-                "不要因为任务包含多个步骤就改回通用 gis-pipeline；只有当前 Skill 明确要求切换，"
-                "或确认当前 Skill 与用户请求不匹配时，才调用 set_active_skill。"
+                "Loaded Skill 规则：当前已经完成至少一次路由，优先遵循已加载 Skill 的专用工作流并继续任务。"
+                "不要因为任务包含多个步骤就改用通用 gis-pipeline；只有当前 Skill 明确要求，"
+                "或确认现有 Skills 无法覆盖剩余子任务时，才继续调用 load_skill。"
+                f"当前已加载：{', '.join(loaded_skills)}。"
             )
         return (
             "Main Orchestrator 规则：先由当前 AI 对照可路由 Skill 目录进行语义匹配。"
             "专用业务 Skill 的优先级高于 qgis-toolbox、gis-pipeline 和 fast-path；"
             "不得因为任务步骤多就跳过专用 Skill。"
             "只有未匹配专用 Skill，且任务只有一个明确的缓冲、裁剪、筛选、字段计算或栅格操作时，"
-            "调用 set_active_skill 切换到 qgis-toolbox。"
+            "调用 load_skill 加载 qgis-toolbox。兼容旧接口时等价参数为"
+            " set_active_skill({\"skill_name\":\"qgis-toolbox\"})。"
             "只有未匹配专用 Skill，且任务包含两个及以上操作、多个图层、CRS/字段推断、"
             "空间连接或统计汇总时，"
-            "直接切换到 gis-pipeline。"
+            "调用 load_skill 加载 gis-pipeline。"
             "不要直接调用 execute_gis_code。只有简单单步且非工具箱更合适的任务才可进入 fast-path。"
             "调用代码执行前必须只写入 QGIS_AGENT_WORKSPACE，"
             "QGIS_AGENT_WORKSPACE 是 execute_gis_code 执行器注入的运行时变量。"

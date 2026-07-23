@@ -219,7 +219,7 @@ def build_list_layers_tool(qgis_executor=None) -> ToolEntry:
 def build_inspect_layer_tool(qgis_executor=None) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         def operation():
-            layer = _find_layer(arguments.get("layer_id") or arguments.get("layer_name"))
+            layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
             return _inspect_layer(layer, int(arguments.get("sample_limit", 5)))
 
         return _run_qgis(qgis_executor, operation)
@@ -365,7 +365,7 @@ def build_remove_layer_tool(
 ) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         def operation():
-            layer = _find_layer(arguments.get("layer_id") or arguments.get("layer_name"))
+            layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
             summary = _layer_summary(layer)
             _snapshot(session_db, session_id, layer, "removed")
             _project().removeMapLayer(layer.id())
@@ -397,7 +397,7 @@ def build_zoom_to_layer_tool(iface=None, qgis_executor=None) -> ToolEntry:
         def operation():
             if iface is None:
                 raise RuntimeError("当前没有 QGIS iface，无法控制地图画布。")
-            layer = _find_layer(arguments.get("layer_id") or arguments.get("layer_name"))
+            layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
             canvas = iface.mapCanvas()
             canvas.setExtent(layer.extent())
             canvas.refresh()
@@ -428,7 +428,7 @@ def build_set_style_tool(
 ) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         def operation():
-            layer = _find_layer(arguments.get("layer_id") or arguments.get("layer_name"))
+            layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
             qml_path = str(arguments.get("qml_path") or "").strip()
             if not qml_path:
                 raise ValueError("当前 set_style 仅支持 qml_path。")
@@ -478,7 +478,7 @@ def build_export_layer_tool(
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         def operation():
             classes = _qgis_classes()
-            layer = _find_layer(arguments.get("layer_id") or arguments.get("layer_name"))
+            layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
             output_path = str(arguments.get("output_path") or "").strip()
             if not output_path:
                 raise ValueError("必须提供 output_path。")

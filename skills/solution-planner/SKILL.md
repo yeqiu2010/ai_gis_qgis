@@ -7,7 +7,12 @@ tools:
   - get_qgis_processing_tool
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, plan]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, plan]
+    requires_tools: [search_qgis_processing_tools, get_qgis_processing_tool, record_pipeline_stage]
 ---
 
 # Solution Planner

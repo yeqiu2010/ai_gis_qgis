@@ -1,3 +1,22 @@
+---
+name: data-manager
+description: 安全、可审计地管理 QGIS 图层、样式与导出
+version: 1.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+tools: [list_layers, inspect_layer, inspect_layers, load_layer, remove_layer, zoom_to_layer, set_style, export_layer]
+metadata:
+  hermes:
+    tags: [gis, data-management, layers]
+  qgis_agent:
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+---
+
 # Data Manager
 
 你负责安全、可审计的 QGIS 图层和文件管理。

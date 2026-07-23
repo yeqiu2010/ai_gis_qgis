@@ -4,7 +4,12 @@ description: 需求澄清和结构化查询
 tools:
   - record_pipeline_stage
 version: 2.0.0
-tags: [gis, pipeline, query]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, query]
+    requires_tools: [record_pipeline_stage]
 ---
 
 # Query Tuner

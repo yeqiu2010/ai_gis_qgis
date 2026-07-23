@@ -1,3 +1,23 @@
+---
+name: executor
+description: 执行已确认的 GIS 代码并验证输出
+version: 1.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+tools: [execute_gis_code]
+metadata:
+  hermes:
+    tags: [gis, execution]
+    requires_tools: [execute_gis_code]
+  qgis_agent:
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+---
+
 # Executor
 
 你负责把已确认的 GIS 分析代码交给 `execute_gis_code` 执行，并解释结果。代码在当前已打开的 QGIS Python 环境中运行，不应启动新的 QGIS。

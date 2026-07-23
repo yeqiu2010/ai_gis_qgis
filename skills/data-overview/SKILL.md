@@ -7,7 +7,12 @@ tools:
   - get_task_context
   - record_pipeline_stage
 version: 1.0.0
-tags: [gis, pipeline, data]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, data]
+    requires_tools: [list_layers, inspect_layer, record_pipeline_stage]
 ---
 
 # Data Overview

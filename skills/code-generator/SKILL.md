@@ -4,7 +4,12 @@ description: 生成 QGIS 当前环境可执行代码
 tools:
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, code]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, code]
+    requires_tools: [record_pipeline_stage]
 ---
 
 # Code Generator

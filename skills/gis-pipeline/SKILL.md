@@ -19,7 +19,28 @@ includes:
   - code-reviewer
   - executor
 version: 2.1.0
-tags: [gis, pipeline]
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [gis, pipeline]
+    related_skills: [data-overview, query-tuner, solution-planner, code-generator, code-reviewer, executor]
+    requires_tools: [list_layers, inspect_layers, search_qgis_processing_tools, record_pipeline_stage, execute_gis_code]
+  qgis_agent:
+    inputs:
+      required:
+        objective: {type: string}
+    outputs:
+      execution_outputs: {type: array}
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+    completion:
+      required_artifacts: [execution_outputs]
+      checks: [pipeline_stages_complete, expected_outputs_exist]
 ---
 
 # GIS Pipeline
@@ -44,7 +65,8 @@ tags: [gis, pipeline]
 - `structured_query` 完成前不得搜索算法；必须先产出每个操作的标准 GIS 术语。
 - `solution_plan` 中只调用一次 `search_qgis_processing_tools`，用 `queries` 覆盖全部操作；随后只调用一次 `get_qgis_processing_tool` 批量读取候选详情。
 - 不得调用或假设存在 `run_qgis_processing`。所有步骤必须组合进一份脚本，审查通过后只调用一次 `execute_gis_code`。
-- 进入本 Skill 后不得切换到其他 Skill；domain 检索结果只是算法候选，不是切换 Skill 的指令。
+- 当前 Pipeline 计划步骤执行期间不得用其他 Skill 替代其中阶段；该步骤完成后，Coordinator
+  可以继续加载后续任务所需的其他 Skill。domain 检索结果只是算法候选，不是切换 Skill 的指令。
 - `record_pipeline_stage` 由服务端严格校验顺序。返回 `success=false` 时根据
   `expected_stage` 补齐当前阶段，不得跳到最终回复。
 - 不要重复 `completed_stages` 中已经完成的数据盘点或结构化需求。阶段失败时只修正

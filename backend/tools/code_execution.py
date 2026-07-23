@@ -60,6 +60,7 @@ def build_execute_gis_code_tool(
         executor = QGISCodeExecutor(executor_config)
         use_current_qgis = qgis_executor is not None and executor.execution_mode == "current_qgis"
         if use_current_qgis:
+            assert qgis_executor is not None
             result = qgis_executor(
                 lambda: executor.execute_current_qgis(
                     code=code,

@@ -2,7 +2,7 @@
 name: qgis-toolbox
 description: QGIS Processing 算法知识检索与简单单步 GIS 任务
 tools:
-  - set_active_skill
+  - load_skill
   - list_layers
   - inspect_layer
   - inspect_layers
@@ -14,8 +14,21 @@ includes:
   - code-generator
   - code-reviewer
   - executor
-version: 2.0.0
-tags: [qgis, processing, toolbox]
+version: 3.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [qgis, processing, toolbox]
+    related_skills: [gis-pipeline]
+    requires_tools: [inspect_layers, search_qgis_processing_tools, get_qgis_processing_tool, execute_gis_code]
+  qgis_agent:
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
 ---
 
 # QGIS Toolbox
@@ -76,7 +89,7 @@ tags: [qgis, processing, toolbox]
 
 ## 路由门禁
 
-出现以下任一情况，立即调用 `set_active_skill({"skill_name":"gis-pipeline"})`：
+出现以下任一情况，立即调用 `load_skill({"skill_name":"gis-pipeline"})`，保留当前已经确认的图层和参数：
 
 - 需要两个及以上 Processing 算法。
 - 同时包含属性筛选与空间分析。
