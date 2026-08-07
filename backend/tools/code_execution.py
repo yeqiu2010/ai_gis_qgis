@@ -15,7 +15,15 @@ from .registry import ToolEntry
 VECTOR_OUTPUT_EXTENSIONS = {".shp", ".gpkg", ".geojson", ".kml"}
 RASTER_OUTPUT_EXTENSIONS = {".tif", ".tiff"}
 TABLE_OUTPUT_EXTENSIONS = {".csv", ".xlsx", ".dbf"}
-FILE_OUTPUT_EXTENSIONS = {".txt", ".json", ".html", ".md", ".pdf", ".png"}
+FILE_OUTPUT_EXTENSIONS = {
+    ".txt",
+    ".json",
+    ".html",
+    ".md",
+    ".pdf",
+    ".png",
+    ".qml",
+}
 OUTPUT_HINTS = ("output", "result", "save", "export", "write", "输出", "结果")
 SHAPEFILE_SIDECAR_EXTENSIONS = {
     ".shp",
@@ -135,8 +143,10 @@ def build_execute_gis_code_tool(
         name="execute_gis_code",
         description=(
             "在当前已打开的 QGIS Python 环境中执行生成的 GIS 代码。"
-            "每个用户任务只用于生成最终文件，不得用于字段唯一值探查或仅打印诊断信息。"
-            "代码只能通过文件产出结果，工具会加载 vector/raster 输出到当前 QGIS 工程。"
+            "用户要求生成或导出文件时，代码必须创建对应 expected_outputs；"
+            "仅需统计结论或调整当前图层样式时可以不提供 expected_outputs，"
+            "分别通过 stdout 返回最终结论或直接更新 QGIS 图层渲染状态。"
+            "不得用于字段唯一值探查或为后续代码生成而执行诊断脚本。"
         ),
         parameters={
             "type": "object",
@@ -144,7 +154,8 @@ def build_execute_gis_code_tool(
                 "code": {
                     "type": "string",
                     "description": (
-                        "要执行的 Python 代码。必须把输出写入 QGIS_AGENT_WORKSPACE，"
+                        "要执行的 Python 代码。需要创建文件时必须写入 QGIS_AGENT_WORKSPACE；"
+                        "无文件任务必须通过 stdout 给出最终结论或完成用户要求的当前图层样式调整。"
                         "不得访问网络，不得调用 subprocess/os.system/eval/exec，"
                         "不得创建 QgsApplication/QApplication 或初始化新的 QGIS。"
                     ),
@@ -152,7 +163,9 @@ def build_execute_gis_code_tool(
                 "expected_outputs": {
                     "type": "array",
                     "description": (
-                        "预期输出文件。path 必须是相对路径或工作目录内路径。"
+                        "可选的预期输出文件。path 必须是相对路径或工作目录内路径。"
+                        "用户只要求统计结论或调整当前图层样式时可省略或传空数组；"
+                        "用户要求生成/导出文件时必须完整列出。"
                         "如果用户要求导出到外部目录，请代码仍输出到工作目录，并使用 delivery_outputs 指定外部目标。"
                     ),
                     "items": {
@@ -169,7 +182,6 @@ def build_execute_gis_code_tool(
                         "required": ["path", "name", "type"],
                         "additionalProperties": False,
                     },
-                    "minItems": 1,
                 },
                 "delivery_outputs": {
                     "type": "array",
@@ -191,7 +203,7 @@ def build_execute_gis_code_tool(
                     "maximum": 3600,
                 },
             },
-            "required": ["code", "expected_outputs"],
+            "required": ["code"],
             "additionalProperties": False,
         },
         handler=handler,
@@ -279,6 +291,18 @@ def find_unwritten_expected_outputs(
                 written.update(_path_names_from_expression(node.args[1], assignments))
         elif func_name.endswith(("exportToImage", "exportToPdf")) and node.args:
             written.update(_path_names_from_expression(node.args[0], assignments))
+        elif func_name.endswith(("saveNamedStyle", "saveSldStyle")):
+            # QgsMapLayer persists QGIS styles through these APIs rather than
+            # Python's open()/Path.write_* sinks.  Treat the URI argument as a
+            # file write so declared .qml outputs pass the static contract;
+            # the executor still verifies that the file actually exists.
+            output_arg = _call_argument(
+                node,
+                position=0,
+                keyword_names={"uri", "path", "fileName", "filename"},
+            )
+            if output_arg is not None:
+                written.update(_path_names_from_expression(output_arg, assignments))
 
     missing = []
     for output in expected_outputs:
@@ -352,6 +376,14 @@ def find_generated_code_issues(code: str) -> list[str]:
             if module in {"PyQt5", "PyQt6"} or module.startswith(("PyQt5.", "PyQt6.")):
                 _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
     assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    color_ramp_shader_names = _assigned_constructor_names(
+        assignments,
+        "QgsColorRampShader",
+    )
+    pseudo_color_renderer_names = _assigned_constructor_names(
+        assignments,
+        "QgsSingleBandPseudoColorRenderer",
+    )
     for node in assignments:
         if not _processing_call_writes_file(node.value):
             continue
@@ -386,6 +418,13 @@ def find_generated_code_issues(code: str) -> list[str]:
         _append_issue(issues, "使用了 os 但没有 import os；输出路径应优先使用 Path(QGIS_AGENT_WORKSPACE)")
 
     for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            _check_raster_shader_call(
+                node,
+                color_ramp_shader_names=color_ramp_shader_names,
+                pseudo_color_renderer_names=pseudo_color_renderer_names,
+                issues=issues,
+            )
         if isinstance(node, ast.Attribute):
             if (
                 isinstance(node.value, ast.Name)
@@ -747,6 +786,87 @@ def _attribute_chain_contains(node: ast.AST, name: str) -> bool:
     return False
 
 
+def _assigned_constructor_names(
+    assignments: list[ast.Assign],
+    constructor_name: str,
+) -> set[str]:
+    """Return simple variables which hold instances of a known constructor."""
+    names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            if not _is_constructor_instance(
+                assignment.value,
+                constructor_name=constructor_name,
+                assigned_names=names,
+            ):
+                continue
+            for target in assignment.targets:
+                if isinstance(target, ast.Name) and target.id not in names:
+                    names.add(target.id)
+                    changed = True
+    return names
+
+
+def _is_constructor_instance(
+    node: ast.AST,
+    *,
+    constructor_name: str,
+    assigned_names: set[str],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in assigned_names
+    if not isinstance(node, ast.Call):
+        return False
+    call_name = _call_name(node.func)
+    return call_name == constructor_name or call_name.endswith(f".{constructor_name}")
+
+
+def _check_raster_shader_call(
+    node: ast.Call,
+    *,
+    color_ramp_shader_names: set[str],
+    pseudo_color_renderer_names: set[str],
+    issues: list[str],
+) -> None:
+    """Reject passing QgsColorRampShader where QgsRasterShader is required."""
+    call_name = _call_name(node.func)
+    shader_argument: ast.AST | None = None
+    if call_name == "QgsSingleBandPseudoColorRenderer" or call_name.endswith(
+        ".QgsSingleBandPseudoColorRenderer"
+    ):
+        shader_argument = _call_argument(
+            node,
+            position=2,
+            keyword_names={"shader"},
+        )
+    elif (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "setShader"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in pseudo_color_renderer_names
+    ):
+        shader_argument = _call_argument(
+            node,
+            position=0,
+            keyword_names={"shader"},
+        )
+    if shader_argument is None or not _is_constructor_instance(
+        shader_argument,
+        constructor_name="QgsColorRampShader",
+        assigned_names=color_ramp_shader_names,
+    ):
+        return
+    _append_issue(
+        issues,
+        "QgsSingleBandPseudoColorRenderer 需要 QgsRasterShader，不能直接传入 "
+        "QgsColorRampShader；必须先创建 QgsRasterShader，调用 "
+        "raster_shader.setRasterShaderFunction(color_ramp_shader)，再把 "
+        "raster_shader 传给构造器或 setShader",
+    )
+
+
 def _append_issue(issues: list[str], issue: str) -> None:
     if issue not in issues:
         issues.append(issue)
@@ -781,6 +901,21 @@ def _call_name(node: ast.AST) -> str:
 def _literal_string(node: ast.AST | None) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    return None
+
+
+def _call_argument(
+    node: ast.Call,
+    *,
+    position: int,
+    keyword_names: set[str],
+) -> ast.AST | None:
+    """Return a positional or named argument from a generated-code call."""
+    if len(node.args) > position:
+        return node.args[position]
+    for keyword in node.keywords:
+        if keyword.arg in keyword_names:
+            return keyword.value
     return None
 
 

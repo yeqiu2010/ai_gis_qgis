@@ -266,8 +266,8 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
     if stage_name == "generated_code":
         if not str(artifact.get("code") or "").strip():
             return "generated_code 阶段缺少非空 code。"
-        if not isinstance(artifact.get("expected_outputs"), list) or not artifact["expected_outputs"]:
-            return "generated_code 阶段缺少 expected_outputs。"
+        if not isinstance(artifact.get("expected_outputs"), list):
+            return "generated_code 阶段缺少 expected_outputs 列表；无文件结果时应传空数组。"
         review = artifact.get("review")
         if not isinstance(review, dict):
             return "generated_code 阶段缺少 review。"

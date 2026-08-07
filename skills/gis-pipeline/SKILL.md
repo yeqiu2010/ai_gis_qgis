@@ -60,7 +60,7 @@ metadata:
 - 不允许在 `data_overview`、`structured_query`、`solution_plan`、`generated_code` 四个阶段完成之前调用 `execute_gis_code`。
 - 每个阶段完成后必须调用一次 `record_pipeline_stage`。
 - `generated_code` 阶段 artifact 必须包含 `code`、`expected_outputs`、`dependencies`、`assumptions`、`summary`、`review`。
-- `review.passed` 为 false、`expected_outputs` 为空、字段/CRS/输出文件不明确时，不得调用 `execute_gis_code`。
+- `review.passed` 为 false，或用户要求的字段/CRS/输出文件不明确时，不得调用 `execute_gis_code`。仅需 stdout 最终结论或直接调整当前图层样式的任务允许 `expected_outputs=[]`；用户要求生成/导出文件时仍不得为空。
 - 复杂任务不要跳过图层检查；涉及多个图层时优先一次调用 `inspect_layers`，至少检查主要输入图层的字段、CRS、几何类型和样例，避免连续多次调用 `inspect_layer`。
 - `structured_query` 完成前不得搜索算法；必须先产出每个操作的标准 GIS 术语。
 - `solution_plan` 中只调用一次 `search_qgis_processing_tools`，用 `queries` 覆盖全部操作；随后只调用一次 `get_qgis_processing_tool` 批量读取候选详情。

@@ -140,6 +140,7 @@ class PromptBuilder:
             "不要询问保存文件夹。"
             "代码会在当前已打开的 QGIS Python 环境中执行，不能创建 QgsApplication/QApplication，"
             "不能初始化或启动新的 QGIS。"
-            "expected_outputs 必须列出每个输出文件，vector/raster 输出会自动加载到 QGIS。"
-            "不要让代码直接修改父进程 QGIS 工程。"
+            "用户要求生成/导出文件时，expected_outputs 必须列出每个输出文件，vector/raster 输出会自动加载到 QGIS。"
+            "仅需 stdout 最终统计结论或直接调整当前图层样式时，expected_outputs 可以为空。"
+            "不得让代码做用户未要求的源数据修改；用户明确要求的 renderer/样式调整可以作用于当前图层并触发重绘。"
         )

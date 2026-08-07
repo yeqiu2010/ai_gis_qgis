@@ -92,9 +92,6 @@ class SandboxPolicy:
                 self._validate_call(node)
 
     def normalize_expected_outputs(self, values: list[dict[str, Any]]) -> list[ExpectedOutput]:
-        if not values:
-            raise ValueError("必须提供 expected_outputs，代码执行结果需要明确输出文件。")
-
         outputs = []
         for index, raw in enumerate(values, start=1):
             raw_path = str(raw.get("path") or "").strip()

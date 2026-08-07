@@ -26,6 +26,7 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
             "参数名是 JOIN",
             "isGeosEmpty",
             "InvalidGeometryCheck",
+            "QgsColorRampShader",
         )
     ):
         return _result("generated_code_api", "生成代码命中了已知的 PyQGIS API 误用模式。", False)
@@ -86,6 +87,16 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
         return _result(
             "generated_code_api",
             "生成代码把 Qgis.InvalidGeometryCheck 枚举错误地写在 QgsProcessingContext 下。",
+            False,
+        )
+    if (
+        "qgssinglebandpseudocolorrenderer" in text
+        and "qgscolorrampshader" in text
+        and "unexpected type" in text
+    ):
+        return _result(
+            "generated_code_api",
+            "生成代码把 QgsColorRampShader 直接传给了需要 QgsRasterShader 的伪彩色渲染器。",
             False,
         )
     if "syntaxerror" in text:

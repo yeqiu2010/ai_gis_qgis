@@ -66,7 +66,7 @@ metadata:
 - 用户要求“导出/生成”新的分析结果但没有提供目录时，不要追问保存文件夹；默认交给 `execute_gis_code` 输出到 `QGIS_AGENT_WORKSPACE` 并加载到 QGIS。
 - 只有用户明确要求把已有图层导出到某个外部目录时，才使用 `export_layer` 并要求 `output_path`。
 - 用户要求缩放到某图层时，使用 `zoom_to_layer`；如果图层名不明确，先用 `list_layers` 或询问用户。
-- 用户要求设置样式时，当前只支持 QML 文件，缺少 `qml_path` 时先询问。
+- 用户提供现有 QML 文件时使用 `set_style`。用户给出符号系统、色带或分类参数并要求直接调整当前图层时，进入代码执行路径更新 renderer，不要求额外提供 QML，也不强制生成文件。
 
 ## execute_gis_code 限制
 
@@ -74,16 +74,15 @@ metadata:
 
 所有代码执行都必须满足：
 
-- 输入图层、字段、距离/单位和输出文件已明确。
-- 输出写入 `QGIS_AGENT_WORKSPACE`。
-- 用户未指定文件名时，基于任务生成合理默认文件名，例如 `park_parcels.geojson`、`buffer_result.gpkg`、`clip_result.gpkg`；不要询问保存文件夹。
-- `expected_outputs` 列出每个输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
+- 输入图层以及任务所需的字段、距离和单位已明确。
+- 用户要求生成/导出文件时，输出写入 `QGIS_AGENT_WORKSPACE`；未指定文件名时生成合理默认文件名，不要询问保存文件夹。
+- 有文件结果时 `expected_outputs` 列出每个输出，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。仅需 stdout 最终统计结论或直接调整当前图层样式时使用空数组。
 - 不创建 `QgsApplication`、`QApplication`，不调用 `initQgis`，不启动新的 QGIS。
 - 不生成网络访问、`subprocess`、`os.system`、`eval`、`exec`、删除文件或写工作目录外路径。
 - 任一输入图层超过 10 万要素时必须进入 `gis-pipeline`，不得使用简单 fast-path。
 - 大数据空间分析必须检查空间索引，避免逐要素嵌套循环，并优先输出 GeoPackage。
 - 自动重试遇到空几何或无效几何时必须排除对应要素；除非用户明确要求修复数据，不得运行 `fixgeometries` 或创建修复副本。
-- `execute_gis_code` 只用于生成用户要求的最终结果，不得用于字段唯一值探查或仅打印诊断信息；用户已明确图层、字段和筛选值时应直接进入最终筛选。
+- `execute_gis_code` 只用于完成用户要求的最终结果，不得用于字段唯一值探查或仅打印供下一步使用的诊断信息；stdout 本身就是用户所需统计结论时可以直接打印且不创建文件。
 
 ## 回复规则
 
