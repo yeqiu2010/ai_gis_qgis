@@ -89,6 +89,12 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
             "生成代码把 Qgis.InvalidGeometryCheck 枚举错误地写在 QgsProcessingContext 下。",
             False,
         )
+    if "qeventloop" in text and "allevents" in text and "has no attribute" in text:
+        return _result(
+            "executor_qt_compatibility",
+            "执行器使用了 Qt5 的事件循环枚举路径，但当前 QGIS 运行在 Qt6。",
+            False,
+        )
     if (
         "qgssinglebandpseudocolorrenderer" in text
         and "qgscolorrampshader" in text

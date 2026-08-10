@@ -9,7 +9,10 @@ from pathlib import Path
 from ai_gis_qgis.backend.agent_core import AgentCore
 from ai_gis_qgis.backend.context.prompt_builder import PromptBuilder
 from ai_gis_qgis.backend.context.qgis_context import QGISContext
-from ai_gis_qgis.backend.executor.qgis_executor import QGISCodeExecutor
+from ai_gis_qgis.backend.executor.qgis_executor import (
+    QGISCodeExecutor,
+    _process_qt_events,
+)
 from ai_gis_qgis.backend.failure_analysis import classify_failure
 from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
@@ -861,7 +864,11 @@ def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tm
     fake_qgis_core.Qgis = FakeQgis
     fake_qt_core = types.ModuleType("qgis.PyQt.QtCore")
     fake_qt_core.QCoreApplication = FakeCoreApplication
-    fake_qt_core.QEventLoop = type("QEventLoop", (), {"AllEvents": 0})
+    fake_qt_core.QEventLoop = type(
+        "QEventLoop",
+        (),
+        {"ProcessEventsFlag": type("ProcessEventsFlag", (), {"AllEvents": "qt6-all"})},
+    )
     monkeypatch.setitem(sys.modules, "processing", fake_processing)
     monkeypatch.setitem(sys.modules, "qgis.core", fake_qgis_core)
     monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", fake_qt_core)
@@ -873,11 +880,12 @@ def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tm
 
     assert fake_processing.run is original_run
     assert calls == [("progress", 25)]
-    assert len(event_pumps) == 1
+    assert event_pumps == [("qt6-all", 25)]
 
 
 def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Path):
     received_feedback = []
+    event_pumps = []
 
     class FakeFeedback:
         def __init__(self):
@@ -892,7 +900,7 @@ def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Pa
     class FakeCoreApplication:
         @staticmethod
         def processEvents(*args):
-            pass
+            event_pumps.append(args)
 
     class FakeProcessingContext:
         def setInvalidGeometryCheck(self, value):
@@ -928,6 +936,33 @@ def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Pa
 
     assert received_feedback[0] is not explicit_feedback
     assert explicit_feedback.progress == [50]
+    assert event_pumps == [(0, 25)]
+
+
+def test_classifies_qt6_event_loop_enum_failure_as_executor_bug():
+    failure = classify_failure(
+        "AttributeError: type object 'QEventLoop' has no attribute 'AllEvents'"
+    )
+
+    assert failure["error_code"] == "executor_qt_compatibility"
+    assert failure["retryable"] is False
+
+
+def test_qt_event_pump_falls_back_when_binding_rejects_flag_overload():
+    calls = []
+
+    class FakeCoreApplication:
+        @staticmethod
+        def processEvents(*args):
+            calls.append(args)
+            if args:
+                raise TypeError("unsupported overload")
+
+    fake_event_loop = type("QEventLoop", (), {"AllEvents": 0})
+
+    _process_qt_events(FakeCoreApplication, fake_event_loop)
+
+    assert calls == [(0, 25), ()]
 
 
 def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):

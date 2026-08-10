@@ -272,7 +272,7 @@ class QGISCodeExecutor:
                 now = time.monotonic()
                 if now - self._last_pump >= 0.05:
                     self._last_pump = now
-                    QCoreApplication.processEvents(QEventLoop.AllEvents, 25)
+                    _process_qt_events(QCoreApplication, QEventLoop)
 
             def isCanceled(self):  # noqa: N802 - QGIS API name
                 return super().isCanceled() or (
@@ -387,3 +387,25 @@ class QGISCodeExecutor:
                 }
             )
         return outputs
+
+
+def _process_qt_events(qcore_application, qevent_loop) -> None:
+    """Pump pending UI events across Qt5 and Qt6 PyQt enum layouts.
+
+    Event pumping is only a responsiveness enhancement. A binding-level enum
+    or overload difference must not abort the underlying Processing algorithm.
+    """
+    all_events = getattr(qevent_loop, "AllEvents", None)
+    if all_events is None:
+        process_events_flag = getattr(qevent_loop, "ProcessEventsFlag", None)
+        all_events = getattr(process_events_flag, "AllEvents", None)
+    try:
+        if all_events is None:
+            qcore_application.processEvents()
+        else:
+            qcore_application.processEvents(all_events, 25)
+    except (AttributeError, TypeError):
+        try:
+            qcore_application.processEvents()
+        except (AttributeError, TypeError):
+            return
