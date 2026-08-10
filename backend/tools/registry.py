@@ -56,16 +56,25 @@ class ToolRegistry:
             raise KeyError(f"Tool not registered: {name}")
         return self._tools[name]
 
+    def tool_names(self) -> set[str]:
+        return set(self._tools)
+
+    def toolsets(self) -> set[str]:
+        return {entry.toolset for entry in self._tools.values()}
+
     def definitions_for_skill(self, skill_name: str) -> list[dict[str, Any]]:
-        allowed = self._skill_tools.get(skill_name)
-        if allowed is None:
+        return self.definitions_for_skills([skill_name])
+
+    def definitions_for_skills(self, skill_names: list[str]) -> list[dict[str, Any]]:
+        """Return the controlled union for all progressively loaded Skills."""
+        configured = [self._skill_tools[name] for name in skill_names if name in self._skill_tools]
+        if not configured:
             return [entry.definition() for entry in self._tools.values()]
-        allowed = set(allowed)
-        allowed.add("set_active_skill")
+        allowed: set[str] = set().union(*configured)
         return [
             entry.definition()
             for entry in self._tools.values()
-            if entry.name in allowed
+            if entry.name in allowed or entry.category in {"skill", "planning", "delegation"}
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], int]:

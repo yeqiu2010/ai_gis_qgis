@@ -1,11 +1,38 @@
 ---
 name: generate-land-cover-map
 description: 使用 QGIS 从分类遥感影像、土地覆盖栅格或带分类字段的矢量数据生成土地覆盖专题图，并可先按行政区、研究区、规划范围等面图层裁剪再制图。适用于土地利用/土地覆盖制图、分类结果配色、LULC 地图、地类图例、打印布局，以及“用武汉/wuhan边界裁剪CLCD后制作专题图”“按某范围裁剪土地覆盖影像并制图”等请求；即使请求同时包含裁剪和制图，也应优先使用本 Skill 而不是 gis-pipeline。支持全图默认范围、可选裁剪范围、内置九类配色或用户自定义类别—名称—颜色映射，并创建含标题、图例、指南针、比例尺的 QGIS 布局及 PNG/PDF 成图。
-allowed-tools: list_layers inspect_layers inspect_land_cover_map_inputs get_task_context generate_land_cover_map
+tools: [list_layers, inspect_layers, inspect_land_cover_map_inputs, get_task_context, generate_land_cover_map]
+version: 1.3.0
+lifecycle: one-shot
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
 metadata:
-  version: 1.3.0
-  lifecycle: one-shot
-  tags: [land-cover, lulc, thematic-map, raster, vector, layout, qgis]
+  hermes:
+    tags: [land-cover, lulc, thematic-map, raster, vector, layout, qgis]
+    requires_tools: [list_layers, inspect_layers, inspect_land_cover_map_inputs, generate_land_cover_map]
+  qgis_agent:
+    inputs:
+      required:
+        input_layer_id: {type: qgis_layer}
+        source_type: {type: enum}
+      optional:
+        boundary_layer_id: {type: qgis_vector_layer, geometry: [Polygon, MultiPolygon]}
+        classification_field: {type: field_name}
+        raster_band: {type: integer}
+        class_mapping: {type: array}
+    outputs:
+      map_png: {type: file}
+      map_pdf: {type: file}
+      layout: {type: qgis_layout}
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+    completion:
+      required_artifacts: [map_png, map_pdf, layout]
+      checks: [output_files_exist, layout_exists]
 ---
 
 # 土地覆盖专题图

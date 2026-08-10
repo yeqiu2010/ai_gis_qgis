@@ -7,7 +7,12 @@ tools:
   - get_qgis_processing_tool
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, plan]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, plan]
+    requires_tools: [search_qgis_processing_tools, get_qgis_processing_tool, record_pipeline_stage]
 ---
 
 # Solution Planner
@@ -20,7 +25,7 @@ tags: [gis, pipeline, plan]
 - `algorithms`：使用的 QGIS Processing 算法 ID，例如 `native:extractbyexpression`、`native:buffer`、`native:extractbylocation`。
 - `crs_strategy`：距离/面积任务的 CRS 策略。
 - `intermediate_outputs`：中间结果，建议使用内存结果或工作目录临时文件。
-- `final_outputs`：最终输出，必须与用户要求文件名和 `expected_outputs` 一致。
+- `final_outputs`：最终文件输出，必须与用户要求文件名和 `expected_outputs` 一致；无文件统计或直接样式调整任务可为空，并明确 stdout 结论或工程状态变化。
 - `risks`：字段缺失、字段取值不确定、CRS 单位、空结果、Shapefile 字段名限制等。
 - `fallbacks`：字段或取值不匹配时的回退策略。
 - `summary`：可执行方案摘要。
@@ -35,7 +40,7 @@ tags: [gis, pipeline, plan]
 - 先完成全部步骤规划，再只调用一次 `search_qgis_processing_tools`；禁止按步骤反复搜索。
 - 用一次 `get_qgis_processing_tool.tool_ids` 批量读取候选详情。未读取详情的算法不得进入最终方案。
 - 本阶段只选择算法，不执行 Processing。
-- 最终输出文件必须在 `final_outputs` 中列出，例如 `500m.shp`。
+- 用户要求的最终输出文件必须在 `final_outputs` 中列出，例如 `500m.shp`；仅需最终统计结论或当前图层样式变化时可以不规划文件。
 - 如果“政府办公”“公园”等业务概念无法通过字段或样例判断，应在 `risks` 中说明，并优先使用 `inspect_layer` 结果中的真实字段和值。
 - 如果风险不可接受，先询问用户，不继续生成代码。
 - 方案包含字段计算时，必须在步骤输出和 `output_schema` 中显式声明派生字段类型。密度、覆盖率、比例、均值、面积、长度和高度等小数结果使用 Double；已有同名字段时把类型冲突列入 `risks`，并规划字段重构或新建正确类型字段，不能规划为扩大字符串长度。

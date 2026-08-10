@@ -593,6 +593,350 @@ class SessionDB:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         return path
 
+    def create_task(
+        self,
+        session_id: str,
+        objective: str,
+        *,
+        status: str = "draft",
+        task_id: str | None = None,
+    ) -> str:
+        task_id = task_id or str(uuid.uuid4())
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO task_runs(
+                    id, session_id, objective, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, session_id, objective, status, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO state_meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"{session_id}:active_task", task_id),
+            )
+        return task_id
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (task_id,)
+            ).fetchone()
+        return self._decode_task_row(row) if row else None
+
+    def get_active_task(self, session_id: str) -> dict[str, Any] | None:
+        task_id = self.get_state(f"{session_id}:active_task")
+        if task_id:
+            task = self.get_task(task_id)
+            if task is not None:
+                return task
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM task_runs
+                WHERE session_id = ? AND status IN (
+                    'draft', 'running', 'waiting_for_user', 'waiting_confirmation'
+                )
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        task = self._decode_task_row(row)
+        self.set_state(f"{session_id}:active_task", str(task["id"]))
+        return task
+
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        objective: str | None = None,
+        summary: str | None = None,
+        finalization: dict[str, Any] | None = None,
+        increment_plan_version: bool = False,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        parameters: list[Any] = [time.time()]
+        if status is not None:
+            assignments.append("status = ?")
+            parameters.append(status)
+            if status in {"completed", "failed", "cancelled"}:
+                assignments.append("completed_at = ?")
+                parameters.append(time.time())
+        if objective is not None:
+            assignments.append("objective = ?")
+            parameters.append(objective)
+        if summary is not None:
+            assignments.append("summary = ?")
+            parameters.append(summary)
+        if finalization is not None:
+            assignments.append("finalization_json = ?")
+            parameters.append(json.dumps(finalization, ensure_ascii=False))
+        if increment_plan_version:
+            assignments.append("plan_version = plan_version + 1")
+        parameters.append(task_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                f"UPDATE task_runs SET {', '.join(assignments)} WHERE id = ?",
+                parameters,
+            )
+
+    def replace_plan_steps(self, task_id: str, steps: list[dict[str, Any]]) -> None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM plan_steps WHERE task_id = ?", (task_id,))
+            for position, step in enumerate(steps, start=1):
+                connection.execute(
+                    """
+                    INSERT INTO plan_steps(
+                        id, task_id, position, skill_name, instruction, dependencies,
+                        status, inputs, outputs, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(step["id"]),
+                        task_id,
+                        int(step.get("position") or position),
+                        str(step.get("skill_name") or "") or None,
+                        str(step.get("instruction") or ""),
+                        json.dumps(step.get("dependencies") or [], ensure_ascii=False),
+                        str(step.get("status") or "pending"),
+                        json.dumps(step.get("inputs") or {}, ensure_ascii=False),
+                        json.dumps(step.get("outputs") or {}, ensure_ascii=False),
+                        str(step.get("error") or "") or None,
+                        now,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE task_runs
+                SET status = 'running', plan_version = plan_version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, task_id),
+            )
+
+    def get_plan_steps(self, task_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM plan_steps WHERE task_id = ? ORDER BY position, id",
+                (task_id,),
+            ).fetchall()
+        return [self._decode_plan_step(row) for row in rows]
+
+    def get_plan_step(self, task_id: str, step_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM plan_steps WHERE task_id = ? AND id = ?",
+                (task_id, step_id),
+            ).fetchone()
+        return self._decode_plan_step(row) if row else None
+
+    def update_plan_step(
+        self,
+        task_id: str,
+        step_id: str,
+        *,
+        status: str | None = None,
+        inputs: dict[str, Any] | None = None,
+        outputs: dict[str, Any] | None = None,
+        error: str | None = None,
+        instruction: str | None = None,
+        skill_name: str | None = None,
+    ) -> bool:
+        assignments = ["updated_at = ?"]
+        parameters: list[Any] = [time.time()]
+        for column, value in (
+            ("status", status),
+            ("instruction", instruction),
+            ("skill_name", skill_name),
+            ("error", error),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                parameters.append(value)
+        if inputs is not None:
+            assignments.append("inputs = ?")
+            parameters.append(json.dumps(inputs, ensure_ascii=False))
+        if outputs is not None:
+            assignments.append("outputs = ?")
+            parameters.append(json.dumps(outputs, ensure_ascii=False))
+        parameters.extend([task_id, step_id])
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"UPDATE plan_steps SET {', '.join(assignments)} "
+                "WHERE task_id = ? AND id = ?",
+                parameters,
+            )
+            connection.execute(
+                "UPDATE task_runs SET updated_at = ? WHERE id = ?",
+                (time.time(), task_id),
+            )
+        return cursor.rowcount > 0
+
+    def start_skill_invocation(
+        self,
+        task_id: str,
+        skill_name: str,
+        *,
+        step_id: str | None = None,
+        execution_mode: str = "main_loop",
+        arguments: dict[str, Any] | None = None,
+    ) -> str:
+        invocation_id = str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO skill_invocations(
+                    id, task_id, step_id, skill_name, execution_mode, status,
+                    arguments, result, started_at
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, '{}', ?)
+                """,
+                (
+                    invocation_id,
+                    task_id,
+                    step_id,
+                    skill_name,
+                    execution_mode,
+                    json.dumps(arguments or {}, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+        return invocation_id
+
+    def finish_skill_invocation(
+        self,
+        invocation_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE skill_invocations
+                SET status = ?, result = ?, ended_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(result or {}, ensure_ascii=False),
+                    time.time(),
+                    invocation_id,
+                ),
+            )
+
+    def list_skill_invocations(self, task_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM skill_invocations WHERE task_id = ? ORDER BY started_at",
+                (task_id,),
+            ).fetchall()
+        values: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["arguments"] = self._decode_json(item.get("arguments"), {})
+            item["result"] = self._decode_json(item.get("result"), {})
+            values.append(item)
+        return values
+
+    def register_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        *,
+        step_id: str | None = None,
+        name: str | None = None,
+        uri: str | None = None,
+        payload: dict[str, Any] | None = None,
+        producer: str | None = None,
+        verified: bool = False,
+        artifact_id: str | None = None,
+    ) -> str:
+        artifact_id = artifact_id or str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, task_id, step_id, artifact_type, name, uri, payload,
+                    producer, verified, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    task_id,
+                    step_id,
+                    artifact_type,
+                    name,
+                    uri,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    producer,
+                    1 if verified else 0,
+                    time.time(),
+                ),
+            )
+        return artifact_id
+
+    def list_artifacts(self, task_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at, id",
+                (task_id,),
+            ).fetchall()
+        values: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = self._decode_json(item.get("payload"), {})
+            item["verified"] = bool(item.get("verified"))
+            values.append(item)
+        return values
+
+    def get_task_state(self, task_id: str) -> dict[str, Any] | None:
+        task = self.get_task(task_id)
+        if task is None:
+            return None
+        return {
+            **task,
+            "steps": self.get_plan_steps(task_id),
+            "artifacts": self.list_artifacts(task_id),
+            "skill_invocations": self.list_skill_invocations(task_id),
+        }
+
+    @staticmethod
+    def _decode_json(value: Any, default: Any) -> Any:
+        try:
+            return json.loads(value) if value else default
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    @classmethod
+    def _decode_task_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["finalization"] = cls._decode_json(item.pop("finalization_json", None), {})
+        return item
+
+    @classmethod
+    def _decode_plan_step(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["dependencies"] = cls._decode_json(item.get("dependencies"), [])
+        item["inputs"] = cls._decode_json(item.get("inputs"), {})
+        item["outputs"] = cls._decode_json(item.get("outputs"), {})
+        return item
+
     def log_stage_artifact(
         self,
         session_id: str,

@@ -1,10 +1,15 @@
 ---
 name: main-orchestrator
 description: 主调度与 Skill 路由
-allowed-tools: set_active_skill search_skills list_layers inspect_layer inspect_layers load_layer remove_layer zoom_to_layer export_layer
+version: 3.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+tools: [search_skills, load_skill, unload_skill, list_loaded_skills, inspect_skill, create_plan, revise_plan, get_task_state, update_plan_step, complete_plan_step, register_artifact, finalize_task, invoke_skill, list_layers, inspect_layer, inspect_layers, load_layer, remove_layer, zoom_to_layer, export_layer]
 metadata:
-  version: 2.0.1
-  tags: [orchestration, routing, gis]
+  hermes:
+    tags: [orchestration, routing, gis, multi-skill]
+    requires_tools: [search_skills, load_skill, create_plan, finalize_task]
 ---
 
 # Main Orchestrator
@@ -15,9 +20,9 @@ metadata:
 
 1. 图层管理、图层查看、字段查看、加载数据、缩放、样式、导出等单步操作：直接使用对应图层工具。
 2. 由当前 AI 将用户原始请求与系统提供的可路由 Skill 目录逐项做语义比较。不得使用程序分词结果、关键词计数或相关性分数代替判断。
-3. 内置或用户自定义的专用业务 Skill 完整覆盖任务时，优先调用 `set_active_skill` 切换到该 Skill。专用 Skill 的优先级高于通用 Pipeline。
-4. 没有专用业务 Skill 匹配时，一个主要输入、一个明确标准 GIS 操作的简单任务切换到 `qgis-toolbox`。
-5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务进入 `gis-pipeline`。
+3. 内置或用户自定义的专用业务 Skill 完整覆盖任务时，优先调用 `load_skill` 加载该 Skill。专用 Skill 的优先级高于通用 Pipeline。
+4. 没有专用业务 Skill 匹配时，一个主要输入、一个明确标准 GIS 操作的简单任务加载 `qgis-toolbox`。
+5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务加载 `gis-pipeline`。
 6. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
 
 `search_skills` 只返回未排序的可路由 Skill 卡片，不替 AI 做匹配。需要刷新目录时传入未经改写的用户原始请求；收到结果后由当前 AI 比较每个 `description` 并选择。
@@ -28,7 +33,7 @@ metadata:
 
 ## QGIS Toolbox 简单任务
 
-以下任务只有在单步且参数明确时，才调用 `set_active_skill({"skill_name":"qgis-toolbox"})`：
+以下任务只有在单步且参数明确时，才调用 `load_skill({"skill_name":"qgis-toolbox"})`：
 
 - 缓冲、裁剪、相交、联合、差集、按位置提取。
 - 属性筛选、表达式筛选、字段计算、属性连接、统计汇总。
@@ -43,13 +48,13 @@ metadata:
 - 需要确认字段含义、属性取值、CRS、距离/面积单位或中间结果。
 - 需要复杂 PyQGIS、制图布局、非 Processing 能力或业务逻辑。
 
-未命中专用业务 Skill 的复杂任务，正确第一步是：
+未命中专用业务 Skill 的复杂任务，应先调用 `create_plan`，再加载：
 
 ```json
 {"skill_name": "gis-pipeline"}
 ```
 
-切换后由 `gis-pipeline` 依次完成 `data_overview`、`structured_query`、`solution_plan`、`generated_code`、`execution_result`。
+加载后由 `gis-pipeline` 依次完成 `data_overview`、`structured_query`、`solution_plan`、`generated_code`、`execution_result`。每个真正完成的任务步骤使用 `complete_plan_step` 登记输出，最后调用 `finalize_task`。
 
 ## 图层管理路由
 
@@ -61,7 +66,7 @@ metadata:
 - 用户要求“导出/生成”新的分析结果但没有提供目录时，不要追问保存文件夹；默认交给 `execute_gis_code` 输出到 `QGIS_AGENT_WORKSPACE` 并加载到 QGIS。
 - 只有用户明确要求把已有图层导出到某个外部目录时，才使用 `export_layer` 并要求 `output_path`。
 - 用户要求缩放到某图层时，使用 `zoom_to_layer`；如果图层名不明确，先用 `list_layers` 或询问用户。
-- 用户要求设置样式时，当前只支持 QML 文件，缺少 `qml_path` 时先询问。
+- 用户提供现有 QML 文件时使用 `set_style`。用户给出符号系统、色带或分类参数并要求直接调整当前图层时，进入代码执行路径更新 renderer，不要求额外提供 QML，也不强制生成文件。
 
 ## execute_gis_code 限制
 
@@ -69,16 +74,15 @@ metadata:
 
 所有代码执行都必须满足：
 
-- 输入图层、字段、距离/单位和输出文件已明确。
-- 输出写入 `QGIS_AGENT_WORKSPACE`。
-- 用户未指定文件名时，基于任务生成合理默认文件名，例如 `park_parcels.geojson`、`buffer_result.gpkg`、`clip_result.gpkg`；不要询问保存文件夹。
-- `expected_outputs` 列出每个输出文件，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。
+- 输入图层以及任务所需的字段、距离和单位已明确。
+- 用户要求生成/导出文件时，输出写入 `QGIS_AGENT_WORKSPACE`；未指定文件名时生成合理默认文件名，不要询问保存文件夹。
+- 有文件结果时 `expected_outputs` 列出每个输出，例如 `{"path": "500m.shp", "name": "500m", "type": "vector"}`。仅需 stdout 最终统计结论或直接调整当前图层样式时使用空数组。
 - 不创建 `QgsApplication`、`QApplication`，不调用 `initQgis`，不启动新的 QGIS。
 - 不生成网络访问、`subprocess`、`os.system`、`eval`、`exec`、删除文件或写工作目录外路径。
 - 任一输入图层超过 10 万要素时必须进入 `gis-pipeline`，不得使用简单 fast-path。
 - 大数据空间分析必须检查空间索引，避免逐要素嵌套循环，并优先输出 GeoPackage。
 - 自动重试遇到空几何或无效几何时必须排除对应要素；除非用户明确要求修复数据，不得运行 `fixgeometries` 或创建修复副本。
-- `execute_gis_code` 只用于生成用户要求的最终结果，不得用于字段唯一值探查或仅打印诊断信息；用户已明确图层、字段和筛选值时应直接进入最终筛选。
+- `execute_gis_code` 只用于完成用户要求的最终结果，不得用于字段唯一值探查或仅打印供下一步使用的诊断信息；stdout 本身就是用户所需统计结论时可以直接打印且不创建文件。
 
 ## 回复规则
 

@@ -4,15 +4,19 @@ import { useBridge } from './composables/useBridge'
 import type {
   AppSettings,
   ChatMessage,
+  LoadedSkillSummary,
   PendingConfirmation,
   RunMetrics,
-  SessionSummary
+  SessionSummary,
+  TaskState
 } from './types/protocol'
 
 const draft = ref('')
 const messages = ref<ChatMessage[]>([])
 const sessions = ref<SessionSummary[]>([])
 const activeSessionId = ref('')
+const loadedSkills = ref<LoadedSkillSummary[]>([])
+const taskState = ref<TaskState | null>(null)
 const isSending = ref(false)
 const pendingConfirmation = ref<PendingConfirmation | null>(null)
 const conversationRef = ref<HTMLElement | null>(null)
@@ -120,6 +124,9 @@ const { status, request } = useBridge((event) => {
   }
   if (event.type === 'error' || event.type === 'complete') {
     isSending.value = false
+    if (event.type === 'complete') {
+      void refreshAgentState()
+    }
   }
   if (event.type === 'message_delta') {
     const delta = event.payload.delta
@@ -196,6 +203,7 @@ async function loadMessages() {
   processMessageIndex.value = null
   runMetricsById.value = {}
   activeMetricsRunId.value = ''
+  await refreshAgentState()
   await scrollConversation()
 }
 
@@ -211,8 +219,37 @@ async function createSession() {
   processMessageIndex.value = null
   runMetricsById.value = {}
   activeMetricsRunId.value = ''
+  loadedSkills.value = []
+  taskState.value = null
+  await refreshAgentState()
   await scrollConversation()
 }
+
+async function refreshAgentState() {
+  if (!activeSessionId.value) {
+    loadedSkills.value = []
+    taskState.value = null
+    return
+  }
+  try {
+    const [skills, task] = await Promise.all([
+      request<LoadedSkillSummary[]>('listLoadedSkills', {
+        session_id: activeSessionId.value
+      }),
+      request<TaskState | null>('getTaskState', {
+        session_id: activeSessionId.value
+      })
+    ])
+    loadedSkills.value = skills
+    taskState.value = task
+  } catch (error) {
+    console.error(error)
+  }
+}
+
+const completedPlanSteps = computed(() => {
+  return taskState.value?.steps.filter((step) => ['completed', 'skipped'].includes(step.status)).length ?? 0
+})
 
 async function sendMessage() {
   const message = draft.value.trim()
@@ -587,6 +624,15 @@ async function waitForPaint() {
         <button type="button" class="icon-action" title="新建会话" @click="createSession">+</button>
       </div>
     </header>
+
+    <section v-if="loadedSkills.length || taskState" class="agent-state-bar" aria-label="Agent 状态">
+      <span v-if="loadedSkills.length">
+        Skills：{{ loadedSkills.map((skill) => skill.name).join(' · ') }}
+      </span>
+      <span v-if="taskState">
+        计划：{{ completedPlanSteps }}/{{ taskState.steps.length }} · {{ taskState.status }}
+      </span>
+    </section>
 
     <section ref="conversationRef" class="conversation" aria-live="polite">
       <div v-if="messages.length === 0" class="empty-state">

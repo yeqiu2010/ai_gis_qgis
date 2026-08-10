@@ -1,6 +1,6 @@
 # AI GIS Agent
 
-AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 QGIS 中嵌入 Vue 对话面板，通过 QWebChannel 连接 Python 后端，并基于可切换的 Skill 工作流完成图层查看、数据加载、空间分析、代码生成与执行等任务。
+AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 QGIS 中嵌入 Vue 对话面板，通过 QWebChannel 连接 Python 后端，并基于 Hermes 风格的渐进式多 Skill Agent Loop 完成图层查看、数据加载、空间分析、代码生成与执行等任务。
 
 当前插件仍标记为 experimental，建议先在测试工程或备份数据上验证工作流。
 
@@ -8,7 +8,9 @@ AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 Q
 
 - QGIS 侧边栏聊天面板，支持会话历史、流式过程消息和停止当前任务。
 - OpenAI-compatible、OpenAI、Ollama 和离线 Echo provider。
-- Skill 驱动的任务路由：自定义 Skill 优先，简单单步任务使用 `qgis-toolbox`，复杂任务进入 `gis-pipeline`。
+- Skill 驱动的任务路由：先检索轻量 Skill 卡片，再按需加载完整 `SKILL.md`；同一主 Agent Loop 可以组合多个 Skill 并共享参数、计划和产物。
+- 通用计划与完成验证：复杂任务持久化为 `task_runs`、`plan_steps` 和 `artifacts`，只有步骤与必需产物通过验证后才完成。
+- 可选 `invoke_skill` Delegation：复杂且独立的只读子任务可以进入隔离子循环；QGIS 工程修改、文件写入和确认型任务强制留在主循环。
 - QGIS Toolbox 算法知识检索：先分析数据和 GIS 术语，再批量检索 Processing 算法及参数示例。
 - 统一脚本执行：复杂流程生成并审查一份完整 Processing/PyQGIS 脚本，通过 `execute_gis_code` 一次确认执行。
 - 用户自定义 Skills 可放在 `~/.qgis_hermes_agent/custom_skills`；自定义工具以现有 `ToolEntry` 方式注册，并由 Skill 的 `tools` 声明调用。
@@ -17,6 +19,29 @@ AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 Q
 - 工具确认机制：对需要确认的写入或潜在破坏性操作先请求用户确认。
 - 本地 SQLite 会话库，默认保存到 `~/.qgis_hermes_agent/state.db`。
 - 结构化失败样本日志，记录工具、Pipeline、生成代码、QGIS 运行和 LLM 调用错误，支持 JSONL 导出。
+
+## 多 Skill Agent Loop
+
+默认执行路径：
+
+```text
+search_skills
+→ load_skill（可以依次加载多个）
+→ create_plan / revise_plan
+→ 调用受控 QGIS 工具
+→ complete_plan_step / register_artifact
+→ finalize_task
+```
+
+Skill 是按需加载的执行指导文档，Tool 是真正执行代码的函数。`invoke_skill` 不是普通 Skill 加载，而是面向 Skill 的隔离子 Agent：
+
+```text
+invoke_skill ≈ skill_view + delegate_task + GIS 契约验证
+```
+
+内置与自定义 `SKILL.md` 支持 Hermes Frontmatter，包括 `metadata.hermes`；GIS 运行时输入、输出、副作用和完成条件放在 `metadata.qgis_agent`。完整设计见 [多 Skill 改造方案](md/基于Hermes-Agent-Loop的多Skill改造方案.md)。
+
+前端状态栏会显示当前已加载 Skills 和活动计划进度。RPC 同时提供 `listLoadedSkills` 与 `getTaskState`，便于其他界面或集成读取结构化状态。
 
 ## 失败日志与改进数据
 

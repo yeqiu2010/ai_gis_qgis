@@ -4,7 +4,12 @@ description: 代码安全和 GIS 正确性审查
 tools:
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, review]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, review]
+    requires_tools: [record_pipeline_stage]
 ---
 
 # Code Reviewer
@@ -18,9 +23,9 @@ tags: [gis, pipeline, review]
 - 创建 `QgsApplication`、`QApplication` 或调用 `initQgis`、`setPrefixPath`。
 - 使用 `subprocess`、`os.system`、`eval`、`exec`、`sys.exit`。
 - 删除或覆盖工作目录外文件。
-- 输出没有写入 `QGIS_AGENT_WORKSPACE`。
+- 用户要求生成/导出的输出文件没有写入 `QGIS_AGENT_WORKSPACE`。
 - 用户要求导出到外部目录时，代码直接写外部目录；应改为工作目录输出 + `delivery_outputs`。
-- `expected_outputs` 为空，或没有包含用户要求生成的最终文件，例如 `500m.shp`。
+- 用户要求生成文件（例如 `500m.shp`），但 `expected_outputs` 为空或没有包含该文件。仅需 stdout 最终统计结论或直接调整当前图层样式时允许空数组。
 - `expected_outputs.path` 和代码实际输出文件名不一致。
 - `expected_outputs` 声明了文件，但代码只向 stdout 打印内容，没有通过 Processing `OUTPUT`、文件写入或 Writer API 实际创建该文件。
 - 使用未定义变量，例如 `QgsProject` 未导入且不在当前命名空间说明中。
@@ -46,6 +51,7 @@ tags: [gis, pipeline, review]
 - 调用不存在的 `QgsProject.addVectorLayer`，或猜测未在算法详情中出现的结果键（如 `OUTPUT_COUNT`）。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
+- 把 `QgsColorRampShader` 直接传给 `QgsSingleBandPseudoColorRenderer` 构造器或 `renderer.setShader()`；二者要求 `QgsRasterShader`，必须先用 `setRasterShaderFunction()` 包装颜色函数。
 - 创建 Polygon/Line/Point 输出图层，却没有为输出要素调用 `setGeometry`；纯统计结果
   应创建无几何表，要求空间结果时必须保留或聚合真实几何。
 - 分组统计中用赋值覆盖分母字段，例如遍历多栋建筑时反复执行
@@ -67,6 +73,7 @@ tags: [gis, pipeline, review]
 - Processing 输出参数必须是工作目录内路径字符串。
 - 输出 vector/raster 后，`expected_outputs.type` 应匹配。
 - 属性值探查不是最终产物时，不得虚构 `.txt` 预期输出；优先使用 `inspect_layer`，确需输出诊断文件时必须在代码中真实写入。
+- stdout 无文件结果必须是用户所需的最终统计答案，并包含统计口径、单位和数值，不能只是供下一步使用的诊断数据。直接样式调整必须作用于用户指定的当前图层并触发重绘。
 - 写 GeoPackage 时优先使用 Processing 算法的 `OUTPUT` 路径；只有取得当前 QGIS 版本精确 API 证据时才允许使用 Writer API。
 - 密度、覆盖率等比值必须审查分子与分母的统计粒度一致；按用地类型统计时，分母应为该
   类型唯一地块面积总量，不能使用任意单个地块面积。

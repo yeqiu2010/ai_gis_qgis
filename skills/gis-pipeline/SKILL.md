@@ -19,7 +19,28 @@ includes:
   - code-reviewer
   - executor
 version: 2.1.0
-tags: [gis, pipeline]
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [gis, pipeline]
+    related_skills: [data-overview, query-tuner, solution-planner, code-generator, code-reviewer, executor]
+    requires_tools: [list_layers, inspect_layers, search_qgis_processing_tools, record_pipeline_stage, execute_gis_code]
+  qgis_agent:
+    inputs:
+      required:
+        objective: {type: string}
+    outputs:
+      execution_outputs: {type: array}
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
+    completion:
+      required_artifacts: [execution_outputs]
+      checks: [pipeline_stages_complete, expected_outputs_exist]
 ---
 
 # GIS Pipeline
@@ -39,12 +60,13 @@ tags: [gis, pipeline]
 - 不允许在 `data_overview`、`structured_query`、`solution_plan`、`generated_code` 四个阶段完成之前调用 `execute_gis_code`。
 - 每个阶段完成后必须调用一次 `record_pipeline_stage`。
 - `generated_code` 阶段 artifact 必须包含 `code`、`expected_outputs`、`dependencies`、`assumptions`、`summary`、`review`。
-- `review.passed` 为 false、`expected_outputs` 为空、字段/CRS/输出文件不明确时，不得调用 `execute_gis_code`。
+- `review.passed` 为 false，或用户要求的字段/CRS/输出文件不明确时，不得调用 `execute_gis_code`。仅需 stdout 最终结论或直接调整当前图层样式的任务允许 `expected_outputs=[]`；用户要求生成/导出文件时仍不得为空。
 - 复杂任务不要跳过图层检查；涉及多个图层时优先一次调用 `inspect_layers`，至少检查主要输入图层的字段、CRS、几何类型和样例，避免连续多次调用 `inspect_layer`。
 - `structured_query` 完成前不得搜索算法；必须先产出每个操作的标准 GIS 术语。
 - `solution_plan` 中只调用一次 `search_qgis_processing_tools`，用 `queries` 覆盖全部操作；随后只调用一次 `get_qgis_processing_tool` 批量读取候选详情。
 - 不得调用或假设存在 `run_qgis_processing`。所有步骤必须组合进一份脚本，审查通过后只调用一次 `execute_gis_code`。
-- 进入本 Skill 后不得切换到其他 Skill；domain 检索结果只是算法候选，不是切换 Skill 的指令。
+- 当前 Pipeline 计划步骤执行期间不得用其他 Skill 替代其中阶段；该步骤完成后，Coordinator
+  可以继续加载后续任务所需的其他 Skill。domain 检索结果只是算法候选，不是切换 Skill 的指令。
 - `record_pipeline_stage` 由服务端严格校验顺序。返回 `success=false` 时根据
   `expected_stage` 补齐当前阶段，不得跳到最终回复。
 - 不要重复 `completed_stages` 中已经完成的数据盘点或结构化需求。阶段失败时只修正

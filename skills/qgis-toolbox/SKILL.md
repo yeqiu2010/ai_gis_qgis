@@ -2,7 +2,7 @@
 name: qgis-toolbox
 description: QGIS Processing 算法知识检索与简单单步 GIS 任务
 tools:
-  - set_active_skill
+  - load_skill
   - list_layers
   - inspect_layer
   - inspect_layers
@@ -14,8 +14,21 @@ includes:
   - code-generator
   - code-reviewer
   - executor
-version: 2.0.0
-tags: [qgis, processing, toolbox]
+version: 3.0.0
+author: AI GIS QGIS Plugin
+license: MIT
+platforms: [linux, Windows, macos]
+metadata:
+  hermes:
+    tags: [qgis, processing, toolbox]
+    related_skills: [gis-pipeline]
+    requires_tools: [inspect_layers, search_qgis_processing_tools, get_qgis_processing_tool, execute_gis_code]
+  qgis_agent:
+    side_effects:
+      modifies_qgis_project: true
+      writes_files: true
+      requires_confirmation: true
+      concurrency: qgis_main_thread_serial
 ---
 
 # QGIS Toolbox
@@ -30,11 +43,12 @@ tags: [qgis, processing, toolbox]
 3. 只调用一次 `search_qgis_processing_tools`。
 4. 只调用一次 `get_qgis_processing_tool` 获取选中算法的完整参数和示例。
 5. 根据真实参数生成完整脚本，并按 `code-reviewer` 规则审查。
-6. 脚本最终输出到 `QGIS_AGENT_WORKSPACE`，通过 `execute_gis_code` 一次确认执行。
+6. 通过 `execute_gis_code` 一次确认执行。生成/导出任务输出到 `QGIS_AGENT_WORKSPACE`；最终结果只是统计结论或当前图层样式变化时可不创建文件。
 
 字段和值已经由用户明确指定时，直接生成最终 Processing 筛选代码，不得先用
 `execute_gis_code` 打印唯一值做诊断。确需补充探查时优先使用 `inspect_layer`；stdout
 不是文件，禁止为仅打印的诊断代码声明虚假的 `expected_outputs`。
+stdout 本身就是用户要求的最终面积/数量等结论时，使用 `expected_outputs=[]` 并直接打印口径、单位和数值。用户明确要求调整当前图层渲染样式时，也可直接更新 renderer、触发重绘并使用空数组。
 
 ## GIS 术语映射
 
@@ -76,7 +90,7 @@ tags: [qgis, processing, toolbox]
 
 ## 路由门禁
 
-出现以下任一情况，立即调用 `set_active_skill({"skill_name":"gis-pipeline"})`：
+出现以下任一情况，立即调用 `load_skill({"skill_name":"gis-pipeline"})`，保留当前已经确认的图层和参数：
 
 - 需要两个及以上 Processing 算法。
 - 同时包含属性筛选与空间分析。

@@ -4,7 +4,12 @@ description: 生成 QGIS 当前环境可执行代码
 tools:
   - record_pipeline_stage
 version: 2.1.0
-tags: [gis, pipeline, code]
+author: AI GIS QGIS Plugin
+license: MIT
+metadata:
+  hermes:
+    tags: [gis, pipeline, code]
+    requires_tools: [record_pipeline_stage]
 ---
 
 # Code Generator
@@ -13,9 +18,16 @@ tags: [gis, pipeline, code]
 
 ## 硬性规则
 
-- 代码必须把结果写入 `QGIS_AGENT_WORKSPACE`。
+- 用户要求生成或导出文件时，代码必须把结果写入 `QGIS_AGENT_WORKSPACE`。
 - `QGIS_AGENT_WORKSPACE` 是 `execute_gis_code` 执行器注入到运行命名空间和环境变量中的工作目录变量，生成代码中可以直接使用；为了可读性，建议写成 `workspace = Path(QGIS_AGENT_WORKSPACE)`。
-- `expected_outputs` 必须和代码实际输出路径完全一致。
+- `expected_outputs` 始终使用列表：有文件结果时必须和代码实际输出路径完全一致；无文件结果时使用空数组。
+- 仅需面积、数量、最值等统计结论时，可以不创建文件；代码把完整最终结论清晰打印到 stdout，并使用 `expected_outputs=[]`。
+- 用户只要求调整当前栅格/矢量图层的符号系统、色带、分类或其他显示样式时，可以直接更新该图层 renderer、触发重绘并使用 `expected_outputs=[]`；不要为了通过检查虚构 QML 或栅格输出文件。
+- 单波段伪彩色渲染必须使用正确的三层对象链：`QgsColorRampShader` 是着色函数，先用 `raster_shader = QgsRasterShader()` 和 `raster_shader.setRasterShaderFunction(color_ramp_shader)` 包装，再调用 `QgsSingleBandPseudoColorRenderer(layer.dataProvider(), band, raster_shader)`。构造器第三个参数及 `renderer.setShader()` 都严禁直接传 `QgsColorRampShader`。
+- QGIS 4 栅格色带优先使用 `Qgis.ShaderInterpolationMethod.Linear/Discrete/Exact` 和 `Qgis.ShaderClassificationMethod.Continuous/EqualInterval/Quantile`。相等间隔 7 类应设置 `EqualInterval` 后调用 `color_ramp_shader.classifyColorRamp(7, band, layer.extent(), layer.dataProvider())`。
+- 连续拉伸可以给 `QgsColorRampShader` 设置最小值、最大值、`Linear` 插值以及深色/浅色端点；分类图则使用独立的颜色函数、`EqualInterval` 和明确类别数。每个 renderer 都创建自己的 `QgsRasterShader`，不要在多个 renderer 间复用已被接管所有权的 shader。
+- 用户要求从同一数据生成多种样式的 QGIS 栅格图层、但未要求导出文件时，可以从源数据 URI 创建多个独立 `QgsRasterLayer`，分别设置 renderer 后用 `QgsProject.instance().addMapLayer()` 加入工程，并使用 `expected_outputs=[]`；不要无故复制底层栅格文件。
+- 空 `expected_outputs` 只适用于 stdout 本身就是最终答案，或用户明确要求的当前 QGIS 图层/工程状态修改；不得用于字段唯一值探查或为下一次代码生成收集诊断信息。
 - 用户要求生成的最终文件，例如 `500m.shp`、`result.gpkg`、`parks.geojson`，必须写入 `expected_outputs`；不要省略 `expected_outputs`，也不要只把文件名写在代码里。
 - 用户只说“导出/生成结果”但没有给文件名时，不要询问保存目录；使用合理默认文件名并写入 `expected_outputs`，例如 `park_parcels.geojson`。
 - 输出路径用 `Path(QGIS_AGENT_WORKSPACE) / "文件名"` 构造，不要写绝对路径到工作目录外。
@@ -69,7 +81,7 @@ tags: [gis, pipeline, code]
 - `provider.addAttributes(source.fields())`：复制字段。
 - `provider.addFeatures(features)`：写入要素。
 - 矢量文件输出优先通过已验证的 `processing.run(..., {"OUTPUT": output_path})` 完成。
-- `QgsProcessing.TEMPORARY_OUTPUT`：仅适合中间结果；最终结果必须写到 `QGIS_AGENT_WORKSPACE`。
+- `QgsProcessing.TEMPORARY_OUTPUT`：适合中间结果；用户要求生成/导出的最终文件仍必须写到 `QGIS_AGENT_WORKSPACE`。纯统计结论可从内存结果计算后打印到 stdout。
 - `QgsProcessingFeedback()`：Processing 反馈对象，只有在算法参数确实需要时再使用。
 - `processing.run("native:extractbyexpression", {...})`：按表达式提取。
 - `processing.run("native:buffer", {...})`：缓冲区。

@@ -9,7 +9,10 @@ from pathlib import Path
 from ai_gis_qgis.backend.agent_core import AgentCore
 from ai_gis_qgis.backend.context.prompt_builder import PromptBuilder
 from ai_gis_qgis.backend.context.qgis_context import QGISContext
-from ai_gis_qgis.backend.executor.qgis_executor import QGISCodeExecutor
+from ai_gis_qgis.backend.executor.qgis_executor import (
+    QGISCodeExecutor,
+    _process_qt_events,
+)
 from ai_gis_qgis.backend.failure_analysis import classify_failure
 from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
 from ai_gis_qgis.backend.tools.code_execution import (
@@ -21,6 +24,7 @@ from ai_gis_qgis.backend.tools.code_execution import (
     validate_execute_gis_code_arguments,
 )
 from ai_gis_qgis.backend.tools.layer_ops import _layer_name_aliases, _normalize_source
+from ai_gis_qgis.backend.tools.pipeline import _validate_stage_artifact
 from ai_gis_qgis.backend.tools.registry import ToolEntry, ToolRegistry
 from ai_gis_qgis.database.session_db import SessionDB
 
@@ -780,6 +784,51 @@ def test_execute_gis_code_uses_current_qgis_mode_when_executor_is_available(tmp_
     assert "current" in result["stdout"]
 
 
+def test_execute_gis_code_allows_stdout_or_project_result_without_files(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="direct result", model="test", source="test")
+    fake_iface = types.SimpleNamespace(style_updated=False)
+    tool = build_execute_gis_code_tool(
+        session_db=session_db,
+        session_id=session.id,
+        iface=fake_iface,
+        qgis_executor=lambda func: func(),
+        executor_config={
+            "execution_mode": "current_qgis",
+            "workspace_dir": str(tmp_path / "workspaces"),
+        },
+    )
+
+    assert tool.parameters["required"] == ["code"]
+    assert "minItems" not in tool.parameters["properties"]["expected_outputs"]
+
+    result = tool.handler(
+        {
+            "code": (
+                "iface.style_updated = True\n"
+                "print('surface1 总面积：123.45 平方米；样式已更新')"
+            )
+        }
+    )
+
+    assert result["success"] is True
+    assert result["expected_outputs"] == []
+    assert result["outputs"] == []
+    assert result["expected_outputs_inferred"] is False
+    assert fake_iface.style_updated is True
+    assert "123.45" in result["stdout"]
+
+
+def test_pipeline_generated_code_allows_empty_file_outputs_for_direct_result():
+    artifact = {
+        "code": "print('总面积：123.45 平方米')",
+        "expected_outputs": [],
+        "review": {"passed": True},
+    }
+
+    assert _validate_stage_artifact("generated_code", artifact) is None
+
+
 def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tmp_path: Path):
     calls = []
     event_pumps = []
@@ -815,7 +864,11 @@ def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tm
     fake_qgis_core.Qgis = FakeQgis
     fake_qt_core = types.ModuleType("qgis.PyQt.QtCore")
     fake_qt_core.QCoreApplication = FakeCoreApplication
-    fake_qt_core.QEventLoop = type("QEventLoop", (), {"AllEvents": 0})
+    fake_qt_core.QEventLoop = type(
+        "QEventLoop",
+        (),
+        {"ProcessEventsFlag": type("ProcessEventsFlag", (), {"AllEvents": "qt6-all"})},
+    )
     monkeypatch.setitem(sys.modules, "processing", fake_processing)
     monkeypatch.setitem(sys.modules, "qgis.core", fake_qgis_core)
     monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", fake_qt_core)
@@ -827,11 +880,12 @@ def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tm
 
     assert fake_processing.run is original_run
     assert calls == [("progress", 25)]
-    assert len(event_pumps) == 1
+    assert event_pumps == [("qt6-all", 25)]
 
 
 def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Path):
     received_feedback = []
+    event_pumps = []
 
     class FakeFeedback:
         def __init__(self):
@@ -846,7 +900,7 @@ def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Pa
     class FakeCoreApplication:
         @staticmethod
         def processEvents(*args):
-            pass
+            event_pumps.append(args)
 
     class FakeProcessingContext:
         def setInvalidGeometryCheck(self, value):
@@ -882,6 +936,33 @@ def test_responsive_processing_wraps_explicit_feedback(monkeypatch, tmp_path: Pa
 
     assert received_feedback[0] is not explicit_feedback
     assert explicit_feedback.progress == [50]
+    assert event_pumps == [(0, 25)]
+
+
+def test_classifies_qt6_event_loop_enum_failure_as_executor_bug():
+    failure = classify_failure(
+        "AttributeError: type object 'QEventLoop' has no attribute 'AllEvents'"
+    )
+
+    assert failure["error_code"] == "executor_qt_compatibility"
+    assert failure["retryable"] is False
+
+
+def test_qt_event_pump_falls_back_when_binding_rejects_flag_overload():
+    calls = []
+
+    class FakeCoreApplication:
+        @staticmethod
+        def processEvents(*args):
+            calls.append(args)
+            if args:
+                raise TypeError("unsupported overload")
+
+    fake_event_loop = type("QEventLoop", (), {"AllEvents": 0})
+
+    _process_qt_events(FakeCoreApplication, fake_event_loop)
+
+    assert calls == [(0, 25), ()]
 
 
 def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
@@ -1044,6 +1125,26 @@ report_path.write_text("ok", encoding="utf-8")
     ) == []
 
 
+def test_accepts_qgis_named_style_output_writes():
+    code = """
+from pathlib import Path
+workspace = Path(QGIS_AGENT_WORKSPACE)
+stretch_style_path = workspace / "surface1_stretch.qml"
+class_style_path = workspace / "surface1_class7.qml"
+stretch_layer.saveNamedStyle(str(stretch_style_path))
+class_layer.saveNamedStyle(uri=str(class_style_path))
+"""
+    expected_outputs = [
+        {"path": "surface1_stretch.qml", "name": "stretch style", "type": "file"},
+        {"path": "surface1_class7.qml", "name": "class style", "type": "file"},
+    ]
+
+    assert find_unwritten_expected_outputs(code, expected_outputs) == []
+    assert validate_execute_gis_code_arguments(
+        {"code": code, "expected_outputs": expected_outputs}
+    ) is None
+
+
 def test_detects_recurrent_generated_pyqgis_mistakes():
     code = """
 from PyQt5.QtCore import QVariant
@@ -1071,6 +1172,59 @@ QgsProject.instance().addVectorLayer("result.gpkg", "result", "ogr")
     assert any("featureCount" in issue for issue in issues)
     assert any("QgsVectorFileWriter" in issue for issue in issues)
     assert any("addVectorLayer" in issue for issue in issues)
+
+
+def test_rejects_color_ramp_shader_passed_directly_to_pseudocolor_renderer():
+    invalid_constructor_code = """
+color_function = QgsColorRampShader(minimum, maximum)
+color_function_alias = color_function
+renderer = QgsSingleBandPseudoColorRenderer(
+    layer.dataProvider(), 1, color_function_alias
+)
+"""
+    invalid_setter_code = """
+color_function = QgsColorRampShader(minimum, maximum)
+renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1)
+renderer_alias = renderer
+renderer_alias.setShader(color_function)
+"""
+
+    for code in (invalid_constructor_code, invalid_setter_code):
+        issues = find_generated_code_issues(code)
+        assert any(
+            "QgsSingleBandPseudoColorRenderer 需要 QgsRasterShader" in issue
+            and "setRasterShaderFunction" in issue
+            for issue in issues
+        )
+
+
+def test_accepts_color_ramp_function_wrapped_in_raster_shader():
+    code = """
+color_function_1 = QgsColorRampShader(minimum, maximum)
+raster_shader_1 = QgsRasterShader()
+raster_shader_1.setRasterShaderFunction(color_function_1)
+renderer_1 = QgsSingleBandPseudoColorRenderer(
+    layer.dataProvider(), 1, raster_shader_1
+)
+
+color_function_2 = QgsColorRampShader(minimum, maximum)
+raster_shader_2 = QgsRasterShader()
+raster_shader_2.setRasterShaderFunction(color_function_2)
+renderer_2 = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1)
+renderer_2.setShader(raster_shader_2)
+"""
+
+    assert find_generated_code_issues(code) == []
+
+
+def test_classifies_pseudocolor_shader_type_failure_as_generated_code_api():
+    failure = classify_failure(
+        "QgsSingleBandPseudoColorRenderer.setShader(): argument 1 has unexpected type "
+        "'QgsColorRampShader'"
+    )
+
+    assert failure["error_code"] == "generated_code_api"
+    assert failure["retryable"] is False
 
 
 def test_detects_feature_count_on_processing_output_path_variants():
@@ -1675,6 +1829,9 @@ def test_prompt_builder_composes_pipeline_includes():
     assert "若原字段是文本型，必须先重构为唯一的 Double 字段" in prompt
     assert "FIELD_TYPE=2` 是 Text/String" in prompt
     assert "上一次失败执行的中间文件不会继承" in prompt
+    assert "expected_outputs=[]" in prompt
+    assert "stdout 本身就是最终答案" in prompt
+    assert "setRasterShaderFunction" in prompt
 
 
 def test_prompt_builder_routes_complex_analysis_to_pipeline():
