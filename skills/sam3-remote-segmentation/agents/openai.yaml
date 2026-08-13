@@ -1,0 +1,4 @@
+interface:
+  display_name: "SAM3 遥感影像分割"
+  short_description: "通过 SAM3 API 分割遥感影像并生成 QGIS 图层"
+  default_prompt: "使用 $sam3-remote-segmentation 从当前遥感影像中分割指定地物并加载结果。"

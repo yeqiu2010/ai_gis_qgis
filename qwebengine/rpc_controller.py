@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from ..backend.agent_core import AgentCore
 from ..backend.context.prompt_builder import PromptBuilder
 from ..backend.context.qgis_context import QGISContext
 from ..backend.llm.provider_registry import create_provider
+from ..backend.sam3.client import Sam3Client
+from ..backend.sam3.errors import Sam3Error
 from ..backend.tools.skill_management import read_loaded_skills
 from ..config.settings import SettingsManager
 from ..database.session_db import SessionDB
@@ -48,6 +51,7 @@ class RPCController:
             "cancelRun": self.cancel_run,
             "getSettings": self.get_settings,
             "saveSettings": self.save_settings,
+            "testSam3Connection": self.test_sam3_connection,
         }
         return handlers[request.method](request.params)
 
@@ -148,9 +152,32 @@ class RPCController:
         llm_params = params.get("llm")
         if isinstance(llm_params, dict) and llm_params.get("api_key") in {"", "***"}:
             llm_params["api_key"] = self.config.get("llm", {}).get("api_key", "")
+        sam3_params = params.get("sam3")
+        if isinstance(sam3_params, dict) and sam3_params.get("api_token") in {"", "***"}:
+            sam3_params["api_token"] = self.config.get("sam3", {}).get("api_token", "")
         self.config = self.settings.save(params)
         self.agent_core = self._create_agent_core()
         return self._redact_settings(self.config)
+
+    def test_sam3_connection(self, params: dict[str, Any]) -> dict[str, Any]:
+        candidate = dict(self.config.get("sam3") or {})
+        supplied = params.get("sam3")
+        if isinstance(supplied, dict):
+            candidate.update(supplied)
+        if candidate.get("api_token") in {"", "***"}:
+            candidate["api_token"] = self.config.get("sam3", {}).get("api_token", "")
+        started = time.monotonic()
+        try:
+            health = Sam3Client(candidate).health()
+            ready = health.get("status") == "ok" and bool(health.get("model_loaded"))
+            return {
+                "success": ready,
+                **health,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+                "error": None if ready else "服务可达，但 SAM3 模型尚未加载完成。",
+            }
+        except Sam3Error as exc:
+            return exc.as_payload()
 
     def _start_worker(self, name: str, target, *args) -> None:
         self._workers = [worker for worker in self._workers if worker.is_alive()]
@@ -255,6 +282,7 @@ class RPCController:
             iface=self.iface,
             qgis_executor=self.main_thread_executor.run,
             executor_config=self.config.get("executor") or {},
+            sam3_config=self.config.get("sam3") or {},
             custom_tools_dir=custom_tools_dir,
             should_cancel=lambda: self._is_cancelled_run(cancellable_run_id),
         )
@@ -272,4 +300,7 @@ class RPCController:
         redacted["llm"] = dict(redacted.get("llm") or {})
         if redacted["llm"].get("api_key"):
             redacted["llm"]["api_key"] = "***"
+        redacted["sam3"] = dict(redacted.get("sam3") or {})
+        if redacted["sam3"].get("api_token"):
+            redacted["sam3"]["api_token"] = "***"
         return redacted

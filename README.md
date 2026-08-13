@@ -15,6 +15,7 @@ AI GIS Agent 是一个面向 QGIS 的自然语言 GIS 助手插件。插件在 Q
 - 统一脚本执行：复杂流程生成并审查一份完整 Processing/PyQGIS 脚本，通过 `execute_gis_code` 一次确认执行。
 - 用户自定义 Skills 可放在 `~/.qgis_hermes_agent/custom_skills`；自定义工具以现有 `ToolEntry` 方式注册，并由 Skill 的 `tools` 声明调用。
 - QGIS 图层工具：列出图层、查看字段/CRS/范围、加载/移除图层、缩放到图层、导出图层。
+- SAM3 遥感影像分割：通过独立 SAM3-Geo-API 对当前栅格执行文本、自动或矢量框提示分割，输出地理配准掩码或 GeoPackage 面图层，并可继续进入矢量 GIS 流程。
 - 代码执行工具：在 QGIS 主线程中运行受控 PyQGIS 代码，并将结果加载回当前工程。
 - 工具确认机制：对需要确认的写入或潜在破坏性操作先请求用户确认。
 - 本地 SQLite 会话库，默认保存到 `~/.qgis_hermes_agent/state.db`。
@@ -114,6 +115,28 @@ uv run python scripts/package_plugin.py
 GIS Pipeline 会在阶段边界以完整 JSON envelope 传递最小状态：下一阶段只接收前一阶段 artifact，并在 `solution_plan` 之后继续携带 `structured_query` 中的结构化用户需求；历史对话、原始工具结果和更早阶段不会加入提示词，截断的 `_raw_arguments` 也不会再次回填。
 
 默认配置见 [config/defaults.py](config/defaults.py)。
+
+## SAM3 遥感影像分割
+
+先启动 `sam3-geo-api` 服务，再在插件设置页的“SAM3 遥感分割服务”区域配置：
+
+- `Base URL`：默认 `http://127.0.0.1:8000`。
+- `API Token`：当前本地服务可留空，网关启用 Bearer 鉴权时填写。
+- 连接/推理超时、最大上传大小、最大像元数和单次最大边界框数。
+- HTTPS 服务默认校验证书。
+
+点击“测试 SAM3 连接”可查看模型是否就绪。之后可在对话中使用，例如：
+
+```text
+从当前遥感影像中分割建筑物，输出面图层。
+在研究区面图层范围内识别水体，同时保留掩码栅格。
+使用候选框图层中选中的要素，在影像中生成真实轮廓。
+识别建筑物后与地块相交，统计各地块建筑占地率。
+```
+
+插件会在确认后把指定范围的影像快照上传到配置的服务。SAM3 API 请求通过受信任工具执行，不进入禁止联网的生成代码沙箱；分割结果加载为真实 QGIS 图层后，才能继续交给 QGIS Toolbox 或 GIS Pipeline。
+
+当前 SAM3 服务不支持点提示和超大影像自动分块。超过像元限制时，请改用当前画布范围或 AOI。完整设计与限制见 [SAM3 接入方案](md/SAM3遥感影像分割API插件接入方案.md)。
 
 ## 开发
 

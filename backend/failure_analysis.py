@@ -5,6 +5,16 @@ from __future__ import annotations
 
 def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[str, object]:
     text = (message or "").lower()
+    if "service_unreachable" in text or "无法连接 sam3" in text:
+        return _result("sam3_service", "SAM3 服务不可达或连接被重置。", True)
+    if "model_not_ready" in text or "模型尚未" in message:
+        return _result("sam3_model_not_ready", "SAM3 服务已响应但模型尚未就绪。", True)
+    if "no_objects_found" in text or "未找到匹配对象" in message:
+        return _result("sam3_no_objects", "SAM3 在当前提示、阈值和范围内没有找到对象。", False)
+    if "payload_too_large" in text or "请求快照" in message and "超过" in message:
+        return _result("sam3_payload_too_large", "SAM3 请求影像超过上传或处理限制。", False)
+    if "invalid_response" in text or "sam3 掩码尺寸" in text:
+        return _result("sam3_invalid_response", "SAM3 返回文件为空、损坏或空间尺寸不一致。", False)
     if "参数 json 不完整或被截断" in text or "truncated_tool_arguments" in text:
         return _result(
             "truncated_tool_arguments",

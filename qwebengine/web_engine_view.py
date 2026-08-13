@@ -377,6 +377,25 @@ else:
             request_timeout_input.setSingleStep(30)
             request_timeout_input.setValue(int(llm.get("request_timeout_seconds") or 300))
 
+            sam3 = dict(current.get("sam3") or {})
+            sam3_enabled_box = QComboBox(dialog)
+            sam3_enabled_box.addItems(["true", "false"])
+            sam3_enabled_box.setCurrentText("true" if sam3.get("enabled", True) else "false")
+            sam3_url_input = QLineEdit(dialog)
+            sam3_url_input.setText(str(sam3.get("base_url") or "http://127.0.0.1:8000"))
+            sam3_token_input = QLineEdit(dialog)
+            sam3_token_input.setText(str(sam3.get("api_token") or ""))
+            if hasattr(QLineEdit, "EchoMode"):
+                sam3_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+            elif hasattr(QLineEdit, "Password"):
+                sam3_token_input.setEchoMode(QLineEdit.Password)
+            sam3_timeout_input = QSpinBox(dialog)
+            sam3_timeout_input.setRange(10, 7200)
+            sam3_timeout_input.setValue(int(sam3.get("request_timeout_seconds") or 1200))
+            sam3_max_pixels_input = QSpinBox(dialog)
+            sam3_max_pixels_input.setRange(1, 2_000_000_000)
+            sam3_max_pixels_input.setValue(int(sam3.get("max_pixels") or 100_000_000))
+
             form.addRow("提供商", provider_box)
             form.addRow("模型名", model_input)
             form.addRow("Base URL", base_url_input)
@@ -385,6 +404,11 @@ else:
             form.addRow("Max Tokens", max_tokens_input)
             form.addRow("Context Window", max_context_tokens_input)
             form.addRow("请求超时（秒）", request_timeout_input)
+            form.addRow("SAM3 启用", sam3_enabled_box)
+            form.addRow("SAM3 Base URL", sam3_url_input)
+            form.addRow("SAM3 API Token", sam3_token_input)
+            form.addRow("SAM3 推理超时（秒）", sam3_timeout_input)
+            form.addRow("SAM3 最大像元数", sam3_max_pixels_input)
             dialog_layout.addLayout(form)
 
             if hasattr(QDialogButtonBox, "StandardButton"):
@@ -421,6 +445,17 @@ else:
                 }
             )
             updated["llm"] = updated_llm
+            updated_sam3 = dict(updated.get("sam3") or {})
+            updated_sam3.update(
+                {
+                    "enabled": sam3_enabled_box.currentText() == "true",
+                    "base_url": sam3_url_input.text().strip(),
+                    "api_token": sam3_token_input.text().strip(),
+                    "request_timeout_seconds": sam3_timeout_input.value(),
+                    "max_pixels": sam3_max_pixels_input.value(),
+                }
+            )
+            updated["sam3"] = updated_sam3
 
             try:
                 saved = self.controller.save_settings(updated)

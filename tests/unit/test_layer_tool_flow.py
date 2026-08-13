@@ -69,6 +69,276 @@ class ConfirmingProvider:
         )
 
 
+class Sam3ContinuationProvider:
+    name = "sam3-continuation-test"
+    model = "sam3-continuation-test-model"
+
+    def __init__(self):
+        self.calls = 0
+        self.messages_by_call = []
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        self.messages_by_call.append(messages)
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="plan-vegetation",
+                        name="create_plan",
+                        arguments={
+                            "objective": "使用 SAM3 提取植被并统计面积占比",
+                            "steps": [
+                                {
+                                    "id": "segment",
+                                    "skill_name": "sam3-remote-segmentation",
+                                    "instruction": "使用 SAM3 分割植被",
+                                    "dependencies": [],
+                                },
+                                {
+                                    "id": "statistics",
+                                    "skill_name": "gis-pipeline",
+                                    "instruction": "计算植被面积及影像面积占比",
+                                    "dependencies": ["segment"],
+                                },
+                            ],
+                        },
+                    )
+                ],
+            )
+        if self.calls == 2:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="load-sam3",
+                        name="load_skill",
+                        arguments={"skill_name": "sam3-remote-segmentation"},
+                    )
+                ],
+            )
+        if self.calls == 3:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="segment-vegetation",
+                        name="segment_remote_sensing_image",
+                        arguments={
+                            "input_layer_id": "satellite-id",
+                            "mode": "text",
+                            "prompt": "vegetation",
+                            "output_types": ["vector"],
+                        },
+                    )
+                ],
+            )
+        if self.calls == 4:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="load-pipeline",
+                        name="load_skill",
+                        arguments={"skill_name": "gis-pipeline"},
+                    )
+                ],
+            )
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id="calculate-ratio",
+                    name="execute_gis_code",
+                    arguments={
+                        "code": "print('vegetation_area_ratio=25.0%')",
+                        "expected_outputs": [],
+                    },
+                )
+            ],
+        )
+
+
+class BufferThenSamProvider:
+    name = "buffer-then-sam-test"
+    model = "buffer-then-sam-test-model"
+
+    def __init__(self):
+        self.calls = 0
+        self.messages_by_call = []
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        self.messages_by_call.append(messages)
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="create-buffer",
+                        name="execute_gis_code",
+                        arguments={
+                            "code": (
+                                "with open('youth_road_500m_buffer.gpkg', 'w', "
+                                "encoding='utf-8') as handle:\n    handle.write('buffer')"
+                            ),
+                            "expected_outputs": [
+                                {
+                                    "path": "youth_road_500m_buffer.gpkg",
+                                    "name": "youth_road_500m_buffer",
+                                    "type": "vector",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            )
+        if self.calls == 2:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="load-sam3-after-buffer",
+                        name="load_skill",
+                        arguments={"skill_name": "sam3-remote-segmentation"},
+                    )
+                ],
+            )
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id="segment-buildings-in-buffer",
+                    name="segment_remote_sensing_image",
+                    arguments={
+                        "input_layer_id": "whch-layer-id",
+                        "mode": "text",
+                        "prompt": "building",
+                        "scope_mode": "aoi",
+                        "aoi_layer_id": "buffer-layer-id",
+                        "output_types": ["vector"],
+                        "output_name": "building",
+                    },
+                )
+            ],
+        )
+
+
+class DuplicateThresholdProvider:
+    name = "duplicate-threshold-test"
+    model = "duplicate-threshold-test-model"
+
+    def __init__(self):
+        self.calls = 0
+        self.messages_by_call = []
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        self.messages_by_call.append(messages)
+        if self.calls >= 4:
+            return ChatResponse(
+                content="阈值 0.5 和 0.3 的建筑物分割均已完成。",
+                model=self.model,
+            )
+        threshold = 0.5 if self.calls <= 2 else 0.3
+        suffix = str(threshold).replace(".", "_")
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=f"segment-{suffix}-{self.calls}",
+                    name="segment_remote_sensing_image",
+                    arguments={
+                        "input_layer_id": "whch-layer-id",
+                        "mode": "text",
+                        "prompt": "building",
+                        "confidence_threshold": threshold,
+                        "output_types": ["vector"],
+                        "output_name": f"building_threshold_{suffix}",
+                    },
+                )
+            ],
+        )
+
+
+class Sam3InspectionContinuationProvider:
+    name = "sam3-inspection-continuation-test"
+    model = "sam3-inspection-continuation-test-model"
+
+    def __init__(self):
+        self.calls = 0
+        self.system_prompts = []
+        self.messages_by_call = []
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        self.system_prompts.append(system)
+        self.messages_by_call.append(messages)
+        if self.calls == 1:
+            return ChatResponse(
+                content=(
+                    "以下是刚刚执行的 QGIS 工具结果。如果任务尚未完成，继续调用必要工具："
+                    '[{"name":"inspect_sam3_segmentation_inputs",'
+                    '"result":{"success":true,"inspection_complete":true}}]'
+                ),
+                model=self.model,
+            )
+        if self.calls == 2:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="inspect-10000",
+                        name="inspect_sam3_segmentation_inputs",
+                        arguments={
+                            "input_layer_id": "10000-layer-id",
+                            "scope_mode": "full",
+                        },
+                    )
+                ],
+            )
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id="segment-road",
+                    name="segment_remote_sensing_image",
+                    arguments={
+                        "input_layer_id": "10000-layer-id",
+                        "mode": "text",
+                        "prompt": "road",
+                        "scope_mode": "full",
+                        "output_types": ["vector"],
+                        "output_name": "road",
+                    },
+                )
+            ],
+        )
+
+
 class CodeExecutionProvider:
     name = "code-execution-test"
     model = "code-execution-test-model"
@@ -88,6 +358,42 @@ class CodeExecutionProvider:
                             {"path": "result.txt", "name": "result", "type": "file"}
                         ],
                         "timeout_seconds": 10,
+                    },
+                )
+            ],
+        )
+
+
+class RepeatingSmoothingProvider:
+    name = "repeating-smoothing-test"
+    model = "repeating-smoothing-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=f"smooth-building-{self.calls}",
+                    name="execute_gis_code",
+                    arguments={
+                        "code": (
+                            "with open('building_smoothed.geojson', 'w', "
+                            "encoding='utf-8') as handle:\n    handle.write('{}')\n"
+                            "print('平滑处理完成！')"
+                        ),
+                        "expected_outputs": [
+                            {
+                                "path": "building_smoothed.geojson",
+                                "name": "building_smoothed",
+                                "type": "vector",
+                            }
+                        ],
                     },
                 )
             ],
@@ -535,6 +841,550 @@ def test_agent_core_pauses_destructive_layer_tools_for_confirmation(tmp_path: Pa
     assert "PyQGIS" in tool_end["payload"]["result"]["error"]
 
 
+def test_confirmed_sam3_segmentation_resumes_remaining_user_request(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = tmp_path / "vegetation.gpkg"
+    output_path.touch()
+
+    def build_fake_sam3_tools(**kwargs):
+        del kwargs
+        arguments_schema = {
+            "type": "object",
+            "properties": {
+                "input_layer_id": {"type": "string"},
+                "mode": {"type": "string"},
+                "prompt": {"type": "string"},
+                "output_types": {"type": "array"},
+            },
+            "required": ["input_layer_id", "mode"],
+        }
+        read_parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+        return [
+            ToolEntry(
+                name="check_sam3_service",
+                description="Fake SAM3 health check.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "status": "ok",
+                    "model_loaded": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="inspect_sam3_segmentation_inputs",
+                description="Fake SAM3 input inspection.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "inspection_complete": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="segment_remote_sensing_image",
+                description="Fake SAM3 segmentation for confirmation-resume testing.",
+                parameters=arguments_schema,
+                handler=lambda arguments: {
+                    "success": True,
+                    "job_id": "job-vegetation-1",
+                    "mode": arguments["mode"],
+                    "prompt": arguments.get("prompt"),
+                    "source_layer": {
+                        "id": arguments["input_layer_id"],
+                        "name": "satellite",
+                    },
+                    "outputs": [
+                        {
+                            "path": str(output_path),
+                            "name": "vegetation_objects",
+                            "type": "vector",
+                        }
+                    ],
+                    "loaded_layers": [
+                        {
+                            "id": "vegetation-layer-id",
+                            "name": "vegetation_objects",
+                            "type": "vector",
+                        }
+                    ],
+                    "object_count": 8,
+                    "crs": "EPSG:3857",
+                },
+                category="sam3",
+                requires_confirmation=True,
+                writes_project=True,
+                preflight=lambda arguments: {
+                    "success": True,
+                    "arguments": arguments,
+                },
+            )
+        ]
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        build_fake_sam3_tools,
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="sam3 continuation",
+        model="sam3-continuation-test-model",
+        source="test",
+    )
+    provider = Sam3ContinuationProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="提取satellite图层中的植被区域，并统计植被面积相当于影像面积的占比",
+    )
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert provider.calls == 5
+    continuation_context = "\n".join(
+        message.content for message in provider.messages_by_call[3]
+    )
+    assert "提取satellite图层中的植被区域" in continuation_context
+    assert "vegetation-layer-id" in continuation_context
+    assert "中间产物，不是任务完成信号" in continuation_context
+    next_confirmation = next(
+        event for event in confirmed_events if event["type"] == "confirm_request"
+    )
+    assert next_confirmation["payload"]["tool_name"] == "execute_gis_code"
+    assert session_db.get_state(f"{session.id}:active_skill") == "gis-pipeline"
+    steps = session_db.get_plan_steps(
+        str(session_db.get_active_task(session.id)["id"])
+    )
+    assert [step["skill_name"] for step in steps] == [
+        "sam3-remote-segmentation",
+        "gis-pipeline",
+    ]
+    assert steps[0]["status"] == "completed"
+    assert steps[1]["status"] == "pending"
+
+
+def test_confirmed_buffer_resumes_plan_and_passes_aoi_layer_to_sam3(
+    tmp_path: Path,
+    monkeypatch,
+):
+    buffer_path = tmp_path / "youth_road_500m_buffer.gpkg"
+    buffer_path.touch()
+
+    def build_fake_execute_tool(**kwargs):
+        del kwargs
+        return ToolEntry(
+            name="execute_gis_code",
+            description="Fake confirmed buffer execution.",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda arguments: {
+                "success": True,
+                "stdout": "500m缓冲区创建完成",
+                "workspace_dir": str(tmp_path),
+                "outputs": [
+                    {
+                        "path": str(buffer_path),
+                        "name": "youth_road_500m_buffer",
+                        "type": "vector",
+                        "exists": True,
+                    }
+                ],
+                "loaded_layers": [
+                    {
+                        "id": "buffer-layer-id",
+                        "name": "youth_road_500m_buffer",
+                        "type": "vector",
+                    }
+                ],
+            },
+            category="analysis",
+            requires_confirmation=True,
+            writes_project=True,
+        )
+
+    def build_fake_sam3_tools(**kwargs):
+        del kwargs
+        read_parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+        segment_parameters = {
+            "type": "object",
+            "properties": {
+                "input_layer_id": {"type": "string"},
+                "mode": {"type": "string"},
+                "prompt": {"type": "string"},
+                "scope_mode": {"type": "string"},
+                "aoi_layer_id": {"type": "string"},
+                "output_types": {"type": "array"},
+                "output_name": {"type": "string"},
+            },
+            "required": ["input_layer_id", "mode"],
+        }
+        return [
+            ToolEntry(
+                name="check_sam3_service",
+                description="Fake SAM3 health check.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "status": "ok",
+                    "model_loaded": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="inspect_sam3_segmentation_inputs",
+                description="Fake SAM3 input inspection.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "inspection_complete": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="segment_remote_sensing_image",
+                description="Fake SAM3 AOI segmentation.",
+                parameters=segment_parameters,
+                handler=lambda arguments: {"success": True},
+                category="sam3",
+                requires_confirmation=True,
+                writes_project=True,
+                preflight=lambda arguments: {
+                    "success": True,
+                    "arguments": arguments,
+                },
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_execute_gis_code_tool",
+        build_fake_execute_tool,
+    )
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        build_fake_sam3_tools,
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="buffer then SAM3",
+        model="buffer-then-sam-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(
+        session.id,
+        "提取青年路500m范围内whch影像中的建筑物并保存building.geojson",
+    )
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "buffer",
+                "skill_name": "qgis-toolbox",
+                "instruction": "生成青年路500m缓冲区",
+                "dependencies": [],
+            },
+            {
+                "id": "segment",
+                "skill_name": "sam3-remote-segmentation",
+                "instruction": "在缓冲区内使用SAM3分割建筑物",
+                "dependencies": ["buffer"],
+            },
+            {
+                "id": "export",
+                "skill_name": "qgis-toolbox",
+                "instruction": "保存为building.geojson",
+                "dependencies": ["segment"],
+            },
+        ],
+    )
+    session_db.set_state(f"{session.id}:active_skill", "qgis-toolbox")
+    provider = BufferThenSamProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="使用SAM3进行建筑物分割，青年路在line1图层中",
+    )
+    buffer_confirmation = next(
+        event for event in events if event["type"] == "confirm_request"
+    )
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=buffer_confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert provider.calls == 3
+    resumed_context = "\n".join(
+        message.content for message in provider.messages_by_call[1]
+    )
+    assert "buffer-layer-id" in resumed_context
+    assert "道路缓冲区应作为后续 SAM3 的 aoi_layer_id" in resumed_context
+    sam_confirmation = next(
+        event for event in confirmed_events if event["type"] == "confirm_request"
+    )
+    assert sam_confirmation["payload"]["tool_name"] == "segment_remote_sensing_image"
+    assert sam_confirmation["payload"]["arguments"]["aoi_layer_id"] == "buffer-layer-id"
+    steps = session_db.get_plan_steps(task_id)
+    assert steps[0]["status"] == "completed"
+    assert steps[1]["status"] == "pending"
+
+
+def test_duplicate_confirmed_sam3_threshold_is_reused_and_next_threshold_runs(
+    tmp_path: Path,
+    monkeypatch,
+):
+    execution_count = {"value": 0}
+    output_path = tmp_path / "building_threshold_0_5.gpkg"
+    output_path.touch()
+
+    def build_fake_sam3_tools(**kwargs):
+        del kwargs
+        read_parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+
+        def segment(arguments):
+            execution_count["value"] += 1
+            threshold = float(arguments["confidence_threshold"])
+            return {
+                "success": True,
+                "job_id": f"job-{threshold}",
+                "mode": "text",
+                "prompt": "building",
+                "confidence_threshold": threshold,
+                "parameters": {
+                    key: value
+                    for key, value in arguments.items()
+                    if key != "_inspection"
+                },
+                "outputs": [
+                    {
+                        "path": str(output_path),
+                        "name": arguments["output_name"],
+                        "type": "vector",
+                    }
+                ],
+                "loaded_layers": [
+                    {
+                        "id": f"building-layer-{threshold}",
+                        "name": arguments["output_name"],
+                        "type": "vector",
+                    }
+                ],
+                "object_count": 4,
+                "crs": "EPSG:2385",
+            }
+
+        return [
+            ToolEntry(
+                name="check_sam3_service",
+                description="Fake SAM3 health check.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "status": "ok",
+                    "model_loaded": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="inspect_sam3_segmentation_inputs",
+                description="Fake SAM3 inspection.",
+                parameters=read_parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "inspection_complete": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="segment_remote_sensing_image",
+                description="Fake threshold segmentation.",
+                parameters=read_parameters,
+                handler=segment,
+                category="sam3",
+                requires_confirmation=True,
+                writes_project=True,
+                preflight=lambda arguments: {
+                    "success": True,
+                    "arguments": arguments,
+                },
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        build_fake_sam3_tools,
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="duplicate SAM3 threshold",
+        model="duplicate-threshold-test-model",
+        source="test",
+    )
+    session_db.set_state(f"{session.id}:active_skill", "sam3-remote-segmentation")
+    provider = DuplicateThresholdProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="使用sam3提取whch图层中的建筑物，阈值分别设为0.5，0.3",
+    )
+    first_confirmation = next(
+        event for event in events if event["type"] == "confirm_request"
+    )
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=first_confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert execution_count["value"] == 1
+    assert provider.calls == 3
+    replay = next(
+        event
+        for event in confirmed_events
+        if event["type"] == "tool_end"
+        and event["payload"]["result"].get("duplicate_prevented")
+    )
+    assert replay["payload"]["result"]["confidence_threshold"] == 0.5
+    second_confirmation = next(
+        event for event in confirmed_events if event["type"] == "confirm_request"
+    )
+    assert second_confirmation["payload"]["arguments"]["confidence_threshold"] == 0.3
+    assert second_confirmation["payload"]["arguments"]["output_name"] == (
+        "building_threshold_0_3"
+    )
+    completed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=second_confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+    assert execution_count["value"] == 2
+    assert provider.calls == 4
+    final_message = next(
+        event for event in reversed(completed_events) if event["type"] == "message"
+    )
+    assert "阈值 0.5 和 0.3" in final_message["payload"]["content"]
+    completed_context = "\n".join(
+        message.content for message in provider.messages_by_call[-1]
+    )
+    assert '"confidence_threshold": 0.5' in completed_context
+    assert '"confidence_threshold": 0.3' in completed_context
+
+
+def test_sam3_inspection_cannot_leak_internal_result_or_ask_natural_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    def build_fake_sam3_tools(**kwargs):
+        del kwargs
+        parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+        return [
+            ToolEntry(
+                name="check_sam3_service",
+                description="Fake health check.",
+                parameters=parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "status": "ok",
+                    "model_loaded": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="inspect_sam3_segmentation_inputs",
+                description="Fake inspection.",
+                parameters=parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "inspection_complete": True,
+                    "input_layer_id": arguments["input_layer_id"],
+                    "input_layer_name": "10000",
+                    "width": 2048,
+                    "height": 2048,
+                    "rgb_bands": [1, 2, 3],
+                    "scope_mode": "full",
+                    "warnings": [],
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="segment_remote_sensing_image",
+                description="Fake road segmentation.",
+                parameters=parameters,
+                handler=lambda arguments: {"success": True},
+                category="sam3",
+                requires_confirmation=True,
+                writes_project=True,
+                preflight=lambda arguments: {
+                    "success": True,
+                    "arguments": arguments,
+                },
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        build_fake_sam3_tools,
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="SAM3 inspection continuation",
+        model="sam3-inspection-continuation-test-model",
+        source="test",
+    )
+    session_db.set_state(f"{session.id}:active_skill", "sam3-remote-segmentation")
+    provider = Sam3InspectionContinuationProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="使用SAM3模型从10000图层中提取出道路",
+    )
+
+    assert provider.calls == 3
+    confirmations = [event for event in events if event["type"] == "confirm_request"]
+    assert len(confirmations) == 1
+    assert confirmations[0]["payload"]["tool_name"] == "segment_remote_sensing_image"
+    assert confirmations[0]["payload"]["arguments"]["prompt"] == "road"
+    messages = [event["payload"]["content"] for event in events if event["type"] == "message"]
+    assert len(messages) == 1
+    assert "需要确认后才能执行" in messages[0]
+    assert "以下是刚刚执行的 QGIS 工具结果" not in messages[0]
+    correction_context = "\n".join(
+        message.content for message in provider.messages_by_call[1]
+    )
+    assert "数据库中没有该工具的真实成功调用" in correction_context
+    real_inspection = next(
+        event
+        for event in events
+        if event["type"] == "tool_end"
+        and event["payload"]["name"] == "inspect_sam3_segmentation_inputs"
+    )
+    assert real_inspection["payload"]["result"]["inspection_complete"] is True
+
+
 def test_load_layer_source_normalization_does_not_truncate_by_extension():
     assert _normalize_source(r"E:\Desktop\test\1.shp数据") == r"E:\Desktop\test\1.shp数据"
     assert _normalize_source('"E:/Desktop/test/2.gpkg"') == "E:/Desktop/test/2.gpkg"
@@ -605,6 +1455,130 @@ def test_execute_gis_code_requires_confirmation_and_runs_worker(tmp_path: Path):
         role == "assistant" and event_type == "summary" and "done" in content
         for role, content, event_type in message_rows
     )
+
+
+def test_completed_single_step_plan_does_not_repeat_confirmed_gis_code(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = tmp_path / "building_smoothed.geojson"
+    output_path.write_text("{}", encoding="utf-8")
+
+    def build_fake_execute_tool(**kwargs):
+        del kwargs
+        return ToolEntry(
+            name="execute_gis_code",
+            description="Fake smoothing execution.",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda arguments: {
+                "success": True,
+                "stdout": "平滑处理完成！",
+                "workspace_dir": str(tmp_path),
+                "outputs": [
+                    {
+                        "path": str(output_path),
+                        "name": "building_smoothed",
+                        "type": "vector",
+                        "exists": True,
+                    }
+                ],
+                "loaded_layers": [
+                    {
+                        "id": "building-smoothed-id",
+                        "name": "building_smoothed",
+                        "type": "vector",
+                    }
+                ],
+            },
+            category="analysis",
+            requires_confirmation=True,
+            writes_project=True,
+        )
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_execute_gis_code_tool",
+        build_fake_execute_tool,
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="smooth once",
+        model="repeating-smoothing-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(session.id, "消除building图层中的边界锯齿")
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "smooth",
+                "skill_name": "qgis-toolbox",
+                "instruction": "平滑building边界并输出结果",
+                "dependencies": [],
+            }
+        ],
+    )
+    session_db.set_state(f"{session.id}:active_skill", "qgis-toolbox")
+    provider = RepeatingSmoothingProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="消除building图层中的边界锯齿",
+    )
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert provider.calls == 1
+    assert not any(event["type"] == "confirm_request" for event in confirmed_events)
+    assert session_db.get_plan_step(task_id, "smooth")["status"] == "completed"
+    assert session_db.get_task(task_id)["status"] == "completed"
+    final_message = next(
+        event for event in reversed(confirmed_events) if event["type"] == "message"
+    )
+    assert "平滑处理完成" in final_message["payload"]["content"]
+
+
+def test_identical_confirmed_gis_code_is_idempotent_within_user_turn(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="dedupe", model="test", source="test")
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+    arguments = {
+        "code": "print('smooth')",
+        "expected_outputs": [
+            {
+                "path": "building_smoothed.geojson",
+                "name": "building_smoothed",
+                "type": "vector",
+            }
+        ],
+    }
+    result = {
+        "success": True,
+        "stdout": "平滑处理完成",
+        "outputs": [{"path": "building_smoothed.geojson", "type": "vector"}],
+        "loaded_layers": [{"id": "smoothed-layer-id"}],
+    }
+
+    core._remember_confirmed_write_call(
+        session.id,
+        "execute_gis_code",
+        arguments,
+        result,
+    )
+    replay = core._confirmed_tool_replay(
+        session.id,
+        "execute_gis_code",
+        arguments,
+    )
+
+    assert replay is not None
+    assert replay["duplicate_prevented"] is True
+    assert replay["already_completed"] is True
+    assert replay["loaded_layers"] == [{"id": "smoothed-layer-id"}]
 
 
 def test_one_shot_business_skill_resets_after_confirmed_execution(
@@ -2187,6 +3161,19 @@ final_count = output_layer.featureCount()
 def test_switching_to_pipeline_starts_new_cycle_after_stale_artifacts(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="new pipeline cycle", model="test", source="test")
+    task_id = session_db.create_task(session.id, "开始新的复杂分析任务")
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "pipeline",
+                "skill_name": "gis-pipeline",
+                "instruction": "执行复杂分析",
+                "dependencies": [],
+            }
+        ],
+    )
+    session_db.update_task(task_id, status="waiting_for_user")
     for stage_name in ("data_overview", "structured_query"):
         session_db.log_stage_artifact(
             session.id,

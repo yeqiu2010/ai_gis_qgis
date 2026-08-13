@@ -341,6 +341,25 @@ textarea {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.settings-divider {
+  align-items: center;
+  border-top: 1px solid #e1e6e9;
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  padding-top: 10px;
+}
+
+.settings-panel .settings-check {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.settings-panel .settings-check input {
+  min-width: auto;
+}
+
 .settings-panel footer p {
   color: #0b6e69;
   flex: 1;

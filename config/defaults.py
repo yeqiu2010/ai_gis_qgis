@@ -2,7 +2,7 @@
 
 PLUGIN_NAME = "AI GIS Agent"
 FRONTEND_DIST_DIR = "resources/frontend_dist"
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 DEFAULT_CONFIG = {
     "config_version": CONFIG_VERSION,
@@ -25,6 +25,20 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 300,
         "max_memory_mb": 2048,
         "workspace_dir": "~/.qgis_hermes_agent/workspaces",
+    },
+    "sam3": {
+        "enabled": True,
+        "base_url": "http://127.0.0.1:8000",
+        "api_token": "",
+        "connect_timeout_seconds": 10,
+        "request_timeout_seconds": 1200,
+        "max_upload_mb": 512,
+        "max_pixels": 100000000,
+        "max_boxes_per_request": 64,
+        "health_cache_seconds": 30,
+        "verify_tls": True,
+        "default_output": "vector",
+        "default_rgb_bands": [1, 2, 3],
     },
     "skills": {
         "custom_skills_dir": "~/.qgis_hermes_agent/custom_skills",

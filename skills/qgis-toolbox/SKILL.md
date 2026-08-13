@@ -44,6 +44,7 @@ metadata:
 4. 只调用一次 `get_qgis_processing_tool` 获取选中算法的完整参数和示例。
 5. 根据真实参数生成完整脚本，并按 `code-reviewer` 规则审查。
 6. 通过 `execute_gis_code` 一次确认执行。生成/导出任务输出到 `QGIS_AGENT_WORKSPACE`；最终结果只是统计结论或当前图层样式变化时可不创建文件。
+7. `execute_gis_code` 成功且输出文件已验证、结果图层已加载后，本单步任务立即完成。不得再次调用 `inspect_layer`、重新检索同一算法或生成第二份等价代码，也不得再次申请确认。若返回 `duplicate_prevented=true` 或 `already_completed=true`，必须复用现有输出并结束该步骤。
 
 字段和值已经由用户明确指定时，直接生成最终 Processing 筛选代码，不得先用
 `execute_gis_code` 打印唯一值做诊断。确需补充探查时优先使用 `inspect_layer`；stdout

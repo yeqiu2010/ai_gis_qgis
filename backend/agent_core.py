@@ -40,6 +40,7 @@ from .tools.pipeline import (
 )
 from .tools.qgis_toolbox import build_qgis_toolbox_tools
 from .tools.registry import ToolRegistry
+from .tools.sam3_segmentation import build_sam3_tools
 from .tools.school_service_coverage import (
     build_inspect_school_service_coverage_inputs_tool,
     build_school_service_coverage_tool,
@@ -150,6 +151,7 @@ class AgentCore:
         iface=None,
         qgis_executor=None,
         executor_config: dict[str, Any] | None = None,
+        sam3_config: dict[str, Any] | None = None,
         custom_tools_dir: str | None = None,
         should_cancel: CancelChecker | None = None,
         llm_retry_attempts: int = 3,
@@ -161,6 +163,7 @@ class AgentCore:
         self.iface = iface
         self.qgis_executor = qgis_executor
         self.executor_config = executor_config or {}
+        self.sam3_config = sam3_config or {}
         self.custom_tools_dir = custom_tools_dir
         self.should_cancel = should_cancel or (lambda: False)
         self.llm_retry_attempts = max(1, llm_retry_attempts)
@@ -247,6 +250,11 @@ class AgentCore:
             event_type="user",
             run_id=run_id,
         )
+        # Preserve the current SAM3 workflow across short follow-ups such as
+        # “继续”; a fresh workflow starts only after the previous one ended.
+        if not self.session_db.get_state(f"{session_id}:sam3_workflow_pending"):
+            self.session_db.delete_state(f"{session_id}:sam3_confirmed_calls")
+        self.session_db.delete_state(f"{session_id}:confirmed_write_calls")
 
         try:
             if qgis_context is None:
@@ -309,12 +317,36 @@ class AgentCore:
                     return events
                 budget.record_iteration()
                 task_must_continue = self._managed_task_must_continue(session_id)
-                if not response.tool_calls and task_must_continue:
-                    expected = (
-                        "当前通用计划尚未完成。请读取 get_task_state，继续未完成步骤；"
-                        "需要用户补充时先把对应步骤标记为 waiting_for_user，"
-                        "所有步骤完成后调用 finalize_task。"
-                    )
+                sam3_must_continue = self._sam3_workflow_must_continue(session_id)
+                leaked_internal_result = self._looks_like_internal_tool_result(
+                    response.content
+                )
+                if not response.tool_calls and (
+                    task_must_continue
+                    or sam3_must_continue
+                    or leaked_internal_result
+                ):
+                    if leaked_internal_result and not self._has_successful_sam3_inspection(
+                        session_id
+                    ):
+                        expected = (
+                            "上一段文本伪装成 inspect_sam3_segmentation_inputs 的工具结果，"
+                            "但数据库中没有该工具的真实成功调用，不能向用户展示或据此执行。"
+                            "必须先真实调用 inspect_sam3_segmentation_inputs；检查成功后再直接调用 "
+                            "segment_remote_sensing_image，由插件创建正式确认请求。"
+                        )
+                    elif sam3_must_continue or leaked_internal_result:
+                        expected = (
+                            "SAM3 输入检查已经成功，分割尚未执行。禁止输出或复述内部工具结果，"
+                            "也禁止用自然语言询问是否确认；必须直接调用 "
+                            "segment_remote_sensing_image，由插件创建唯一的正式确认请求。"
+                        )
+                    else:
+                        expected = (
+                            "当前通用计划尚未完成。请读取 get_task_state，继续未完成步骤；"
+                            "需要用户补充时先把对应步骤标记为 waiting_for_user，"
+                            "所有步骤完成后调用 finalize_task。"
+                        )
                     messages.append(
                         ChatMessage(
                             role="assistant",
@@ -434,6 +466,44 @@ class AgentCore:
                         if isinstance(normalized_arguments, dict):
                             call_arguments = normalized_arguments
                     if entry.requires_confirmation:
+                        replay_result = self._confirmed_tool_replay(
+                            session_id,
+                            call.name,
+                            call_arguments,
+                        )
+                        if replay_result is not None:
+                            self.session_db.log_tool_call(
+                                session_id,
+                                call.name,
+                                call_arguments,
+                                replay_result,
+                                duration_ms=0,
+                            )
+                            tool_results.append(
+                                {
+                                    "name": call.name,
+                                    "arguments": call_arguments,
+                                    "result": replay_result,
+                                }
+                            )
+                            publish(
+                                agent_event(
+                                    "tool_end",
+                                    {
+                                        "name": call.name,
+                                        "result": replay_result,
+                                        "duration_ms": 0,
+                                    },
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                )
+                            )
+                            self._save_process_message(
+                                session_id,
+                                self._duplicate_tool_process_message(call.name),
+                            )
+                            budget.record_tool_call()
+                            continue
                         confirmation_id = str(uuid.uuid4())
                         pending = {
                             "confirmation_id": confirmation_id,
@@ -497,7 +567,21 @@ class AgentCore:
                     )
                     self._save_process_message(session_id, f"调用工具：{call.name}")
                     self._publish_stage_start_if_needed(call.name, call.arguments, publish, session_id, run_id)
-                    result, duration_ms = tool_registry.execute(call.name, call_arguments)
+                    activation_failure = self._skill_activation_precondition(
+                        session_id,
+                        call.name,
+                        call_arguments,
+                    )
+                    if activation_failure is not None:
+                        result, duration_ms = activation_failure, 0
+                    else:
+                        result, duration_ms = tool_registry.execute(call.name, call_arguments)
+                    self._update_sam3_workflow_state(
+                        session_id,
+                        call.name,
+                        call_arguments,
+                        result,
+                    )
                     if check_cancelled():
                         return events
                     if call.name == "set_active_skill" and result.get("success"):
@@ -520,6 +604,10 @@ class AgentCore:
                         previous_skill = active_skill
                         loaded_skills = [str(name) for name in result.get("loaded_skills") or loaded_skills]
                         active_skill = str(result.get("skill_name") or active_skill)
+                        self.session_db.set_state(
+                            f"{session_id}:active_skill",
+                            active_skill,
+                        )
                         if active_skill == "gis-pipeline" and previous_skill != "gis-pipeline":
                             start_pipeline_cycle(self.session_db, session_id)
                         system_prompt = self.prompt_builder.build(
@@ -775,6 +863,12 @@ class AgentCore:
         self._save_process_message(session_id, f"调用工具：{tool_name}")
         self._publish_stage_start_if_needed(tool_name, arguments, publish, session_id, run_id)
         result, duration_ms = tool_registry.execute(tool_name, arguments)
+        self._update_sam3_workflow_state(
+            session_id,
+            tool_name,
+            arguments,
+            result,
+        )
         self.session_db.log_tool_call(
             session_id,
             tool_name,
@@ -812,6 +906,19 @@ class AgentCore:
             if retry_result is not None:
                 result = retry_result
 
+        if result.get("success", True):
+            self._remember_confirmed_sam3_call(
+                session_id,
+                tool_name,
+                arguments,
+                result,
+            )
+            self._remember_confirmed_write_call(
+                session_id,
+                tool_name,
+                arguments,
+                result,
+            )
         self._capture_confirmed_tool_artifacts(session_id, tool_name, result)
         if tool_name == "execute_gis_code":
             self._record_pipeline_execution_result(
@@ -823,7 +930,29 @@ class AgentCore:
             )
         self._reset_one_shot_skill(session_id)
 
-        if result.get("success", True):
+        should_resume_plan = result.get("success", True) and (
+            tool_name == "segment_remote_sensing_image"
+            or self._managed_task_must_continue(session_id)
+        )
+        if should_resume_plan:
+            try:
+                content, paused_for_confirmation = self._continue_after_confirmed_tool(
+                    session_id=session_id,
+                    confirmed_tool_name=tool_name,
+                    confirmed_result=result,
+                    tool_registry=tool_registry,
+                    publish=publish,
+                    run_id=run_id,
+                    on_response=record_response,
+                )
+            except Exception as exc:
+                content = self._format_llm_error(exc)
+                self._publish_final_error(content, publish, session_id, run_id)
+                publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
+                return events
+            if paused_for_confirmation:
+                return events
+        elif result.get("success", True):
             content = self._format_tool_success(tool_name, result)
         else:
             content = self._format_tool_failure(tool_name, result)
@@ -852,6 +981,394 @@ class AgentCore:
         )
         publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
         return events
+
+    def _continue_after_confirmed_tool(
+        self,
+        *,
+        session_id: str,
+        confirmed_tool_name: str,
+        confirmed_result: dict[str, Any],
+        tool_registry: ToolRegistry,
+        publish: EventCallback,
+        run_id: str,
+        on_response: Callable[[ChatResponse], None] | None = None,
+    ) -> tuple[str, bool]:
+        """Resume the same agent turn after a confirmed tool has completed.
+
+        Confirmation used to terminate the turn after executing one tool.  In a
+        managed multi-step task, confirmed outputs such as an AOI buffer or a
+        SAM3 layer are intermediate artifacts and must be returned to the agent
+        loop so the next planned Skill can run.
+        """
+        qgis_context = self._collect_qgis_context()
+        loaded_skills = read_loaded_skills(
+            self.session_db.get_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+        )
+        active_skill = self.session_db.get_state(f"{session_id}:active_skill") or ""
+        if active_skill not in loaded_skills:
+            active_skill = next(
+                (name for name in reversed(loaded_skills) if name != "main-orchestrator"),
+                "main-orchestrator",
+            )
+        system_prompt = self.prompt_builder.build(
+            active_skill,
+            qgis_context,
+            loaded_skills=loaded_skills,
+        )
+        messages = self._build_conversation_messages(session_id)
+        continuation_result = {
+            key: confirmed_result.get(key)
+            for key in (
+                "success",
+                "job_id",
+                "mode",
+                "prompt",
+                "confidence_threshold",
+                "parameters",
+                "source_layer",
+                "outputs",
+                "loaded_layers",
+                "object_count",
+                "crs",
+                "warnings",
+                "stdout",
+                "stderr",
+                "workspace_dir",
+                "delivered_outputs",
+            )
+            if confirmed_result.get(key) is not None
+        }
+        if confirmed_tool_name == "segment_remote_sensing_image":
+            continuation_result["completed_sam3_calls"] = (
+                self._completed_sam3_calls(session_id)
+            )
+            continuation_instruction = (
+                "这是 SAM3 分割产物。若仍有面积、占比、裁剪、相交、统计、导出或制图等要求，"
+                "必须使用 loaded_layers 中的真实 layer_id 继续加载计划指定的 Skill。"
+                "completed_sam3_calls 列出了本次用户请求中已经成功的全部参数组合；"
+                "多个阈值只执行尚未出现在该列表中的值。全部请求阈值都已出现时，"
+                "必须结束分割阶段并完成/最终化计划，严禁再次调用分割工具。"
+            )
+        else:
+            continuation_instruction = (
+                "这是当前计划步骤的执行产物。必须调用 get_task_state 读取下一未完成步骤，"
+                "使用 outputs/loaded_layers 中的真实路径和 layer_id 加载该步骤指定的 Skill；"
+                "例如前一步生成的道路缓冲区应作为后续 SAM3 的 aoi_layer_id，不能停在缓冲区。"
+            )
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content=(
+                    f"已确认并成功执行工具 {confirmed_tool_name}。"
+                    "以下结果是当前用户请求的中间产物，不是任务完成信号。"
+                    "请重新阅读本轮用户的完整原始请求和持久化计划。"
+                    f"{continuation_instruction}只有全部计划步骤和交付文件完成后才能最终回复。\n"
+                    f"确认工具结果：{json.dumps(continuation_result, ensure_ascii=False)}"
+                ),
+            )
+        )
+        budget = IterationBudget()
+        last_response: ChatResponse | None = None
+        while not budget.exhausted:
+            response = self._chat_with_retries(
+                system=system_prompt,
+                messages=messages,
+                tools=tool_registry.definitions_for_skills(loaded_skills),
+                publish=publish,
+                session_id=session_id,
+                run_id=run_id,
+                on_response=on_response,
+            )
+            last_response = response
+            budget.record_iteration()
+            if not response.tool_calls:
+                task_must_continue = self._managed_task_must_continue(session_id)
+                sam3_must_continue = self._sam3_workflow_must_continue(session_id)
+                leaked_internal_result = self._looks_like_internal_tool_result(
+                    response.content
+                )
+                if task_must_continue or sam3_must_continue or leaked_internal_result:
+                    if leaked_internal_result and not self._has_successful_sam3_inspection(
+                        session_id
+                    ):
+                        continuation = (
+                            "上一段是伪造/泄漏的内部工具结果，数据库中没有真实 SAM3 输入检查。"
+                            "必须先调用 inspect_sam3_segmentation_inputs，再调用分割工具；"
+                            "不得把该文本回复给用户。"
+                        )
+                    elif sam3_must_continue or leaked_internal_result:
+                        continuation = (
+                            "SAM3 输入检查已经成功，必须直接调用 "
+                            "segment_remote_sensing_image 创建插件正式确认请求；"
+                            "禁止输出自然语言确认说明或内部工具结果。"
+                        )
+                    else:
+                        continuation = (
+                            "当前计划尚未完成。读取 get_task_state 并继续未完成步骤；"
+                            "完成全部步骤和必需产物后再调用 finalize_task。"
+                        )
+                    messages.append(
+                        ChatMessage(
+                            role="assistant",
+                            content=continuation,
+                        )
+                    )
+                    continue
+                return response.content, False
+
+            tool_results: list[dict[str, Any]] = []
+            for call in response.tool_calls:
+                entry = tool_registry.get(call.name)
+                call_arguments = call.arguments
+                preflight_result: dict[str, Any] | None = None
+                if call.name == "execute_gis_code":
+                    preflight_result = validate_execute_gis_code_arguments(call_arguments)
+                elif entry.requires_confirmation and entry.preflight is not None:
+                    publish(
+                        agent_event(
+                            "tool_start",
+                            {"name": call.name, "arguments": call_arguments},
+                            session_id=session_id,
+                            run_id=run_id,
+                        )
+                    )
+                    started = time.monotonic()
+                    try:
+                        preflight_result = entry.preflight(call_arguments)
+                    except Exception as exc:
+                        preflight_result = {
+                            "success": False,
+                            "error": str(exc),
+                            "preflight_failed": True,
+                        }
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    self.session_db.log_tool_call(
+                        session_id,
+                        call.name,
+                        call_arguments,
+                        preflight_result,
+                        duration_ms=duration_ms,
+                    )
+                    publish(
+                        agent_event(
+                            "tool_end",
+                            {
+                                "name": call.name,
+                                "result": preflight_result,
+                                "duration_ms": duration_ms,
+                            },
+                            session_id=session_id,
+                            run_id=run_id,
+                        )
+                    )
+                    if preflight_result.get("success"):
+                        normalized = preflight_result.get("arguments")
+                        if isinstance(normalized, dict):
+                            call_arguments = normalized
+
+                if preflight_result is not None and not preflight_result.get("success"):
+                    if call.name == "execute_gis_code":
+                        publish(
+                            agent_event(
+                                "tool_start",
+                                {"name": call.name, "arguments": call_arguments},
+                                session_id=session_id,
+                                run_id=run_id,
+                            )
+                        )
+                        self.session_db.log_tool_call(
+                            session_id,
+                            call.name,
+                            call_arguments,
+                            preflight_result,
+                            duration_ms=0,
+                        )
+                        publish(
+                            agent_event(
+                                "tool_end",
+                                {"name": call.name, "result": preflight_result, "duration_ms": 0},
+                                session_id=session_id,
+                                run_id=run_id,
+                            )
+                        )
+                    tool_results.append(
+                        {
+                            "name": call.name,
+                            "arguments": call_arguments,
+                            "result": preflight_result,
+                        }
+                    )
+                    budget.record_tool_call()
+                    continue
+
+                if entry.requires_confirmation:
+                    replay_result = self._confirmed_tool_replay(
+                        session_id,
+                        call.name,
+                        call_arguments,
+                    )
+                    if replay_result is not None:
+                        self.session_db.log_tool_call(
+                            session_id,
+                            call.name,
+                            call_arguments,
+                            replay_result,
+                            duration_ms=0,
+                        )
+                        publish(
+                            agent_event(
+                                "tool_end",
+                                {
+                                    "name": call.name,
+                                    "result": replay_result,
+                                    "duration_ms": 0,
+                                },
+                                session_id=session_id,
+                                run_id=run_id,
+                            )
+                        )
+                        self._save_process_message(
+                            session_id,
+                            self._duplicate_tool_process_message(call.name),
+                        )
+                        tool_results.append(
+                            {
+                                "name": call.name,
+                                "arguments": call_arguments,
+                                "result": replay_result,
+                            }
+                        )
+                        budget.record_tool_call()
+                        continue
+                    self._request_tool_confirmation(
+                        session_id=session_id,
+                        run_id=run_id,
+                        tool_name=call.name,
+                        arguments=call_arguments,
+                        tool_registry=tool_registry,
+                        publish=publish,
+                        model=response.model,
+                    )
+                    return "", True
+
+                publish(
+                    agent_event(
+                        "tool_start",
+                        {"name": call.name, "arguments": call_arguments},
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
+                )
+                self._save_process_message(session_id, f"调用工具：{call.name}")
+                self._publish_stage_start_if_needed(
+                    call.name, call_arguments, publish, session_id, run_id
+                )
+                previous_skill = active_skill
+                activation_failure = self._skill_activation_precondition(
+                    session_id,
+                    call.name,
+                    call_arguments,
+                )
+                if activation_failure is not None:
+                    result, duration_ms = activation_failure, 0
+                else:
+                    result, duration_ms = tool_registry.execute(call.name, call_arguments)
+                self._update_sam3_workflow_state(
+                    session_id,
+                    call.name,
+                    call_arguments,
+                    result,
+                )
+                if call.name in {"load_skill", "set_active_skill"} and result.get("success"):
+                    active_skill = str(
+                        result.get("skill_name")
+                        or result.get("active_skill")
+                        or active_skill
+                    )
+                    self.session_db.set_state(f"{session_id}:active_skill", active_skill)
+                    loaded_skills = read_loaded_skills(
+                        self.session_db.get_state,
+                        session_id,
+                        self.prompt_builder.skill_manager,
+                    )
+                    if active_skill == "gis-pipeline" and previous_skill != "gis-pipeline":
+                        start_pipeline_cycle(self.session_db, session_id)
+                    if call.name == "load_skill":
+                        self._record_main_loop_skill_invocation(
+                            session_id,
+                            active_skill,
+                            call_arguments,
+                            result,
+                        )
+                elif call.name == "unload_skill" and result.get("success"):
+                    loaded_skills = read_loaded_skills(
+                        self.session_db.get_state,
+                        session_id,
+                        self.prompt_builder.skill_manager,
+                    )
+                    active_skill = self.session_db.get_state(
+                        f"{session_id}:active_skill"
+                    ) or "main-orchestrator"
+                self.session_db.log_tool_call(
+                    session_id,
+                    call.name,
+                    call_arguments,
+                    result,
+                    duration_ms=duration_ms,
+                )
+                publish(
+                    agent_event(
+                        "tool_end",
+                        {"name": call.name, "result": result, "duration_ms": duration_ms},
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
+                )
+                self._save_process_message(
+                    session_id, self._format_tool_process(call.name, result)
+                )
+                self._publish_stage_end_if_needed(
+                    call.name, result, publish, session_id, run_id
+                )
+                requested_tool_call = self._requested_tool_call_from_result(result)
+                if requested_tool_call is not None:
+                    self._request_tool_confirmation(
+                        session_id=session_id,
+                        run_id=run_id,
+                        tool_name=requested_tool_call["name"],
+                        arguments=requested_tool_call["arguments"],
+                        tool_registry=tool_registry,
+                        publish=publish,
+                        model=response.model,
+                    )
+                    return "", True
+                tool_results.append(
+                    {"name": call.name, "arguments": call_arguments, "result": result}
+                )
+                budget.record_tool_call()
+
+            qgis_context = self._collect_qgis_context()
+            system_prompt = self.prompt_builder.build(
+                active_skill,
+                qgis_context,
+                loaded_skills=loaded_skills,
+            )
+            messages.append(
+                ChatMessage(
+                    role="assistant",
+                    content=(
+                        "以下是继续执行用户原始请求得到的工具结果。"
+                        "若仍有未完成要求，继续调用工具；只有全部完成或确实需要用户补充时才回复：\n"
+                        f"{json.dumps(tool_results, ensure_ascii=False)}"
+                    ),
+                )
+            )
+
+        if last_response is not None and last_response.content:
+            return last_response.content, False
+        return "任务未完成：确认后的后续处理达到迭代或工具预算。", False
 
     def _build_tool_registry(self, session_id: str) -> ToolRegistry:
         registry = ToolRegistry()
@@ -964,6 +1481,16 @@ class AgentCore:
             executor_config=self.executor_config,
         ):
             registry.register(entry)
+        for entry in build_sam3_tools(
+            config=self.sam3_config,
+            executor_config=self.executor_config,
+            session_db=self.session_db,
+            session_id=session_id,
+            iface=self.iface,
+            qgis_executor=self.qgis_executor,
+            should_cancel=self.should_cancel,
+        ):
+            registry.register(entry)
         for entry in load_custom_tool_entries(self.custom_tools_dir):
             registry.register(entry)
         registry.register(
@@ -993,7 +1520,161 @@ class AgentCore:
         }:
             return False
         steps = self.session_db.get_plan_steps(str(task["id"]))
-        return bool(steps)
+        return any(
+            step.get("status") not in {"completed", "skipped"}
+            for step in steps
+        )
+
+    def _sam3_workflow_must_continue(self, session_id: str) -> bool:
+        return bool(self.session_db.get_state(f"{session_id}:sam3_workflow_pending"))
+
+    @staticmethod
+    def _looks_like_internal_tool_result(content: str) -> bool:
+        text = str(content or "").strip()
+        if not text:
+            return False
+        internal_prefixes = (
+            "以下是刚刚执行的 QGIS 工具结果",
+            "以下是继续执行用户原始请求得到的工具结果",
+        )
+        if any(text.startswith(prefix) for prefix in internal_prefixes):
+            return True
+        return (
+            "inspect_sam3_segmentation_inputs" in text
+            and '"inspection_complete"' in text
+            and '"result"' in text
+        )
+
+    def _has_successful_sam3_inspection(self, session_id: str) -> bool:
+        return any(
+            call.get("tool_name") == "inspect_sam3_segmentation_inputs"
+            and bool(call.get("success"))
+            and bool((call.get("result") or {}).get("inspection_complete"))
+            for call in self.session_db.get_recent_tool_calls(session_id, limit=20)
+        )
+
+    def _update_sam3_workflow_state(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        key = f"{session_id}:sam3_workflow_pending"
+        if tool_name == "inspect_sam3_segmentation_inputs":
+            if result.get("success") and result.get("inspection_complete"):
+                compact_result = {
+                    field: result.get(field)
+                    for field in (
+                        "input_layer",
+                        "input_layer_id",
+                        "input_layer_name",
+                        "width",
+                        "height",
+                        "rgb_bands",
+                        "scope_mode",
+                        "scope_extent",
+                        "estimated_pixels",
+                        "estimated_upload_size_display",
+                        "warnings",
+                    )
+                    if result.get(field) is not None
+                }
+                self.session_db.set_state(
+                    key,
+                    json.dumps(
+                        {
+                            "arguments": arguments,
+                            "inspection": compact_result,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            else:
+                self.session_db.delete_state(key)
+        elif tool_name == "segment_remote_sensing_image":
+            # A real execution attempt resolves the inspection-to-confirmation
+            # workflow. Success/failure is then reported from the tool result.
+            self.session_db.delete_state(key)
+
+    def _skill_activation_precondition(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Keep generic Pipeline activation behind the persisted task plan.
+
+        Semantic routing remains the model's responsibility.  Once it chooses a
+        multi-step Pipeline, however, the runtime must not let that generic path
+        bypass planning or an earlier specialised-Skill step.
+        """
+        if tool_name not in {"load_skill", "set_active_skill"}:
+            return None
+        target_skill = str(arguments.get("skill_name") or "").strip()
+        if target_skill != "gis-pipeline":
+            return None
+
+        task = self.session_db.get_active_task(session_id)
+        if task is None or task.get("status") in {"completed", "failed", "cancelled"}:
+            return {
+                "success": False,
+                "error_code": "plan_required_before_pipeline",
+                "error": (
+                    "gis-pipeline 只能在 create_plan 建立多步骤计划后加载。"
+                    "请重新对照专用 Skill 目录；若任务包含影像地物提取与后续统计，"
+                    "计划必须先执行对应的影像分割 Skill，再把 gis-pipeline 设为依赖步骤。"
+                ),
+            }
+
+        steps = self.session_db.get_plan_steps(str(task["id"]))
+        if not steps:
+            return {
+                "success": False,
+                "error_code": "plan_required_before_pipeline",
+                "error": "当前任务尚无计划步骤，请先调用 create_plan，再加载 gis-pipeline。",
+            }
+
+        steps_by_id = {str(step["id"]): step for step in steps}
+        ready_steps: list[dict[str, Any]] = []
+        for step in steps:
+            if step.get("status") in {"completed", "skipped"}:
+                continue
+            dependencies = [
+                steps_by_id.get(str(dependency))
+                for dependency in step.get("dependencies") or []
+            ]
+            if all(
+                dependency is not None
+                and dependency.get("status") in {"completed", "skipped"}
+                for dependency in dependencies
+            ):
+                ready_steps.append(step)
+
+        required_step = next(
+            (
+                step
+                for step in ready_steps
+                if str(step.get("skill_name") or "").strip()
+            ),
+            None,
+        )
+        if required_step is None:
+            return None
+        required_skill = str(required_step.get("skill_name") or "").strip()
+        if required_skill == target_skill:
+            return None
+        return {
+            "success": False,
+            "error_code": "skill_order_violation",
+            "error": (
+                f"计划中的当前前置步骤 {required_step['id']} 必须先使用 "
+                f"{required_skill} 完成；在该步骤及其真实产物完成前不能加载 "
+                "gis-pipeline。"
+            ),
+            "required_step_id": str(required_step["id"]),
+            "required_skill": required_skill,
+        }
 
     def _record_main_loop_skill_invocation(
         self,
@@ -1093,6 +1774,7 @@ class AgentCore:
             "artifacts": artifact_ids,
             "outputs": result.get("outputs") or [],
             "loaded_layers": result.get("loaded_layers") or [],
+            "parameters": result.get("parameters") or {},
         }
         self.session_db.update_plan_step(
             task_id,
@@ -1129,6 +1811,22 @@ class AgentCore:
                     "name": output.get("name") or output.get("path"),
                     "uri": output.get("path") or output.get("absolute_path"),
                     "payload": output,
+                    "verified": True,
+                }
+            )
+        if tool_name == "segment_remote_sensing_image" and artifacts:
+            artifacts.append(
+                {
+                    "artifact_type": "segmentation_outputs",
+                    "name": "SAM3 segmentation outputs",
+                    "payload": {
+                        "job_id": result.get("job_id"),
+                        "confidence_threshold": result.get("confidence_threshold"),
+                        "parameters": result.get("parameters") or {},
+                        "outputs": result.get("outputs") or [],
+                        "loaded_layers": result.get("loaded_layers") or [],
+                        "object_count": result.get("object_count"),
+                    },
                     "verified": True,
                 }
             )
@@ -1325,6 +2023,232 @@ class AgentCore:
             self.prompt_builder.skill_manager,
             [name for name in loaded if name != active_skill],
         )
+
+    @staticmethod
+    def _sam3_call_parameters(arguments: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "input_layer_id",
+            "mode",
+            "prompt",
+            "scope_mode",
+            "aoi_layer_id",
+            "boxes_layer_id",
+            "selected_only",
+            "rgb_bands",
+            "stretch_percentiles",
+            "confidence_threshold",
+            "min_size_pixels",
+            "max_size_pixels",
+            "output_types",
+        )
+        parameters = {
+            key: arguments.get(key)
+            for key in keys
+            if arguments.get(key) is not None
+        }
+        output_types = parameters.get("output_types")
+        if isinstance(output_types, list):
+            parameters["output_types"] = sorted(str(value) for value in output_types)
+        threshold = parameters.get("confidence_threshold")
+        if threshold is not None:
+            parameters["confidence_threshold"] = float(threshold)
+        return parameters
+
+    @classmethod
+    def _sam3_call_fingerprint(cls, arguments: dict[str, Any]) -> str:
+        return json.dumps(
+            cls._sam3_call_parameters(arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _remember_confirmed_sam3_call(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        if tool_name != "segment_remote_sensing_image":
+            return
+        key = f"{session_id}:sam3_confirmed_calls"
+        raw = self.session_db.get_state(key)
+        try:
+            history = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            history = {}
+        if not isinstance(history, dict):
+            history = {}
+        fingerprint = self._sam3_call_fingerprint(arguments)
+        history[fingerprint] = {
+            "parameters": self._sam3_call_parameters(arguments),
+            "result": {
+                field: result.get(field)
+                for field in (
+                    "job_id",
+                    "mode",
+                    "prompt",
+                    "confidence_threshold",
+                    "outputs",
+                    "loaded_layers",
+                    "object_count",
+                    "crs",
+                    "warnings",
+                )
+                if result.get(field) is not None
+            },
+        }
+        self.session_db.set_state(key, json.dumps(history, ensure_ascii=False))
+
+    def _confirmed_sam3_replay(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if tool_name != "segment_remote_sensing_image":
+            return None
+        raw = self.session_db.get_state(f"{session_id}:sam3_confirmed_calls")
+        if not raw:
+            return None
+        try:
+            history = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(history, dict):
+            return None
+        completed = history.get(self._sam3_call_fingerprint(arguments))
+        if not isinstance(completed, dict):
+            return None
+        previous_result = completed.get("result")
+        result = dict(previous_result) if isinstance(previous_result, dict) else {}
+        return {
+            "success": True,
+            **result,
+            "parameters": completed.get("parameters") or {},
+            "already_completed": True,
+            "duplicate_prevented": True,
+            "message": (
+                "相同参数的 SAM3 分割已在本次用户请求中成功完成，"
+                "已复用现有 job 和输出；禁止再次提交。"
+            ),
+        }
+
+    def _confirmed_tool_replay(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        sam3_replay = self._confirmed_sam3_replay(
+            session_id,
+            tool_name,
+            arguments,
+        )
+        if sam3_replay is not None:
+            return sam3_replay
+        if tool_name != "execute_gis_code":
+            return None
+        raw = self.session_db.get_state(f"{session_id}:confirmed_write_calls")
+        if not raw:
+            return None
+        try:
+            history = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(history, dict):
+            return None
+        fingerprint = self._confirmed_write_fingerprint(tool_name, arguments)
+        completed = history.get(fingerprint)
+        if not isinstance(completed, dict):
+            return None
+        return {
+            "success": True,
+            **completed,
+            "already_completed": True,
+            "duplicate_prevented": True,
+            "message": (
+                "相同的已确认 GIS 代码已在本次用户请求中成功执行，"
+                "已复用现有输出；禁止重复执行或再次请求确认。"
+            ),
+        }
+
+    @staticmethod
+    def _duplicate_tool_process_message(tool_name: str) -> str:
+        if tool_name == "segment_remote_sensing_image":
+            return "已阻止重复的 SAM3 分割请求，继续处理尚未完成的其他阈值。"
+        return "已阻止重复执行相同的 GIS 代码，复用现有输出并继续完成剩余计划。"
+
+    @staticmethod
+    def _confirmed_write_fingerprint(
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        return json.dumps(
+            {"tool_name": tool_name, "arguments": arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _remember_confirmed_write_call(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        if tool_name != "execute_gis_code":
+            return
+        key = f"{session_id}:confirmed_write_calls"
+        raw = self.session_db.get_state(key)
+        try:
+            history = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            history = {}
+        if not isinstance(history, dict):
+            history = {}
+        history[self._confirmed_write_fingerprint(tool_name, arguments)] = {
+            field: result.get(field)
+            for field in (
+                "stdout",
+                "stderr",
+                "workspace_dir",
+                "outputs",
+                "loaded_layers",
+                "delivered_outputs",
+            )
+            if result.get(field) is not None
+        }
+        self.session_db.set_state(key, json.dumps(history, ensure_ascii=False))
+
+    def _completed_sam3_calls(self, session_id: str) -> list[dict[str, Any]]:
+        raw = self.session_db.get_state(f"{session_id}:sam3_confirmed_calls")
+        if not raw:
+            return []
+        try:
+            history = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(history, dict):
+            return []
+        completed: list[dict[str, Any]] = []
+        for item in history.values():
+            if not isinstance(item, dict):
+                continue
+            result = item.get("result")
+            completed.append(
+                {
+                    "parameters": item.get("parameters") or {},
+                    "job_id": result.get("job_id") if isinstance(result, dict) else None,
+                    "outputs": result.get("outputs") if isinstance(result, dict) else [],
+                    "loaded_layers": (
+                        result.get("loaded_layers") if isinstance(result, dict) else []
+                    ),
+                }
+            )
+        return completed
 
     def _confirmation_key(self, session_id: str, confirmation_id: str) -> str:
         return f"{session_id}:pending_confirmation:{confirmation_id}"

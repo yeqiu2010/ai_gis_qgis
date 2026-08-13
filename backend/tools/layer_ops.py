@@ -398,10 +398,12 @@ def build_zoom_to_layer_tool(iface=None, qgis_executor=None) -> ToolEntry:
             if iface is None:
                 raise RuntimeError("当前没有 QGIS iface，无法控制地图画布。")
             layer = _find_layer(str(arguments.get("layer_id") or arguments.get("layer_name") or ""))
-            canvas = iface.mapCanvas()
-            canvas.setExtent(layer.extent())
-            canvas.refresh()
-            return {"layer": _layer_summary(layer), "zoomed": True}
+            canvas_extent = _zoom_canvas_to_layer(layer, iface)
+            return {
+                "layer": _layer_summary(layer),
+                "canvas_extent": canvas_extent,
+                "zoomed": True,
+            }
 
         return _run_qgis(qgis_executor, operation)
 
@@ -419,6 +421,48 @@ def build_zoom_to_layer_tool(iface=None, qgis_executor=None) -> ToolEntry:
         handler=handler,
         category="layer",
     )
+
+
+def _zoom_canvas_to_layer(layer, iface) -> dict[str, float]:
+    """Zoom in canvas CRS without changing the user's map rotation."""
+    if iface is None:
+        raise RuntimeError("当前没有 QGIS iface，无法控制地图画布。")
+    update_extents = getattr(layer, "updateExtents", None)
+    if callable(update_extents):
+        update_extents()
+    canvas = iface.mapCanvas()
+    rotation_getter = getattr(canvas, "rotation", None)
+    rotation_setter = getattr(canvas, "setRotation", None)
+    original_rotation = (
+        float(rotation_getter()) if callable(rotation_getter) else None
+    )
+    extent = layer.extent()
+    layer_crs = layer.crs()
+    canvas_crs = canvas.mapSettings().destinationCrs()
+    if (
+        layer_crs.isValid()
+        and canvas_crs.isValid()
+        and layer_crs != canvas_crs
+    ):
+        from qgis.core import QgsCoordinateTransform, QgsProject
+
+        extent = QgsCoordinateTransform(
+            layer_crs,
+            canvas_crs,
+            QgsProject.instance(),
+        ).transformBoundingBox(extent)
+    canvas.setExtent(extent)
+    if original_rotation is not None and callable(rotation_setter):
+        current_rotation = float(rotation_getter()) if callable(rotation_getter) else None
+        if current_rotation != original_rotation:
+            rotation_setter(original_rotation)
+    canvas.refresh()
+    return {
+        "xmin": float(extent.xMinimum()),
+        "ymin": float(extent.yMinimum()),
+        "xmax": float(extent.xMaximum()),
+        "ymax": float(extent.yMaximum()),
+    }
 
 
 def build_set_style_tool(

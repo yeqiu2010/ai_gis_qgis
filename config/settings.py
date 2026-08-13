@@ -6,6 +6,7 @@ import copy
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .defaults import CONFIG_VERSION, DEFAULT_CONFIG
 
@@ -34,17 +35,44 @@ class SettingsManager:
             if legacy_max_tokens in {4096, 8192}:
                 config["llm"]["max_tokens"] = DEFAULT_CONFIG["llm"]["max_tokens"]
         config["config_version"] = CONFIG_VERSION
+        self._normalize(config)
         return config
 
     def save(self, config: dict[str, Any]) -> dict[str, Any]:
         merged = copy.deepcopy(DEFAULT_CONFIG)
         self._deep_update(merged, config)
+        self._normalize(merged)
         raw = json.dumps(merged, ensure_ascii=False, indent=2)
         if self._qsettings is not None:
             self._qsettings.setValue(SETTINGS_KEY, raw)
         FALLBACK_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         FALLBACK_SETTINGS_PATH.write_text(raw, encoding="utf-8")
         return merged
+
+    def _normalize(self, config: dict[str, Any]) -> None:
+        sam3 = config.setdefault("sam3", {})
+        base_url = str(sam3.get("base_url") or "").strip().rstrip("/")
+        if base_url:
+            parsed = urlparse(base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("SAM3 Base URL 必须是有效的 http/https 地址。")
+        sam3["base_url"] = base_url
+        bands = sam3.get("default_rgb_bands") or [1, 2, 3]
+        if not isinstance(bands, list) or len(bands) != 3:
+            raise ValueError("SAM3 default_rgb_bands 必须包含 3 个波段编号。")
+        sam3["default_rgb_bands"] = [int(value) for value in bands]
+        for key, minimum in (
+            ("connect_timeout_seconds", 1),
+            ("request_timeout_seconds", 1),
+            ("max_upload_mb", 1),
+            ("max_pixels", 1),
+            ("max_boxes_per_request", 1),
+            ("health_cache_seconds", 0),
+        ):
+            value = int(sam3.get(key) or 0)
+            if value < minimum:
+                raise ValueError(f"SAM3 {key} 必须大于等于 {minimum}。")
+            sam3[key] = value
 
     def _read_raw_values(self) -> list[str]:
         values = []

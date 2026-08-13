@@ -32,6 +32,7 @@ let clockTimer: number | undefined
 const settingsOpen = ref(false)
 const settingsSaving = ref(false)
 const settingsMessage = ref('')
+const sam3Testing = ref(false)
 const settings = ref<AppSettings | null>(null)
 const settingsForm = ref({
   provider: 'openai_compatible',
@@ -49,6 +50,17 @@ const providerOptions = [
   { value: 'ollama', label: 'Ollama' },
   { value: 'echo', label: 'Echo（离线测试）' }
 ]
+const sam3Form = ref({
+  enabled: true,
+  base_url: 'http://127.0.0.1:8000',
+  api_token: '',
+  connect_timeout_seconds: 10,
+  request_timeout_seconds: 1200,
+  max_upload_mb: 512,
+  max_pixels: 100000000,
+  max_boxes_per_request: 64,
+  verify_tls: true
+})
 
 const { status, request } = useBridge((event) => {
   if (event.type === 'run_start') {
@@ -303,6 +315,17 @@ async function loadSettings() {
     max_context_tokens: Number(loaded.llm?.max_context_tokens ?? 32768),
     request_timeout_seconds: Number(loaded.llm?.request_timeout_seconds ?? 300)
   }
+  sam3Form.value = {
+    enabled: Boolean(loaded.sam3?.enabled ?? true),
+    base_url: loaded.sam3?.base_url || 'http://127.0.0.1:8000',
+    api_token: loaded.sam3?.api_token || '',
+    connect_timeout_seconds: Number(loaded.sam3?.connect_timeout_seconds ?? 10),
+    request_timeout_seconds: Number(loaded.sam3?.request_timeout_seconds ?? 1200),
+    max_upload_mb: Number(loaded.sam3?.max_upload_mb ?? 512),
+    max_pixels: Number(loaded.sam3?.max_pixels ?? 100000000),
+    max_boxes_per_request: Number(loaded.sam3?.max_boxes_per_request ?? 64),
+    verify_tls: Boolean(loaded.sam3?.verify_tls ?? true)
+  }
 }
 
 async function openSettings() {
@@ -328,6 +351,18 @@ async function saveSettings() {
         max_tokens: Number(settingsForm.value.max_tokens),
         max_context_tokens: Number(settingsForm.value.max_context_tokens),
         request_timeout_seconds: Number(settingsForm.value.request_timeout_seconds)
+      },
+      sam3: {
+        ...(current.sam3 || {}),
+        enabled: sam3Form.value.enabled,
+        base_url: sam3Form.value.base_url.trim(),
+        api_token: sam3Form.value.api_token.trim(),
+        connect_timeout_seconds: Number(sam3Form.value.connect_timeout_seconds),
+        request_timeout_seconds: Number(sam3Form.value.request_timeout_seconds),
+        max_upload_mb: Number(sam3Form.value.max_upload_mb),
+        max_pixels: Number(sam3Form.value.max_pixels),
+        max_boxes_per_request: Number(sam3Form.value.max_boxes_per_request),
+        verify_tls: sam3Form.value.verify_tls
       }
     })
     settings.value = saved
@@ -341,9 +376,46 @@ async function saveSettings() {
       max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768),
       request_timeout_seconds: Number(saved.llm?.request_timeout_seconds ?? 300)
     }
+    sam3Form.value = {
+      enabled: Boolean(saved.sam3?.enabled ?? true),
+      base_url: saved.sam3?.base_url || 'http://127.0.0.1:8000',
+      api_token: saved.sam3?.api_token || '',
+      connect_timeout_seconds: Number(saved.sam3?.connect_timeout_seconds ?? 10),
+      request_timeout_seconds: Number(saved.sam3?.request_timeout_seconds ?? 1200),
+      max_upload_mb: Number(saved.sam3?.max_upload_mb ?? 512),
+      max_pixels: Number(saved.sam3?.max_pixels ?? 100000000),
+      max_boxes_per_request: Number(saved.sam3?.max_boxes_per_request ?? 64),
+      verify_tls: Boolean(saved.sam3?.verify_tls ?? true)
+    }
     settingsMessage.value = '设置已保存。'
+  } catch (error) {
+    settingsMessage.value = `设置保存失败：${String(error)}`
   } finally {
     settingsSaving.value = false
+  }
+}
+
+async function testSam3Connection() {
+  sam3Testing.value = true
+  settingsMessage.value = '正在检查 SAM3 服务...'
+  try {
+    const result = await request<Record<string, unknown>>('testSam3Connection', {
+      sam3: {
+        enabled: sam3Form.value.enabled,
+        base_url: sam3Form.value.base_url.trim(),
+        api_token: sam3Form.value.api_token.trim(),
+        connect_timeout_seconds: Number(sam3Form.value.connect_timeout_seconds),
+        request_timeout_seconds: Number(sam3Form.value.request_timeout_seconds),
+        verify_tls: sam3Form.value.verify_tls
+      }
+    })
+    settingsMessage.value = result.success
+      ? `SAM3 已就绪：${String(result.device || '')}，${Number(result.latency_ms || 0)} ms`
+      : `SAM3 连接失败：${String(result.error || '模型未就绪')}`
+  } catch (error) {
+    settingsMessage.value = `SAM3 连接失败：${String(error)}`
+  } finally {
+    sam3Testing.value = false
   }
 }
 
@@ -756,6 +828,50 @@ async function waitForPaint() {
           />
         </label>
       </div>
+      <div class="settings-divider">
+        <strong>SAM3 遥感分割服务</strong>
+        <label class="settings-check">
+          <input v-model="sam3Form.enabled" type="checkbox" />
+          <span>启用</span>
+        </label>
+      </div>
+      <label>
+        <span>SAM3 Base URL</span>
+        <input v-model="sam3Form.base_url" type="text" placeholder="http://127.0.0.1:8000" />
+      </label>
+      <label>
+        <span>API Token（可选）</span>
+        <input v-model="sam3Form.api_token" type="password" placeholder="无鉴权服务可留空" />
+      </label>
+      <div class="settings-grid">
+        <label>
+          <span>连接超时（秒）</span>
+          <input v-model.number="sam3Form.connect_timeout_seconds" type="number" min="1" max="300" />
+        </label>
+        <label>
+          <span>推理超时（秒）</span>
+          <input v-model.number="sam3Form.request_timeout_seconds" type="number" min="10" max="7200" step="30" />
+        </label>
+        <label>
+          <span>最大上传（MB）</span>
+          <input v-model.number="sam3Form.max_upload_mb" type="number" min="1" max="10240" />
+        </label>
+        <label>
+          <span>最大像元数</span>
+          <input v-model.number="sam3Form.max_pixels" type="number" min="1" step="1000000" />
+        </label>
+        <label>
+          <span>单次最大框数</span>
+          <input v-model.number="sam3Form.max_boxes_per_request" type="number" min="1" max="10000" />
+        </label>
+        <label class="settings-check">
+          <input v-model="sam3Form.verify_tls" type="checkbox" />
+          <span>校验 HTTPS 证书</span>
+        </label>
+      </div>
+      <button type="button" class="secondary-action" :disabled="sam3Testing" @click="testSam3Connection">
+        {{ sam3Testing ? '检查中...' : '测试 SAM3 连接' }}
+      </button>
       <footer>
         <p>{{ settingsMessage }}</p>
         <button type="button" class="secondary-action" @click="settingsOpen = false">取消</button>

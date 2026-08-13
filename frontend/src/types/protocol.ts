@@ -9,6 +9,7 @@ export type RPCMethod =
   | 'cancelRun'
   | 'getSettings'
   | 'saveSettings'
+  | 'testSam3Connection'
 
 export interface RPCRequest {
   id: number
@@ -152,6 +153,19 @@ export interface AppSettings {
     max_tokens?: number
     max_context_tokens?: number
     request_timeout_seconds?: number
+  }
+  sam3?: {
+    enabled?: boolean
+    base_url?: string
+    api_token?: string
+    connect_timeout_seconds?: number
+    request_timeout_seconds?: number
+    max_upload_mb?: number
+    max_pixels?: number
+    max_boxes_per_request?: number
+    verify_tls?: boolean
+    default_output?: string
+    default_rgb_bands?: number[]
   }
   database?: Record<string, unknown>
   executor?: Record<string, unknown>

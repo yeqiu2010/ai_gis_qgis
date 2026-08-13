@@ -404,6 +404,16 @@ def _build_register_artifact_tool(session_db: SessionDB, session_id: str) -> Too
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         task, error = _active_task_or_error(session_db, session_id)
         if error:
+            if str(arguments.get("artifact_type") or "") == "segmentation_outputs":
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "already_captured": True,
+                    "message": (
+                        "当前没有活动计划；SAM3 工具结果已由 AgentCore 和会话工具日志保存，"
+                        "无需重复登记计划产物。"
+                    ),
+                }
             return error
         assert task is not None
         registered = _register_artifact_specs(

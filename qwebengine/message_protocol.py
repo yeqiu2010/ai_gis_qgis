@@ -16,6 +16,7 @@ RPC_METHODS = {
     "cancelRun",
     "getSettings",
     "saveSettings",
+    "testSam3Connection",
 }
 
 AgentEventType = Literal[
