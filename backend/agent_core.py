@@ -15,6 +15,7 @@ from .context.prompt_builder import PromptBuilder
 from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, ChatResponse, LLMProvider
+from .plugin_system import PluginManager
 from .tools.code_execution import (
     build_execute_gis_code_tool,
     validate_execute_gis_code_arguments,
@@ -31,6 +32,7 @@ from .tools.land_use_building_metrics import (
     build_land_use_building_metrics_tool,
 )
 from .tools.layer_ops import build_layer_tools
+from .tools.learning import build_learning_tools
 from .tools.pipeline import (
     PIPELINE_STAGES,
     build_record_pipeline_stage_tool,
@@ -40,7 +42,6 @@ from .tools.pipeline import (
 )
 from .tools.qgis_toolbox import build_qgis_toolbox_tools
 from .tools.registry import ToolRegistry
-from .tools.sam3_segmentation import build_sam3_tools
 from .tools.school_service_coverage import (
     build_inspect_school_service_coverage_inputs_tool,
     build_school_service_coverage_tool,
@@ -61,6 +62,11 @@ from .tools.task_planning import build_task_planning_tools, verify_task_completi
 
 EventCallback = Callable[[dict[str, Any]], None]
 CancelChecker = Callable[[], bool]
+
+# Deprecated test/integration seam retained for one migration cycle. The
+# kernel does not import SAM3; bundled Plugin code may consume an explicitly
+# supplied factory when older integrations monkeypatch this symbol.
+build_sam3_tools: Callable[..., list[Any]] | None = None
 
 
 class _RunMetricsTracker:
@@ -152,6 +158,7 @@ class AgentCore:
         qgis_executor=None,
         executor_config: dict[str, Any] | None = None,
         sam3_config: dict[str, Any] | None = None,
+        plugins_config: dict[str, Any] | None = None,
         custom_tools_dir: str | None = None,
         should_cancel: CancelChecker | None = None,
         llm_retry_attempts: int = 3,
@@ -164,6 +171,8 @@ class AgentCore:
         self.qgis_executor = qgis_executor
         self.executor_config = executor_config or {}
         self.sam3_config = sam3_config or {}
+        self.plugins_config = plugins_config or {}
+        self.plugin_manager: PluginManager | None = None
         self.custom_tools_dir = custom_tools_dir
         self.should_cancel = should_cancel or (lambda: False)
         self.llm_retry_attempts = max(1, llm_retry_attempts)
@@ -250,11 +259,7 @@ class AgentCore:
             event_type="user",
             run_id=run_id,
         )
-        # Preserve the current SAM3 workflow across short follow-ups such as
-        # “继续”; a fresh workflow starts only after the previous one ended.
-        if not self.session_db.get_state(f"{session_id}:sam3_workflow_pending"):
-            self.session_db.delete_state(f"{session_id}:sam3_confirmed_calls")
-        self.session_db.delete_state(f"{session_id}:confirmed_write_calls")
+        self.session_db.set_state(f"{session_id}:request_scope", run_id)
 
         try:
             if qgis_context is None:
@@ -317,36 +322,20 @@ class AgentCore:
                     return events
                 budget.record_iteration()
                 task_must_continue = self._managed_task_must_continue(session_id)
-                sam3_must_continue = self._sam3_workflow_must_continue(session_id)
                 leaked_internal_result = self._looks_like_internal_tool_result(
                     response.content
                 )
-                if not response.tool_calls and (
-                    task_must_continue
-                    or sam3_must_continue
-                    or leaked_internal_result
-                ):
-                    if leaked_internal_result and not self._has_successful_sam3_inspection(
-                        session_id
-                    ):
-                        expected = (
-                            "上一段文本伪装成 inspect_sam3_segmentation_inputs 的工具结果，"
-                            "但数据库中没有该工具的真实成功调用，不能向用户展示或据此执行。"
-                            "必须先真实调用 inspect_sam3_segmentation_inputs；检查成功后再直接调用 "
-                            "segment_remote_sensing_image，由插件创建正式确认请求。"
-                        )
-                    elif sam3_must_continue or leaked_internal_result:
-                        expected = (
-                            "SAM3 输入检查已经成功，分割尚未执行。禁止输出或复述内部工具结果，"
-                            "也禁止用自然语言询问是否确认；必须直接调用 "
-                            "segment_remote_sensing_image，由插件创建唯一的正式确认请求。"
-                        )
-                    else:
-                        expected = (
+                if not response.tool_calls and (task_must_continue or leaked_internal_result):
+                    expected = (
+                        "模型刚才生成了看似工具结果的内部文本，但它不是实际工具调用，不能展示给用户。"
+                        "必须使用已注册工具产生真实结果。"
+                        if leaked_internal_result
+                        else (
                             "当前通用计划尚未完成。请读取 get_task_state，继续未完成步骤；"
                             "需要用户补充时先把对应步骤标记为 waiting_for_user，"
                             "所有步骤完成后调用 finalize_task。"
                         )
+                    )
                     messages.append(
                         ChatMessage(
                             role="assistant",
@@ -360,6 +349,11 @@ class AgentCore:
                 if not response.tool_calls:
                     break
 
+                # Keep the provider-native tool-call chain. Tool results must
+                # be returned with role=tool and the original call id; wrapping
+                # them in an assistant prompt lets internal control text leak
+                # into the user-visible answer and breaks confirmation resume.
+                messages.append(self._assistant_tool_message(response))
                 tool_results = []
                 for call in response.tool_calls:
                     if check_cancelled():
@@ -389,6 +383,7 @@ class AgentCore:
                             )
                             tool_results.append(
                                 {
+                                    "call_id": call.id,
                                     "name": call.name,
                                     "arguments": call.arguments,
                                     "result": preflight_result,
@@ -451,6 +446,7 @@ class AgentCore:
                         if not preflight_result.get("success"):
                             tool_results.append(
                                 {
+                                    "call_id": call.id,
                                     "name": call.name,
                                     "arguments": call_arguments,
                                     "result": preflight_result,
@@ -470,6 +466,7 @@ class AgentCore:
                             session_id,
                             call.name,
                             call_arguments,
+                            tool_registry,
                         )
                         if replay_result is not None:
                             self.session_db.log_tool_call(
@@ -481,6 +478,7 @@ class AgentCore:
                             )
                             tool_results.append(
                                 {
+                                    "call_id": call.id,
                                     "name": call.name,
                                     "arguments": call_arguments,
                                     "result": replay_result,
@@ -504,16 +502,35 @@ class AgentCore:
                             )
                             budget.record_tool_call()
                             continue
+                        self._persist_tool_exchange(
+                            session_id,
+                            response,
+                            tool_results,
+                            run_id=run_id,
+                        )
                         confirmation_id = str(uuid.uuid4())
                         pending = {
                             "confirmation_id": confirmation_id,
+                            "tool_call_id": call.id,
                             "tool_name": call.name,
                             "arguments": call_arguments,
                             "run_id": run_id,
+                            "request_scope": self.session_db.get_state(
+                                f"{session_id}:request_scope"
+                            ) or run_id,
                         }
                         self.session_db.set_state(
                             self._confirmation_key(session_id, confirmation_id),
                             json.dumps(pending, ensure_ascii=False),
+                        )
+                        self.session_db.save_message(
+                            session_id,
+                            "assistant",
+                            response.content,
+                            event_type="tool_call",
+                            finish_reason=response.finish_reason,
+                            run_id=run_id,
+                            tool_calls=self._tool_calls_payload([call]),
                         )
                         active_task = self.session_db.get_active_task(session_id)
                         if active_task is not None:
@@ -576,12 +593,6 @@ class AgentCore:
                         result, duration_ms = activation_failure, 0
                     else:
                         result, duration_ms = tool_registry.execute(call.name, call_arguments)
-                    self._update_sam3_workflow_state(
-                        session_id,
-                        call.name,
-                        call_arguments,
-                        result,
-                    )
                     if check_cancelled():
                         return events
                     if call.name == "set_active_skill" and result.get("success"):
@@ -639,7 +650,14 @@ class AgentCore:
                         result,
                         duration_ms=duration_ms,
                     )
-                    tool_results.append({"name": call.name, "arguments": call_arguments, "result": result})
+                    tool_results.append(
+                        {
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": call_arguments,
+                            "result": result,
+                        }
+                    )
                     publish(
                         agent_event(
                             "tool_end",
@@ -669,22 +687,18 @@ class AgentCore:
                     tool_results
                 ):
                     messages = self._build_pipeline_stage_messages(session_id)
+                    messages.append(self._assistant_tool_message(response))
                     result_context = self._compact_pipeline_tool_results(tool_results)
                 else:
                     result_context = tool_results
-                messages.append(
-                    ChatMessage(
-                        role="assistant",
-                        content=(
-                            "以下是刚刚执行的 QGIS 工具结果。"
-                            "如果任务尚未完成，继续调用必要工具完成任务；"
-                            "只有确认已经完成或需要用户补充信息时，才给用户最终答复：\n"
-                            "注意：如果某个工具 result.success 为 false，必须说明该工具执行失败及 error，"
-                            "不要把失败结果解释为查询结果为空或操作成功。\n"
-                            f"{json.dumps(result_context, ensure_ascii=False)}"
-                        ),
-                    )
+                self._persist_tool_exchange(
+                    session_id,
+                    response,
+                    tool_results,
+                    run_id=run_id,
                 )
+                for item in result_context:
+                    messages.append(self._tool_result_message(item))
 
             if response is None:
                 response = self._chat_with_retries(
@@ -795,6 +809,10 @@ class AgentCore:
             raise ValueError(f"确认请求不存在或已处理：{confirmation_id}")
         pending = json.loads(raw)
         self.session_db.delete_state(key)
+        self.session_db.set_state(
+            f"{session_id}:request_scope",
+            str(pending.get("request_scope") or pending.get("run_id") or run_id),
+        )
         metrics = _RunMetricsTracker(self.session_db, session_id, run_id)
 
         publish(
@@ -863,11 +881,14 @@ class AgentCore:
         self._save_process_message(session_id, f"调用工具：{tool_name}")
         self._publish_stage_start_if_needed(tool_name, arguments, publish, session_id, run_id)
         result, duration_ms = tool_registry.execute(tool_name, arguments)
-        self._update_sam3_workflow_state(
+        self.session_db.save_message(
             session_id,
-            tool_name,
-            arguments,
-            result,
+            "tool",
+            json.dumps(result, ensure_ascii=False),
+            event_type="tool_result",
+            run_id=run_id,
+            tool_call_id=str(pending.get("tool_call_id") or confirmation_id),
+            tool_name=tool_name,
         )
         self.session_db.log_tool_call(
             session_id,
@@ -907,17 +928,12 @@ class AgentCore:
                 result = retry_result
 
         if result.get("success", True):
-            self._remember_confirmed_sam3_call(
+            self._remember_confirmed_tool_call(
                 session_id,
                 tool_name,
                 arguments,
                 result,
-            )
-            self._remember_confirmed_write_call(
-                session_id,
-                tool_name,
-                arguments,
-                result,
+                tool_registry,
             )
         self._capture_confirmed_tool_artifacts(session_id, tool_name, result)
         if tool_name == "execute_gis_code":
@@ -931,7 +947,7 @@ class AgentCore:
         self._reset_one_shot_skill(session_id)
 
         should_resume_plan = result.get("success", True) and (
-            tool_name == "segment_remote_sensing_image"
+            tool_registry.get(tool_name).resume_policy == "continue_plan"
             or self._managed_task_must_continue(session_id)
         )
         if should_resume_plan:
@@ -995,10 +1011,9 @@ class AgentCore:
     ) -> tuple[str, bool]:
         """Resume the same agent turn after a confirmed tool has completed.
 
-        Confirmation used to terminate the turn after executing one tool.  In a
-        managed multi-step task, confirmed outputs such as an AOI buffer or a
-        SAM3 layer are intermediate artifacts and must be returned to the agent
-        loop so the next planned Skill can run.
+        Confirmation used to terminate the turn after executing one tool. In a
+        managed multi-step task, confirmed outputs are intermediate artifacts
+        and must be returned to the agent loop so the next Skill can run.
         """
         qgis_context = self._collect_qgis_context()
         loaded_skills = read_loaded_skills(
@@ -1018,54 +1033,20 @@ class AgentCore:
             loaded_skills=loaded_skills,
         )
         messages = self._build_conversation_messages(session_id)
-        continuation_result = {
-            key: confirmed_result.get(key)
-            for key in (
-                "success",
-                "job_id",
-                "mode",
-                "prompt",
-                "confidence_threshold",
-                "parameters",
-                "source_layer",
-                "outputs",
-                "loaded_layers",
-                "object_count",
-                "crs",
-                "warnings",
-                "stdout",
-                "stderr",
-                "workspace_dir",
-                "delivered_outputs",
-            )
-            if confirmed_result.get(key) is not None
-        }
-        if confirmed_tool_name == "segment_remote_sensing_image":
-            continuation_result["completed_sam3_calls"] = (
-                self._completed_sam3_calls(session_id)
-            )
-            continuation_instruction = (
-                "这是 SAM3 分割产物。若仍有面积、占比、裁剪、相交、统计、导出或制图等要求，"
-                "必须使用 loaded_layers 中的真实 layer_id 继续加载计划指定的 Skill。"
-                "completed_sam3_calls 列出了本次用户请求中已经成功的全部参数组合；"
-                "多个阈值只执行尚未出现在该列表中的值。全部请求阈值都已出现时，"
-                "必须结束分割阶段并完成/最终化计划，严禁再次调用分割工具。"
-            )
-        else:
-            continuation_instruction = (
-                "这是当前计划步骤的执行产物。必须调用 get_task_state 读取下一未完成步骤，"
-                "使用 outputs/loaded_layers 中的真实路径和 layer_id 加载该步骤指定的 Skill；"
-                "例如前一步生成的道路缓冲区应作为后续 SAM3 的 aoi_layer_id，不能停在缓冲区。"
-            )
+        continuation_instruction = (
+            "这是当前计划步骤的执行产物。若存在活动计划，必须调用 get_task_state 读取下一未完成步骤，"
+            "并使用 artifacts、outputs 或 loaded_layers 中的真实路径和 layer_id 继续；"
+            "只有全部步骤和交付物完成后才能最终回复。"
+        )
+        # The confirmed result is already persisted as a role=tool message.
+        # Keep only a short policy reminder; never serialize the result again
+        # as assistant-authored text.
         messages.append(
             ChatMessage(
-                role="assistant",
+                role="system",
                 content=(
-                    f"已确认并成功执行工具 {confirmed_tool_name}。"
-                    "以下结果是当前用户请求的中间产物，不是任务完成信号。"
-                    "请重新阅读本轮用户的完整原始请求和持久化计划。"
-                    f"{continuation_instruction}只有全部计划步骤和交付文件完成后才能最终回复。\n"
-                    f"确认工具结果：{json.dumps(continuation_result, ensure_ascii=False)}"
+                    "已确认工具的结果是当前请求的中间产物，不是任务完成信号。"
+                    + continuation_instruction
                 ),
             )
         )
@@ -1085,30 +1066,18 @@ class AgentCore:
             budget.record_iteration()
             if not response.tool_calls:
                 task_must_continue = self._managed_task_must_continue(session_id)
-                sam3_must_continue = self._sam3_workflow_must_continue(session_id)
                 leaked_internal_result = self._looks_like_internal_tool_result(
                     response.content
                 )
-                if task_must_continue or sam3_must_continue or leaked_internal_result:
-                    if leaked_internal_result and not self._has_successful_sam3_inspection(
-                        session_id
-                    ):
-                        continuation = (
-                            "上一段是伪造/泄漏的内部工具结果，数据库中没有真实 SAM3 输入检查。"
-                            "必须先调用 inspect_sam3_segmentation_inputs，再调用分割工具；"
-                            "不得把该文本回复给用户。"
-                        )
-                    elif sam3_must_continue or leaked_internal_result:
-                        continuation = (
-                            "SAM3 输入检查已经成功，必须直接调用 "
-                            "segment_remote_sensing_image 创建插件正式确认请求；"
-                            "禁止输出自然语言确认说明或内部工具结果。"
-                        )
-                    else:
-                        continuation = (
+                if task_must_continue or leaked_internal_result:
+                    continuation = (
+                        "模型刚才生成了看似工具结果的内部文本；必须改为真实工具调用。"
+                        if leaked_internal_result
+                        else (
                             "当前计划尚未完成。读取 get_task_state 并继续未完成步骤；"
                             "完成全部步骤和必需产物后再调用 finalize_task。"
                         )
+                    )
                     messages.append(
                         ChatMessage(
                             role="assistant",
@@ -1118,6 +1087,7 @@ class AgentCore:
                     continue
                 return response.content, False
 
+            messages.append(self._assistant_tool_message(response))
             tool_results: list[dict[str, Any]] = []
             for call in response.tool_calls:
                 entry = tool_registry.get(call.name)
@@ -1195,6 +1165,7 @@ class AgentCore:
                         )
                     tool_results.append(
                         {
+                            "call_id": call.id,
                             "name": call.name,
                             "arguments": call_arguments,
                             "result": preflight_result,
@@ -1208,6 +1179,7 @@ class AgentCore:
                         session_id,
                         call.name,
                         call_arguments,
+                        tool_registry,
                     )
                     if replay_result is not None:
                         self.session_db.log_tool_call(
@@ -1235,6 +1207,7 @@ class AgentCore:
                         )
                         tool_results.append(
                             {
+                                "call_id": call.id,
                                 "name": call.name,
                                 "arguments": call_arguments,
                                 "result": replay_result,
@@ -1242,6 +1215,12 @@ class AgentCore:
                         )
                         budget.record_tool_call()
                         continue
+                    self._persist_tool_exchange(
+                        session_id,
+                        response,
+                        tool_results,
+                        run_id=run_id,
+                    )
                     self._request_tool_confirmation(
                         session_id=session_id,
                         run_id=run_id,
@@ -1250,6 +1229,8 @@ class AgentCore:
                         tool_registry=tool_registry,
                         publish=publish,
                         model=response.model,
+                        tool_call_id=call.id,
+                        assistant_content=response.content,
                     )
                     return "", True
 
@@ -1275,12 +1256,6 @@ class AgentCore:
                     result, duration_ms = activation_failure, 0
                 else:
                     result, duration_ms = tool_registry.execute(call.name, call_arguments)
-                self._update_sam3_workflow_state(
-                    session_id,
-                    call.name,
-                    call_arguments,
-                    result,
-                )
                 if call.name in {"load_skill", "set_active_skill"} and result.get("success"):
                     active_skill = str(
                         result.get("skill_name")
@@ -1345,7 +1320,12 @@ class AgentCore:
                     )
                     return "", True
                 tool_results.append(
-                    {"name": call.name, "arguments": call_arguments, "result": result}
+                    {
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": call_arguments,
+                        "result": result,
+                    }
                 )
                 budget.record_tool_call()
 
@@ -1355,16 +1335,14 @@ class AgentCore:
                 qgis_context,
                 loaded_skills=loaded_skills,
             )
-            messages.append(
-                ChatMessage(
-                    role="assistant",
-                    content=(
-                        "以下是继续执行用户原始请求得到的工具结果。"
-                        "若仍有未完成要求，继续调用工具；只有全部完成或确实需要用户补充时才回复：\n"
-                        f"{json.dumps(tool_results, ensure_ascii=False)}"
-                    ),
-                )
+            self._persist_tool_exchange(
+                session_id,
+                response,
+                tool_results,
+                run_id=run_id,
             )
+            for item in tool_results:
+                messages.append(self._tool_result_message(item))
 
         if last_response is not None and last_response.content:
             return last_response.content, False
@@ -1387,6 +1365,7 @@ class AgentCore:
                 self.session_db.get_state,
                 self.session_db.set_state,
                 session_id,
+                self.session_db.record_skill_usage,
             )
         )
         registry.register(
@@ -1404,13 +1383,25 @@ class AgentCore:
                 session_id,
             )
         )
-        registry.register(build_inspect_skill_tool(self.prompt_builder.skill_manager))
-        registry.register(build_load_skill_reference_tool(self.prompt_builder.skill_manager))
+        registry.register(
+            build_inspect_skill_tool(
+                self.prompt_builder.skill_manager,
+                self.session_db.record_skill_usage,
+            )
+        )
+        registry.register(
+            build_load_skill_reference_tool(
+                self.prompt_builder.skill_manager,
+                self.session_db.record_skill_usage,
+            )
+        )
         for entry in build_task_planning_tools(
             self.session_db,
             session_id,
             self.prompt_builder.skill_manager,
         ):
+            registry.register(entry)
+        for entry in build_learning_tools(self.session_db, session_id):
             registry.register(entry)
         registry.register(build_get_task_context_tool(self.iface, qgis_executor=self.qgis_executor))
         registry.register(build_search_messages_tool(self.session_db, session_id))
@@ -1481,16 +1472,30 @@ class AgentCore:
             executor_config=self.executor_config,
         ):
             registry.register(entry)
-        for entry in build_sam3_tools(
-            config=self.sam3_config,
-            executor_config=self.executor_config,
-            session_db=self.session_db,
-            session_id=session_id,
-            iface=self.iface,
-            qgis_executor=self.qgis_executor,
-            should_cancel=self.should_cancel,
-        ):
-            registry.register(entry)
+        self.plugin_manager = PluginManager(
+            skill_manager=self.prompt_builder.skill_manager,
+            runtime={
+                "session_db": self.session_db,
+                "session_id": session_id,
+                "iface": self.iface,
+                "qgis_executor": self.qgis_executor,
+                "executor_config": self.executor_config,
+                "should_cancel": self.should_cancel,
+                "plugin_config": {"sam3": self.sam3_config},
+                "sam3_tool_factory": build_sam3_tools,
+            },
+            user_dir=self.plugins_config.get("user_dir"),
+            project_dir=(
+                self.plugins_config.get("project_dir")
+                if self.plugins_config.get("enable_project_plugins")
+                else None
+            ),
+            enabled=self.plugins_config.get("enabled") or (),
+            disabled=self.plugins_config.get("disabled") or (),
+        )
+        self.plugin_manager.register_all(registry)
+        registry.register(self.plugin_manager.build_diagnostics_tool())
+        self.plugin_manager.attach_hooks(registry)
         for entry in load_custom_tool_entries(self.custom_tools_dir):
             registry.register(entry)
         registry.register(
@@ -1507,6 +1512,7 @@ class AgentCore:
             available_tools=registry.tool_names(),
             active_toolsets=registry.toolsets(),
         )
+        registry.set_skill_tools(self.prompt_builder.skill_manager.tool_allowlist())
         return registry
 
     def _managed_task_must_continue(self, session_id: str) -> bool:
@@ -1525,9 +1531,6 @@ class AgentCore:
             for step in steps
         )
 
-    def _sam3_workflow_must_continue(self, session_id: str) -> bool:
-        return bool(self.session_db.get_state(f"{session_id}:sam3_workflow_pending"))
-
     @staticmethod
     def _looks_like_internal_tool_result(content: str) -> bool:
         text = str(content or "").strip()
@@ -1539,63 +1542,7 @@ class AgentCore:
         )
         if any(text.startswith(prefix) for prefix in internal_prefixes):
             return True
-        return (
-            "inspect_sam3_segmentation_inputs" in text
-            and '"inspection_complete"' in text
-            and '"result"' in text
-        )
-
-    def _has_successful_sam3_inspection(self, session_id: str) -> bool:
-        return any(
-            call.get("tool_name") == "inspect_sam3_segmentation_inputs"
-            and bool(call.get("success"))
-            and bool((call.get("result") or {}).get("inspection_complete"))
-            for call in self.session_db.get_recent_tool_calls(session_id, limit=20)
-        )
-
-    def _update_sam3_workflow_state(
-        self,
-        session_id: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-        result: dict[str, Any],
-    ) -> None:
-        key = f"{session_id}:sam3_workflow_pending"
-        if tool_name == "inspect_sam3_segmentation_inputs":
-            if result.get("success") and result.get("inspection_complete"):
-                compact_result = {
-                    field: result.get(field)
-                    for field in (
-                        "input_layer",
-                        "input_layer_id",
-                        "input_layer_name",
-                        "width",
-                        "height",
-                        "rgb_bands",
-                        "scope_mode",
-                        "scope_extent",
-                        "estimated_pixels",
-                        "estimated_upload_size_display",
-                        "warnings",
-                    )
-                    if result.get(field) is not None
-                }
-                self.session_db.set_state(
-                    key,
-                    json.dumps(
-                        {
-                            "arguments": arguments,
-                            "inspection": compact_result,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            else:
-                self.session_db.delete_state(key)
-        elif tool_name == "segment_remote_sensing_image":
-            # A real execution attempt resolves the inspection-to-confirmation
-            # workflow. Success/failure is then reported from the tool result.
-            self.session_db.delete_state(key)
+        return '"name"' in text and '"result"' in text and '"success"' in text
 
     def _skill_activation_precondition(
         self,
@@ -1691,7 +1638,9 @@ class AgentCore:
             (
                 item
                 for item in steps
-                if item.get("skill_name") == skill_name
+                if self.prompt_builder.skill_manager.canonical_name(
+                    str(item.get("skill_name") or "")
+                ) == self.prompt_builder.skill_manager.canonical_name(skill_name)
                 and item.get("status") in {"pending", "in_progress", "waiting_for_user"}
             ),
             None,
@@ -1729,7 +1678,13 @@ class AgentCore:
                 item
                 for item in steps
                 if item.get("status") == "in_progress"
-                and (not item.get("skill_name") or item.get("skill_name") == active_skill)
+                and (
+                    not item.get("skill_name")
+                    or self.prompt_builder.skill_manager.canonical_name(
+                        str(item.get("skill_name"))
+                    )
+                    == self.prompt_builder.skill_manager.canonical_name(active_skill)
+                )
             ),
             None,
         ) or next(
@@ -1737,7 +1692,13 @@ class AgentCore:
                 item
                 for item in steps
                 if item.get("status") == "pending"
-                and (not item.get("skill_name") or item.get("skill_name") == active_skill)
+                and (
+                    not item.get("skill_name")
+                    or self.prompt_builder.skill_manager.canonical_name(
+                        str(item.get("skill_name"))
+                    )
+                    == self.prompt_builder.skill_manager.canonical_name(active_skill)
+                )
             ),
             None,
         )
@@ -1790,6 +1751,9 @@ class AgentCore:
         tool_name: str,
         result: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        declared = result.get("artifacts")
+        if isinstance(declared, list):
+            return [dict(item) for item in declared if isinstance(item, dict)]
         type_map = {
             "execute_school_service_coverage": ["coverage_layer", "group_statistics"],
             "execute_land_use_building_metrics": ["metrics_layer", "metrics_table"],
@@ -1811,22 +1775,6 @@ class AgentCore:
                     "name": output.get("name") or output.get("path"),
                     "uri": output.get("path") or output.get("absolute_path"),
                     "payload": output,
-                    "verified": True,
-                }
-            )
-        if tool_name == "segment_remote_sensing_image" and artifacts:
-            artifacts.append(
-                {
-                    "artifact_type": "segmentation_outputs",
-                    "name": "SAM3 segmentation outputs",
-                    "payload": {
-                        "job_id": result.get("job_id"),
-                        "confidence_threshold": result.get("confidence_threshold"),
-                        "parameters": result.get("parameters") or {},
-                        "outputs": result.get("outputs") or [],
-                        "loaded_layers": result.get("loaded_layers") or [],
-                        "object_count": result.get("object_count"),
-                    },
                     "verified": True,
                 }
             )
@@ -1869,6 +1817,16 @@ class AgentCore:
                 "artifacts": [artifact["id"] for artifact in state.get("artifacts") or []],
             },
         )
+        self.session_db.record_task_outcome(
+            str(task["id"]),
+            status="completed",
+            completion_score=1.0,
+            metrics={
+                "step_count": len(state.get("steps") or []),
+                "artifact_count": len(state.get("artifacts") or []),
+                "automatic_after_confirmation": True,
+            },
+        )
 
     def _pipeline_must_continue(self, session_id: str, active_skill: str) -> bool:
         if active_skill != "gis-pipeline":
@@ -1908,18 +1866,42 @@ class AgentCore:
         tool_registry: ToolRegistry,
         publish: EventCallback,
         model: str,
+        tool_call_id: str | None = None,
+        assistant_content: str = "",
     ) -> None:
         entry = tool_registry.get(tool_name)
         confirmation_id = str(uuid.uuid4())
         pending = {
             "confirmation_id": confirmation_id,
+            "tool_call_id": tool_call_id or confirmation_id,
             "tool_name": tool_name,
             "arguments": arguments,
             "run_id": run_id,
+            "request_scope": self.session_db.get_state(
+                f"{session_id}:request_scope"
+            ) or run_id,
         }
         self.session_db.set_state(
             self._confirmation_key(session_id, confirmation_id),
             json.dumps(pending, ensure_ascii=False),
+        )
+        self.session_db.save_message(
+            session_id,
+            "assistant",
+            assistant_content,
+            event_type="tool_call",
+            finish_reason="tool_calls",
+            run_id=run_id,
+            tool_calls=[
+                {
+                    "id": tool_call_id or confirmation_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            ],
         )
         active_task = self.session_db.get_active_task(session_id)
         if active_task is not None:
@@ -2024,231 +2006,61 @@ class AgentCore:
             [name for name in loaded if name != active_skill],
         )
 
-    @staticmethod
-    def _sam3_call_parameters(arguments: dict[str, Any]) -> dict[str, Any]:
-        keys = (
-            "input_layer_id",
-            "mode",
-            "prompt",
-            "scope_mode",
-            "aoi_layer_id",
-            "boxes_layer_id",
-            "selected_only",
-            "rgb_bands",
-            "stretch_percentiles",
-            "confidence_threshold",
-            "min_size_pixels",
-            "max_size_pixels",
-            "output_types",
-        )
-        parameters = {
-            key: arguments.get(key)
-            for key in keys
-            if arguments.get(key) is not None
-        }
-        output_types = parameters.get("output_types")
-        if isinstance(output_types, list):
-            parameters["output_types"] = sorted(str(value) for value in output_types)
-        threshold = parameters.get("confidence_threshold")
-        if threshold is not None:
-            parameters["confidence_threshold"] = float(threshold)
-        return parameters
-
-    @classmethod
-    def _sam3_call_fingerprint(cls, arguments: dict[str, Any]) -> str:
-        return json.dumps(
-            cls._sam3_call_parameters(arguments),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    def _remember_confirmed_sam3_call(
-        self,
-        session_id: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-        result: dict[str, Any],
-    ) -> None:
-        if tool_name != "segment_remote_sensing_image":
-            return
-        key = f"{session_id}:sam3_confirmed_calls"
-        raw = self.session_db.get_state(key)
-        try:
-            history = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, TypeError):
-            history = {}
-        if not isinstance(history, dict):
-            history = {}
-        fingerprint = self._sam3_call_fingerprint(arguments)
-        history[fingerprint] = {
-            "parameters": self._sam3_call_parameters(arguments),
-            "result": {
-                field: result.get(field)
-                for field in (
-                    "job_id",
-                    "mode",
-                    "prompt",
-                    "confidence_threshold",
-                    "outputs",
-                    "loaded_layers",
-                    "object_count",
-                    "crs",
-                    "warnings",
-                )
-                if result.get(field) is not None
-            },
-        }
-        self.session_db.set_state(key, json.dumps(history, ensure_ascii=False))
-
-    def _confirmed_sam3_replay(
-        self,
-        session_id: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if tool_name != "segment_remote_sensing_image":
-            return None
-        raw = self.session_db.get_state(f"{session_id}:sam3_confirmed_calls")
-        if not raw:
-            return None
-        try:
-            history = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(history, dict):
-            return None
-        completed = history.get(self._sam3_call_fingerprint(arguments))
-        if not isinstance(completed, dict):
-            return None
-        previous_result = completed.get("result")
-        result = dict(previous_result) if isinstance(previous_result, dict) else {}
-        return {
-            "success": True,
-            **result,
-            "parameters": completed.get("parameters") or {},
-            "already_completed": True,
-            "duplicate_prevented": True,
-            "message": (
-                "相同参数的 SAM3 分割已在本次用户请求中成功完成，"
-                "已复用现有 job 和输出；禁止再次提交。"
-            ),
-        }
-
     def _confirmed_tool_replay(
         self,
         session_id: str,
         tool_name: str,
         arguments: dict[str, Any],
+        tool_registry: ToolRegistry | None = None,
     ) -> dict[str, Any] | None:
-        sam3_replay = self._confirmed_sam3_replay(
-            session_id,
-            tool_name,
-            arguments,
-        )
-        if sam3_replay is not None:
-            return sam3_replay
-        if tool_name != "execute_gis_code":
-            return None
-        raw = self.session_db.get_state(f"{session_id}:confirmed_write_calls")
-        if not raw:
-            return None
-        try:
-            history = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(history, dict):
-            return None
-        fingerprint = self._confirmed_write_fingerprint(tool_name, arguments)
-        completed = history.get(fingerprint)
-        if not isinstance(completed, dict):
-            return None
-        return {
-            "success": True,
-            **completed,
-            "already_completed": True,
-            "duplicate_prevented": True,
-            "message": (
-                "相同的已确认 GIS 代码已在本次用户请求中成功执行，"
-                "已复用现有输出；禁止重复执行或再次请求确认。"
-            ),
-        }
+        if tool_registry is not None:
+            fingerprint = tool_registry.idempotency_key(tool_name, arguments)
+            if fingerprint:
+                scope = self.session_db.get_state(f"{session_id}:request_scope") or ""
+                raw_generic = self.session_db.get_state(
+                    f"{session_id}:confirmed_tool_calls"
+                )
+                try:
+                    generic_history = json.loads(raw_generic) if raw_generic else {}
+                except (json.JSONDecodeError, TypeError):
+                    generic_history = {}
+                completed = generic_history.get(f"{scope}:{fingerprint}")
+                if isinstance(completed, dict):
+                    return {
+                        **completed,
+                        "success": True,
+                        "already_completed": True,
+                        "duplicate_prevented": True,
+                        "message": "相同参数的已确认工具调用已在本次请求中完成，已复用现有结果。",
+                    }
+        return None
 
-    @staticmethod
-    def _duplicate_tool_process_message(tool_name: str) -> str:
-        if tool_name == "segment_remote_sensing_image":
-            return "已阻止重复的 SAM3 分割请求，继续处理尚未完成的其他阈值。"
-        return "已阻止重复执行相同的 GIS 代码，复用现有输出并继续完成剩余计划。"
-
-    @staticmethod
-    def _confirmed_write_fingerprint(
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> str:
-        return json.dumps(
-            {"tool_name": tool_name, "arguments": arguments},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    def _remember_confirmed_write_call(
+    def _remember_confirmed_tool_call(
         self,
         session_id: str,
         tool_name: str,
         arguments: dict[str, Any],
         result: dict[str, Any],
+        tool_registry: ToolRegistry,
     ) -> None:
-        if tool_name != "execute_gis_code":
+        fingerprint = tool_registry.idempotency_key(tool_name, arguments)
+        if not fingerprint:
             return
-        key = f"{session_id}:confirmed_write_calls"
-        raw = self.session_db.get_state(key)
+        state_key = f"{session_id}:confirmed_tool_calls"
+        raw = self.session_db.get_state(state_key)
         try:
             history = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, TypeError):
             history = {}
         if not isinstance(history, dict):
             history = {}
-        history[self._confirmed_write_fingerprint(tool_name, arguments)] = {
-            field: result.get(field)
-            for field in (
-                "stdout",
-                "stderr",
-                "workspace_dir",
-                "outputs",
-                "loaded_layers",
-                "delivered_outputs",
-            )
-            if result.get(field) is not None
-        }
-        self.session_db.set_state(key, json.dumps(history, ensure_ascii=False))
+        scope = self.session_db.get_state(f"{session_id}:request_scope") or ""
+        history[f"{scope}:{fingerprint}"] = result
+        self.session_db.set_state(state_key, json.dumps(history, ensure_ascii=False))
 
-    def _completed_sam3_calls(self, session_id: str) -> list[dict[str, Any]]:
-        raw = self.session_db.get_state(f"{session_id}:sam3_confirmed_calls")
-        if not raw:
-            return []
-        try:
-            history = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return []
-        if not isinstance(history, dict):
-            return []
-        completed: list[dict[str, Any]] = []
-        for item in history.values():
-            if not isinstance(item, dict):
-                continue
-            result = item.get("result")
-            completed.append(
-                {
-                    "parameters": item.get("parameters") or {},
-                    "job_id": result.get("job_id") if isinstance(result, dict) else None,
-                    "outputs": result.get("outputs") if isinstance(result, dict) else [],
-                    "loaded_layers": (
-                        result.get("loaded_layers") if isinstance(result, dict) else []
-                    ),
-                }
-            )
-        return completed
+    @staticmethod
+    def _duplicate_tool_process_message(tool_name: str) -> str:
+        return f"已阻止重复执行工具 {tool_name}，复用现有输出并继续完成剩余计划。"
 
     def _confirmation_key(self, session_id: str, confirmation_id: str) -> str:
         return f"{session_id}:pending_confirmation:{confirmation_id}"
@@ -2670,15 +2482,92 @@ class AgentCore:
 
     def _build_conversation_messages(self, session_id: str) -> list[ChatMessage]:
         history = self.session_db.get_conversation_messages(session_id, limit=50)
-        messages = [
-            ChatMessage(role=row["role"], content=row["content"] or "")
-            for row in history
-            if row["role"] in {"user", "assistant"}
-        ]
+        messages = [self._chat_message_from_row(row) for row in history]
         memory_message = self._build_memory_message(session_id)
         if memory_message is not None:
             messages.insert(0, memory_message)
         return messages
+
+    @staticmethod
+    def _tool_calls_payload(calls: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": str(call.id),
+                "type": "function",
+                "function": {
+                    "name": str(call.name),
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+            for call in calls
+        ]
+
+    @classmethod
+    def _assistant_tool_message(cls, response: ChatResponse) -> ChatMessage:
+        return ChatMessage(
+            role="assistant",
+            content=response.content or "",
+            tool_calls=cls._tool_calls_payload(response.tool_calls),
+        )
+
+    @staticmethod
+    def _tool_result_message(item: dict[str, Any]) -> ChatMessage:
+        return ChatMessage(
+            role="tool",
+            content=json.dumps(item.get("result") or {}, ensure_ascii=False),
+            tool_call_id=str(item.get("call_id") or ""),
+            name=str(item.get("name") or "") or None,
+        )
+
+    def _persist_tool_exchange(
+        self,
+        session_id: str,
+        response: ChatResponse,
+        tool_results: list[dict[str, Any]],
+        *,
+        run_id: str,
+    ) -> None:
+        """Persist a complete provider-native tool exchange for recovery."""
+        if not tool_results:
+            return
+        completed_ids = {str(item.get("call_id") or "") for item in tool_results}
+        completed_calls = [
+            call for call in response.tool_calls if str(call.id) in completed_ids
+        ]
+        if not completed_calls:
+            return
+        self.session_db.save_message(
+            session_id,
+            "assistant",
+            response.content or "",
+            event_type="tool_call",
+            finish_reason=response.finish_reason,
+            run_id=run_id,
+            tool_calls=self._tool_calls_payload(completed_calls),
+        )
+        for item in tool_results:
+            call_id = str(item.get("call_id") or "")
+            if call_id not in completed_ids:
+                continue
+            self.session_db.save_message(
+                session_id,
+                "tool",
+                json.dumps(item.get("result") or {}, ensure_ascii=False),
+                event_type="tool_result",
+                run_id=run_id,
+                tool_call_id=call_id,
+                tool_name=str(item.get("name") or "") or None,
+            )
+
+    @staticmethod
+    def _chat_message_from_row(row: dict[str, Any]) -> ChatMessage:
+        return ChatMessage(
+            role=str(row.get("role") or "assistant"),
+            content=str(row.get("content") or ""),
+            tool_calls=list(row.get("tool_calls") or []),
+            tool_call_id=str(row.get("tool_call_id") or "") or None,
+            name=str(row.get("tool_name") or "") or None,
+        )
 
     def _pipeline_context_should_compact(self, tool_results: list[dict[str, Any]]) -> bool:
         for call in tool_results:
@@ -2701,6 +2590,7 @@ class AgentCore:
             if call.get("name") == "record_pipeline_stage":
                 compact.append(
                     {
+                        "call_id": call.get("call_id"),
                         "name": "record_pipeline_stage",
                         "result": {
                             key: result.get(key)

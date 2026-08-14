@@ -1,0 +1,6 @@
+id: sam3
+version: 1.0.0
+module: plugins.sam3.plugin
+entrypoint: register
+trusted: true
+enabled_by_default: true

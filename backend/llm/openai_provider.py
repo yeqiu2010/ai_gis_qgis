@@ -46,7 +46,7 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
         api_messages = [{"role": "system", "content": system}] + [
-            {"role": message.role, "content": message.content} for message in messages
+            message.as_api_message() for message in messages
         ]
         max_tokens = self._bounded_max_tokens(api_messages, tools)
         payload = {

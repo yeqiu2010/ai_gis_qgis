@@ -29,21 +29,27 @@ def test_sam3_routing_catalog_explicitly_covers_vegetation_and_followup_statisti
     assert "面积/占比统计" in description
 
 
-def test_main_prompt_requires_plan_then_sam3_then_pipeline_for_vegetation_ratio():
+def test_sam3_workflow_rules_live_in_plugin_skill_not_core_prompt():
     prompt = PromptBuilder().build(
         "main-orchestrator",
         QGISContext(project_path="", layer_count=0, layers=[]),
         loaded_skills=["main-orchestrator"],
     )
 
-    plan_position = prompt.index("先 create_plan")
-    sam3_position = prompt.index("再加载 SAM3 Skill")
-    pipeline_position = prompt.index("SAM3 真实分割图层产生前不得加载 gis-pipeline")
-    assert plan_position < sam3_position < pipeline_position
-    assert "提取/识别植被" in prompt
-    assert "只有用户明确要求光谱指数或分类方法时才使用 NDVI" in prompt
-    assert "每个阈值建立独立步骤和唯一输出名" in prompt
-    assert "duplicate_prevented=true" in prompt
+    assert "SAM3 真实分割图层产生前不得加载 gis-pipeline" not in prompt
+    assert "segment_remote_sensing_image" not in prompt
+
+    skill_path = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "sam3"
+        / "skills"
+        / "remote-segmentation"
+        / "SKILL.md"
+    )
+    skill = skill_path.read_text(encoding="utf-8")
+    assert "segment_remote_sensing_image" in skill
+    assert "每个不同阈值" in skill
 
 
 def test_sam3_artifact_preserves_completed_threshold_parameters():
@@ -66,6 +72,17 @@ def test_sam3_artifact_preserves_completed_threshold_parameters():
                 }
             ],
             "loaded_layers": [{"id": "building-05"}],
+            "artifacts": [
+                {
+                    "artifact_type": "segmentation_outputs",
+                    "name": "SAM3 segmentation outputs",
+                    "payload": {
+                        "confidence_threshold": 0.5,
+                        "parameters": {"confidence_threshold": 0.5},
+                    },
+                    "verified": True,
+                }
+            ],
         },
     )
 
@@ -78,7 +95,7 @@ def test_sam3_artifact_preserves_completed_threshold_parameters():
     assert aggregate["payload"]["parameters"]["confidence_threshold"] == 0.5
 
 
-def test_standalone_sam3_artifact_registration_is_a_safe_noop(tmp_path: Path):
+def test_artifact_registration_requires_a_generic_active_task(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="standalone SAM3", model="noop")
     core = AgentCore(session_db=session_db, llm_provider=NoopProvider(), iface=None)
@@ -93,9 +110,8 @@ def test_standalone_sam3_artifact_registration_is_a_safe_noop(tmp_path: Path):
         },
     )
 
-    assert result["success"] is True
-    assert result["skipped"] is True
-    assert result["already_captured"] is True
+    assert result["success"] is False
+    assert "活动任务" in result["error"]
 
 
 def test_pipeline_activation_requires_a_persisted_plan(tmp_path: Path):

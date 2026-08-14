@@ -94,12 +94,14 @@ def build_load_skill_tool(
     get_state: StateGetter,
     set_state: StateSetter,
     session_id: str,
+    record_usage=None,
 ) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         skill_name = str(arguments.get("skill_name") or "").strip()
         document = skill_manager.get(skill_name)
         if document is None:
             return {"success": False, "error": f"Skill 不存在: {skill_name}"}
+        skill_name = document.name
         available, reasons = skill_manager.availability(skill_name)
         if not available:
             return {
@@ -128,6 +130,8 @@ def build_load_skill_tool(
             skill_manager,
             [*loaded, skill_name],
         )
+        if record_usage is not None:
+            record_usage(skill_name, action="use")
         return {
             "success": True,
             "skill_name": skill_name,
@@ -217,12 +221,14 @@ def build_list_loaded_skills_tool(
     )
 
 
-def build_inspect_skill_tool(skill_manager: SkillManager) -> ToolEntry:
+def build_inspect_skill_tool(skill_manager: SkillManager, record_usage=None) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         skill_name = str(arguments.get("skill_name") or "").strip()
         inspected = skill_manager.inspect(skill_name, include_body=True)
         if inspected is None:
             return {"success": False, "error": f"Skill 不存在: {skill_name}"}
+        if record_usage is not None:
+            record_usage(str(inspected["name"]), action="view")
         return {"success": True, "skill": inspected}
 
     return ToolEntry(
@@ -239,7 +245,7 @@ def build_inspect_skill_tool(skill_manager: SkillManager) -> ToolEntry:
     )
 
 
-def build_load_skill_reference_tool(skill_manager: SkillManager) -> ToolEntry:
+def build_load_skill_reference_tool(skill_manager: SkillManager, record_usage=None) -> ToolEntry:
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         skill_name = str(arguments.get("skill_name") or "").strip()
         path = str(arguments.get("path") or "").strip()
@@ -247,6 +253,9 @@ def build_load_skill_reference_tool(skill_manager: SkillManager) -> ToolEntry:
             content = skill_manager.load_reference(skill_name, path)
         except (KeyError, ValueError, OSError) as exc:
             return {"success": False, "error": str(exc)}
+        if record_usage is not None:
+            document = skill_manager.get(skill_name)
+            record_usage(document.name if document else skill_name, action="view")
         return {"success": True, "skill_name": skill_name, "path": path, "content": content}
 
     return ToolEntry(

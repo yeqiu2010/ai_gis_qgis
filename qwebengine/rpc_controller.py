@@ -283,6 +283,7 @@ class RPCController:
             qgis_executor=self.main_thread_executor.run,
             executor_config=self.config.get("executor") or {},
             sam3_config=self.config.get("sam3") or {},
+            plugins_config=self.config.get("plugins") or {},
             custom_tools_dir=custom_tools_dir,
             should_cancel=lambda: self._is_cancelled_run(cancellable_run_id),
         )

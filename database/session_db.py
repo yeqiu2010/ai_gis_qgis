@@ -104,6 +104,9 @@ class SessionDB:
         stage_name: str | None = None,
         stage_artifact: dict[str, Any] | None = None,
         run_id: str | None = None,
+        tool_call_id: str | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+        tool_name: str | None = None,
     ) -> int:
         timestamp = time.time()
         artifact_json = json.dumps(stage_artifact, ensure_ascii=False) if stage_artifact else None
@@ -113,8 +116,9 @@ class SessionDB:
                 """
                 INSERT INTO messages (
                     session_id, role, content, timestamp, finish_reason,
-                    stage_name, stage_artifact, event_type, run_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage_name, stage_artifact, event_type, run_id,
+                    tool_call_id, tool_calls, tool_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -126,6 +130,9 @@ class SessionDB:
                     artifact_json,
                     event_type,
                     run_id,
+                    tool_call_id,
+                    json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+                    tool_name,
                 ),
             )
             connection.execute(
@@ -149,6 +156,7 @@ class SessionDB:
                 FROM messages AS m
                 LEFT JOIN run_metrics AS r ON r.run_id = m.run_id
                 WHERE m.session_id = ?
+                  AND COALESCE(m.event_type, '') NOT IN ('tool_call', 'tool_result')
                 ORDER BY m.id DESC
                 LIMIT ?
                 """,
@@ -264,19 +272,34 @@ class SessionDB:
     def get_conversation_messages(
         self, session_id: str, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """Return user/assistant history, applying the limit after role filtering."""
+        """Return model-visible history, preserving structured tool messages."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, role, content, timestamp, event_type, finish_reason
+                SELECT id, role, content, timestamp, event_type, finish_reason,
+                       tool_call_id, tool_calls, tool_name
                 FROM messages
-                WHERE session_id = ? AND role IN ('user', 'assistant')
+                WHERE session_id = ?
+                  AND role IN ('user', 'assistant', 'tool')
+                  AND COALESCE(event_type, '') NOT IN ('confirm_request', 'process')
                 ORDER BY id DESC
                 LIMIT ?
                 """,
                 (session_id, limit),
             ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            raw_calls = item.get("tool_calls")
+            if raw_calls:
+                try:
+                    item["tool_calls"] = json.loads(raw_calls)
+                except (json.JSONDecodeError, TypeError):
+                    item["tool_calls"] = []
+            else:
+                item["tool_calls"] = []
+            result.append(item)
+        return result
 
     def search_messages(
         self, query: str, *, session_id: str | None = None, limit: int = 20
@@ -1002,3 +1025,275 @@ class SessionDB:
                     time.time(),
                 ),
             )
+
+    # ------------------------------------------------------------------
+    # Evidence-backed learning store. Candidates are intentionally kept
+    # separate from active Recipes so successful execution never mutates
+    # runtime knowledge without review.
+
+    def record_task_outcome(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        completion_score: float | None = None,
+        feedback_score: float | None = None,
+        user_feedback: str | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> str:
+        now = time.time()
+        outcome_id = str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT id FROM task_outcomes WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing:
+                outcome_id = str(existing["id"])
+                connection.execute(
+                    """
+                    UPDATE task_outcomes
+                    SET status = ?, completion_score = COALESCE(?, completion_score),
+                        feedback_score = COALESCE(?, feedback_score),
+                        user_feedback = COALESCE(?, user_feedback), metrics_json = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        status,
+                        completion_score,
+                        feedback_score,
+                        user_feedback,
+                        json.dumps(metrics or {}, ensure_ascii=False),
+                        now,
+                        outcome_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO task_outcomes (
+                        id, task_id, status, completion_score, feedback_score,
+                        user_feedback, metrics_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        outcome_id,
+                        task_id,
+                        status,
+                        completion_score,
+                        feedback_score,
+                        user_feedback,
+                        json.dumps(metrics or {}, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+        return outcome_id
+
+    def save_knowledge_candidate(
+        self,
+        *,
+        candidate_type: str,
+        target_name: str,
+        payload: dict[str, Any],
+        evidence: dict[str, Any] | None = None,
+        evaluation: dict[str, Any] | None = None,
+        source_task_id: str | None = None,
+        created_by: str = "agent",
+        status: str = "candidate",
+    ) -> str:
+        candidate_id = str(uuid.uuid4())
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO knowledge_candidates (
+                    id, candidate_type, target_name, status, payload_json,
+                    evidence_json, evaluation_json, source_task_id, created_by,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate_id,
+                    candidate_type,
+                    target_name,
+                    status,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(evidence or {}, ensure_ascii=False),
+                    json.dumps(evaluation or {}, ensure_ascii=False),
+                    source_task_id,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+        return candidate_id
+
+    def list_knowledge_candidates(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM knowledge_candidates"
+        values: list[Any] = []
+        if status:
+            query += " WHERE status = ?"
+            values.append(status)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        values.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._decode_learning_row(dict(row)) for row in rows]
+
+    def search_recipes(
+        self, query: str = "", *, status: str = "active", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM solution_recipes WHERE status = ?"
+        values: list[Any] = [status]
+        if query.strip():
+            sql += " AND (name LIKE ? OR description LIKE ? OR intent LIKE ?)"
+            pattern = f"%{query.strip()}%"
+            values.extend([pattern, pattern, pattern])
+        sql += " ORDER BY pinned DESC, use_count DESC, updated_at DESC LIMIT ?"
+        values.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(sql, values).fetchall()
+        return [self._decode_learning_row(dict(row)) for row in rows]
+
+    def get_recipe(self, recipe_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM solution_recipes WHERE id = ?", (recipe_id,)
+            ).fetchone()
+        return self._decode_learning_row(dict(row)) if row else None
+
+    def set_recipe_status(self, recipe_id: str, status: str) -> None:
+        if status not in {"active", "stale", "archived"}:
+            raise ValueError(f"Unsupported Recipe status: {status}")
+        now = time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE solution_recipes
+                SET status = ?, updated_at = ?, archived_at = ?
+                WHERE id = ?
+                """,
+                (status, now, now if status == "archived" else None, recipe_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Recipe not found: {recipe_id}")
+
+    def promote_candidate(self, candidate_id: str) -> str:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM knowledge_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Knowledge candidate not found: {candidate_id}")
+            item = self._decode_learning_row(dict(row))
+            if item["candidate_type"] != "recipe":
+                raise ValueError("Only recipe candidates can be promoted by this operation")
+            recipe = item.get("payload") or {}
+            recipe_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO solution_recipes (
+                    id, name, description, intent, status, version, schema_json,
+                    source_task_id, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    recipe_id,
+                    str(recipe.get("name") or item["target_name"]),
+                    str(recipe.get("description") or ""),
+                    str(recipe.get("intent") or item["target_name"]),
+                    json.dumps(recipe, ensure_ascii=False),
+                    item.get("source_task_id"),
+                    item.get("created_by") or "agent",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO knowledge_versions (
+                    id, knowledge_type, knowledge_id, version, payload_json, created_at
+                ) VALUES (?, 'recipe', ?, 1, ?, ?)
+                """,
+                (str(uuid.uuid4()), recipe_id, json.dumps(recipe, ensure_ascii=False), now),
+            )
+            connection.execute(
+                "UPDATE knowledge_candidates SET status = 'validated', updated_at = ? WHERE id = ?",
+                (now, candidate_id),
+            )
+        return recipe_id
+
+    def curator_dry_run(self) -> list[dict[str, Any]]:
+        proposals = []
+        for candidate in self.list_knowledge_candidates(limit=200):
+            if candidate.get("status") not in {"observed", "candidate"}:
+                continue
+            evidence = candidate.get("evidence") or {}
+            evaluation = candidate.get("evaluation") or {}
+            success_count = int(evidence.get("success_count") or 0)
+            eligible = success_count >= 2 and bool(evaluation.get("passed"))
+            proposals.append(
+                {
+                    "candidate_id": candidate["id"],
+                    "target_name": candidate["target_name"],
+                    "action": "promote" if eligible else "retain_candidate",
+                    "reasons": (
+                        ["至少两次成功证据", "回归评测通过"]
+                        if eligible
+                        else ["需要至少两次成功证据且回归评测通过"]
+                    ),
+                }
+            )
+        return proposals
+
+    def record_skill_usage(self, skill_name: str, *, action: str) -> None:
+        now = time.time()
+        view_increment = 1 if action == "view" else 0
+        use_increment = 1 if action == "use" else 0
+        patch_increment = 1 if action == "patch" else 0
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_usage (
+                    skill_name, view_count, use_count, patch_count,
+                    last_viewed_at, last_used_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(skill_name) DO UPDATE SET
+                    view_count = view_count + excluded.view_count,
+                    use_count = use_count + excluded.use_count,
+                    patch_count = patch_count + excluded.patch_count,
+                    last_viewed_at = COALESCE(excluded.last_viewed_at, last_viewed_at),
+                    last_used_at = COALESCE(excluded.last_used_at, last_used_at)
+                """,
+                (
+                    skill_name,
+                    view_increment,
+                    use_increment,
+                    patch_increment,
+                    now if view_increment else None,
+                    now if use_increment else None,
+                ),
+            )
+
+    @staticmethod
+    def _decode_learning_row(item: dict[str, Any]) -> dict[str, Any]:
+        for raw_key, decoded_key in (
+            ("schema_json", "schema"),
+            ("payload_json", "payload"),
+            ("evidence_json", "evidence"),
+            ("evaluation_json", "evaluation"),
+            ("metrics_json", "metrics"),
+        ):
+            if raw_key in item:
+                raw = item.pop(raw_key)
+                try:
+                    item[decoded_key] = json.loads(raw or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    item[decoded_key] = {}
+        return item

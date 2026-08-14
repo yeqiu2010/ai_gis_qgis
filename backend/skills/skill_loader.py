@@ -34,6 +34,8 @@ class SkillDocument:
     hermes_config: list[dict[str, Any]] = field(default_factory=list)
     execution_contract: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    source: str = "filesystem"
+    read_only: bool = False
 
     def availability(
         self,

@@ -44,6 +44,13 @@ DEFAULT_CONFIG = {
         "custom_skills_dir": "~/.qgis_hermes_agent/custom_skills",
         "custom_tools_dir": "~/.qgis_hermes_agent/custom_tools",
     },
+    "plugins": {
+        "user_dir": "~/.qgis_hermes_agent/plugins",
+        "project_dir": "",
+        "enabled": [],
+        "disabled": [],
+        "enable_project_plugins": False,
+    },
     "ui": {
         "panel_width": 420,
         "theme": "auto",

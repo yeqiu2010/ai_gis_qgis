@@ -23,6 +23,7 @@ INCLUDE_DIRS = [
     "qwebengine",
     "resources",
     "skills",
+    "plugins",
 ]
 
 EXCLUDED_PARTS = {

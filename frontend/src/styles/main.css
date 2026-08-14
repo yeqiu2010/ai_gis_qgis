@@ -57,6 +57,7 @@ textarea {
   height: 100vh;
   min-height: 0;
   overflow: hidden;
+  position: relative;
   background: #f4f6f7;
 }
 
@@ -298,8 +299,13 @@ textarea {
   border-top: 1px solid #d7dee2;
   background: #ffffff;
   display: grid;
-  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  inset: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 10px;
+  position: absolute;
+  z-index: 10;
 }
 
 .settings-panel header,
@@ -308,6 +314,26 @@ textarea {
   display: flex;
   gap: 8px;
   justify-content: space-between;
+}
+
+.settings-panel header {
+  border-bottom: 1px solid #e1e6e9;
+  padding-bottom: 10px;
+}
+
+.settings-content {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 2px 10px 0;
+  scrollbar-gutter: stable;
+}
+
+.settings-panel footer {
+  border-top: 1px solid #e1e6e9;
+  padding-top: 10px;
 }
 
 .settings-panel strong {

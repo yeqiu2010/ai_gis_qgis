@@ -404,16 +404,6 @@ def _build_register_artifact_tool(session_db: SessionDB, session_id: str) -> Too
     def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         task, error = _active_task_or_error(session_db, session_id)
         if error:
-            if str(arguments.get("artifact_type") or "") == "segmentation_outputs":
-                return {
-                    "success": True,
-                    "skipped": True,
-                    "already_captured": True,
-                    "message": (
-                        "当前没有活动计划；SAM3 工具结果已由 AgentCore 和会话工具日志保存，"
-                        "无需重复登记计划产物。"
-                    ),
-                }
             return error
         assert task is not None
         registered = _register_artifact_specs(
@@ -471,6 +461,42 @@ def _build_finalize_task_tool(
             summary=summary,
             finalization=finalization,
         )
+        session_db.record_task_outcome(
+            str(task["id"]),
+            status="completed",
+            completion_score=1.0,
+            metrics={
+                "step_count": len(state["steps"]),
+                "artifact_count": len(state["artifacts"]),
+            },
+        )
+        if len(state["steps"]) >= 2:
+            session_db.save_knowledge_candidate(
+                candidate_type="recipe",
+                target_name=str(task.get("objective") or "completed-workflow")[:120],
+                payload={
+                    "name": str(task.get("objective") or "completed-workflow")[:120],
+                    "description": summary,
+                    "intent": "task_plan_reuse",
+                    "preconditions": [],
+                    "steps": [
+                        {
+                            "skill_name": step.get("skill_name"),
+                            "instruction": step.get("instruction"),
+                            "dependencies": step.get("dependencies") or [],
+                        }
+                        for step in state["steps"]
+                    ],
+                    "artifact_contracts": [
+                        artifact.get("artifact_type") for artifact in state["artifacts"]
+                    ],
+                    "success_criteria": ["所有计划步骤完成", "必需 Artifact 已验证"],
+                    "fallbacks": [],
+                },
+                evidence={"success_count": 1, "task_id": task["id"]},
+                evaluation={"passed": False, "reason": "等待重复样本和回归评测"},
+                source_task_id=str(task["id"]),
+            )
         return {
             "success": True,
             "task_id": task["id"],

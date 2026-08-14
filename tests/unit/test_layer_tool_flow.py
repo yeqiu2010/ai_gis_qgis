@@ -1132,7 +1132,8 @@ def test_confirmed_buffer_resumes_plan_and_passes_aoi_layer_to_sam3(
         message.content for message in provider.messages_by_call[1]
     )
     assert "buffer-layer-id" in resumed_context
-    assert "道路缓冲区应作为后续 SAM3 的 aoi_layer_id" in resumed_context
+    assert "道路缓冲区应作为后续 SAM3 的" in resumed_context
+    assert "aoi_layer_id" in resumed_context
     sam_confirmation = next(
         event for event in confirmed_events if event["type"] == "confirm_request"
     )
@@ -1375,7 +1376,7 @@ def test_sam3_inspection_cannot_leak_internal_result_or_ask_natural_confirmation
     correction_context = "\n".join(
         message.content for message in provider.messages_by_call[1]
     )
-    assert "数据库中没有该工具的真实成功调用" in correction_context
+    assert "不是实际工具调用" in correction_context
     real_inspection = next(
         event
         for event in events
@@ -1563,16 +1564,20 @@ def test_identical_confirmed_gis_code_is_idempotent_within_user_turn(tmp_path: P
         "loaded_layers": [{"id": "smoothed-layer-id"}],
     }
 
-    core._remember_confirmed_write_call(
+    registry = core._build_tool_registry(session.id)
+    session_db.set_state(f"{session.id}:request_scope", "request-1")
+    core._remember_confirmed_tool_call(
         session.id,
         "execute_gis_code",
         arguments,
         result,
+        registry,
     )
     replay = core._confirmed_tool_replay(
         session.id,
         "execute_gis_code",
         arguments,
+        registry,
     )
 
     assert replay is not None

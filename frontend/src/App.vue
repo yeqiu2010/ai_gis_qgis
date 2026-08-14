@@ -304,6 +304,10 @@ async function handleComposerSubmit() {
 
 async function loadSettings() {
   const loaded = await request<AppSettings>('getSettings')
+  applySettings(loaded)
+}
+
+function applySettings(loaded: AppSettings) {
   settings.value = loaded
   settingsForm.value = {
     provider: loaded.llm?.provider || 'openai_compatible',
@@ -329,9 +333,18 @@ async function loadSettings() {
 }
 
 async function openSettings() {
+  if (settingsSaving.value) {
+    return
+  }
   settingsMessage.value = ''
   await loadSettings()
   settingsOpen.value = true
+}
+
+function closeSettings() {
+  if (!settingsSaving.value) {
+    settingsOpen.value = false
+  }
 }
 
 async function saveSettings() {
@@ -339,7 +352,7 @@ async function saveSettings() {
   settingsSaving.value = true
   settingsMessage.value = ''
   try {
-    const saved = await request<AppSettings>('saveSettings', {
+    const submitted: AppSettings = {
       ...current,
       llm: {
         ...(current.llm || {}),
@@ -364,35 +377,43 @@ async function saveSettings() {
         max_boxes_per_request: Number(sam3Form.value.max_boxes_per_request),
         verify_tls: sam3Form.value.verify_tls
       }
-    })
-    settings.value = saved
-    settingsForm.value = {
-      provider: saved.llm?.provider || 'openai_compatible',
-      base_url: saved.llm?.base_url || '',
-      model: saved.llm?.model || '',
-      api_key: saved.llm?.api_key || '',
-      temperature: Number(saved.llm?.temperature ?? 0.1),
-      max_tokens: Number(saved.llm?.max_tokens ?? 16384),
-      max_context_tokens: Number(saved.llm?.max_context_tokens ?? 32768),
-      request_timeout_seconds: Number(saved.llm?.request_timeout_seconds ?? 300)
     }
-    sam3Form.value = {
-      enabled: Boolean(saved.sam3?.enabled ?? true),
-      base_url: saved.sam3?.base_url || 'http://127.0.0.1:8000',
-      api_token: saved.sam3?.api_token || '',
-      connect_timeout_seconds: Number(saved.sam3?.connect_timeout_seconds ?? 10),
-      request_timeout_seconds: Number(saved.sam3?.request_timeout_seconds ?? 1200),
-      max_upload_mb: Number(saved.sam3?.max_upload_mb ?? 512),
-      max_pixels: Number(saved.sam3?.max_pixels ?? 100000000),
-      max_boxes_per_request: Number(saved.sam3?.max_boxes_per_request ?? 64),
-      verify_tls: Boolean(saved.sam3?.verify_tls ?? true)
+    await request<AppSettings>('saveSettings', submitted as unknown as Record<string, unknown>)
+    const persisted = await request<AppSettings>('getSettings')
+    if (!settingsMatchSubmission(persisted, submitted)) {
+      throw new Error('后端回读值与提交值不一致，设置未可靠持久化。')
     }
+    applySettings(persisted)
     settingsMessage.value = '设置已保存。'
   } catch (error) {
     settingsMessage.value = `设置保存失败：${String(error)}`
   } finally {
     settingsSaving.value = false
   }
+}
+
+function settingsMatchSubmission(persisted: AppSettings, submitted: AppSettings) {
+  const persistedLlm = persisted.llm || {}
+  const submittedLlm = submitted.llm || {}
+  const persistedSam3 = persisted.sam3 || {}
+  const submittedSam3 = submitted.sam3 || {}
+  return (
+    persistedLlm.provider === submittedLlm.provider &&
+    persistedLlm.base_url === submittedLlm.base_url &&
+    persistedLlm.model === submittedLlm.model &&
+    Number(persistedLlm.temperature) === Number(submittedLlm.temperature) &&
+    Number(persistedLlm.max_tokens) === Number(submittedLlm.max_tokens) &&
+    Number(persistedLlm.max_context_tokens) === Number(submittedLlm.max_context_tokens) &&
+    Number(persistedLlm.request_timeout_seconds) === Number(submittedLlm.request_timeout_seconds) &&
+    Boolean(persistedSam3.enabled) === Boolean(submittedSam3.enabled) &&
+    persistedSam3.base_url === submittedSam3.base_url &&
+    Number(persistedSam3.connect_timeout_seconds) === Number(submittedSam3.connect_timeout_seconds) &&
+    Number(persistedSam3.request_timeout_seconds) === Number(submittedSam3.request_timeout_seconds) &&
+    Number(persistedSam3.max_upload_mb) === Number(submittedSam3.max_upload_mb) &&
+    Number(persistedSam3.max_pixels) === Number(submittedSam3.max_pixels) &&
+    Number(persistedSam3.max_boxes_per_request) === Number(submittedSam3.max_boxes_per_request) &&
+    Boolean(persistedSam3.verify_tls) === Boolean(submittedSam3.verify_tls)
+  )
 }
 
 async function testSam3Connection() {
@@ -757,124 +778,132 @@ async function waitForPaint() {
       <button type="button" class="danger-action" @click="resolveConfirmation(true)">确认</button>
     </section>
 
-    <section v-if="settingsOpen" class="settings-panel" aria-label="AI 设置">
+    <section
+      v-if="settingsOpen"
+      class="settings-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="AI 设置"
+    >
       <header>
         <strong>AI 设置</strong>
-        <button type="button" class="icon-action" title="关闭设置" @click="settingsOpen = false">×</button>
+        <button type="button" class="icon-action" title="关闭设置" :disabled="settingsSaving" @click="closeSettings">×</button>
       </header>
-      <label>
-        <span>提供商</span>
-        <select v-model="settingsForm.provider">
-          <option
-            v-for="option in providerOptions"
-            :key="option.value"
-            :value="option.value"
-          >
-            {{ option.label }}
-          </option>
-        </select>
-      </label>
-      <label>
-        <span>Base URL</span>
-        <input v-model="settingsForm.base_url" type="text" placeholder="http://10.0.19.214:11430/v1" />
-      </label>
-      <label>
-        <span>模型名</span>
-        <input v-model="settingsForm.model" type="text" placeholder="例如 gemma-4-31B-it-Q4:latest" />
-      </label>
-      <label>
-        <span>API Key</span>
-        <input v-model="settingsForm.api_key" type="password" placeholder="本地 Ollama 可留空" />
-      </label>
-      <div class="settings-grid">
+      <div class="settings-content">
         <label>
-          <span>Temperature</span>
-          <input
-            v-model.number="settingsForm.temperature"
-            type="number"
-            min="0"
-            max="2"
-            step="0.1"
-          />
+          <span>提供商</span>
+          <select v-model="settingsForm.provider">
+            <option
+              v-for="option in providerOptions"
+              :key="option.value"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
         </label>
         <label>
-          <span>Max Tokens</span>
-          <input
-            v-model.number="settingsForm.max_tokens"
-            type="number"
-            min="256"
-            max="200000"
-            step="512"
-          />
+          <span>Base URL</span>
+          <input v-model="settingsForm.base_url" type="text" placeholder="http://10.0.19.214:11430/v1" />
         </label>
         <label>
-          <span>Context Window</span>
-          <input
-            v-model.number="settingsForm.max_context_tokens"
-            type="number"
-            min="4096"
-            max="1000000"
-            step="4096"
-          />
+          <span>模型名</span>
+          <input v-model="settingsForm.model" type="text" placeholder="例如 gemma-4-31B-it-Q4:latest" />
         </label>
         <label>
-          <span>请求超时（秒）</span>
-          <input
-            v-model.number="settingsForm.request_timeout_seconds"
-            type="number"
-            min="10"
-            max="3600"
-            step="30"
-          />
+          <span>API Key</span>
+          <input v-model="settingsForm.api_key" type="password" placeholder="本地 Ollama 可留空" />
         </label>
+        <div class="settings-grid">
+          <label>
+            <span>Temperature</span>
+            <input
+              v-model.number="settingsForm.temperature"
+              type="number"
+              min="0"
+              max="2"
+              step="0.1"
+            />
+          </label>
+          <label>
+            <span>Max Tokens</span>
+            <input
+              v-model.number="settingsForm.max_tokens"
+              type="number"
+              min="256"
+              max="200000"
+              step="512"
+            />
+          </label>
+          <label>
+            <span>Context Window</span>
+            <input
+              v-model.number="settingsForm.max_context_tokens"
+              type="number"
+              min="4096"
+              max="1000000"
+              step="4096"
+            />
+          </label>
+          <label>
+            <span>请求超时（秒）</span>
+            <input
+              v-model.number="settingsForm.request_timeout_seconds"
+              type="number"
+              min="10"
+              max="3600"
+              step="30"
+            />
+          </label>
+        </div>
+        <div class="settings-divider">
+          <strong>SAM3 遥感分割服务</strong>
+          <label class="settings-check">
+            <input v-model="sam3Form.enabled" type="checkbox" />
+            <span>启用</span>
+          </label>
+        </div>
+        <label>
+          <span>SAM3 Base URL</span>
+          <input v-model="sam3Form.base_url" type="text" placeholder="http://127.0.0.1:8000" />
+        </label>
+        <label>
+          <span>API Token（可选）</span>
+          <input v-model="sam3Form.api_token" type="password" placeholder="无鉴权服务可留空" />
+        </label>
+        <div class="settings-grid">
+          <label>
+            <span>连接超时（秒）</span>
+            <input v-model.number="sam3Form.connect_timeout_seconds" type="number" min="1" max="300" />
+          </label>
+          <label>
+            <span>推理超时（秒）</span>
+            <input v-model.number="sam3Form.request_timeout_seconds" type="number" min="10" max="7200" step="30" />
+          </label>
+          <label>
+            <span>最大上传（MB）</span>
+            <input v-model.number="sam3Form.max_upload_mb" type="number" min="1" max="10240" />
+          </label>
+          <label>
+            <span>最大像元数</span>
+            <input v-model.number="sam3Form.max_pixels" type="number" min="1" step="1000000" />
+          </label>
+          <label>
+            <span>单次最大框数</span>
+            <input v-model.number="sam3Form.max_boxes_per_request" type="number" min="1" max="10000" />
+          </label>
+          <label class="settings-check">
+            <input v-model="sam3Form.verify_tls" type="checkbox" />
+            <span>校验 HTTPS 证书</span>
+          </label>
+        </div>
+        <button type="button" class="secondary-action" :disabled="sam3Testing" @click="testSam3Connection">
+          {{ sam3Testing ? '检查中...' : '测试 SAM3 连接' }}
+        </button>
       </div>
-      <div class="settings-divider">
-        <strong>SAM3 遥感分割服务</strong>
-        <label class="settings-check">
-          <input v-model="sam3Form.enabled" type="checkbox" />
-          <span>启用</span>
-        </label>
-      </div>
-      <label>
-        <span>SAM3 Base URL</span>
-        <input v-model="sam3Form.base_url" type="text" placeholder="http://127.0.0.1:8000" />
-      </label>
-      <label>
-        <span>API Token（可选）</span>
-        <input v-model="sam3Form.api_token" type="password" placeholder="无鉴权服务可留空" />
-      </label>
-      <div class="settings-grid">
-        <label>
-          <span>连接超时（秒）</span>
-          <input v-model.number="sam3Form.connect_timeout_seconds" type="number" min="1" max="300" />
-        </label>
-        <label>
-          <span>推理超时（秒）</span>
-          <input v-model.number="sam3Form.request_timeout_seconds" type="number" min="10" max="7200" step="30" />
-        </label>
-        <label>
-          <span>最大上传（MB）</span>
-          <input v-model.number="sam3Form.max_upload_mb" type="number" min="1" max="10240" />
-        </label>
-        <label>
-          <span>最大像元数</span>
-          <input v-model.number="sam3Form.max_pixels" type="number" min="1" step="1000000" />
-        </label>
-        <label>
-          <span>单次最大框数</span>
-          <input v-model.number="sam3Form.max_boxes_per_request" type="number" min="1" max="10000" />
-        </label>
-        <label class="settings-check">
-          <input v-model="sam3Form.verify_tls" type="checkbox" />
-          <span>校验 HTTPS 证书</span>
-        </label>
-      </div>
-      <button type="button" class="secondary-action" :disabled="sam3Testing" @click="testSam3Connection">
-        {{ sam3Testing ? '检查中...' : '测试 SAM3 连接' }}
-      </button>
       <footer>
         <p>{{ settingsMessage }}</p>
-        <button type="button" class="secondary-action" @click="settingsOpen = false">取消</button>
+        <button type="button" class="secondary-action" :disabled="settingsSaving" @click="closeSettings">取消</button>
         <button type="button" class="primary-action" :disabled="settingsSaving" @click="saveSettings">
           {{ settingsSaving ? '保存中' : '保存' }}
         </button>

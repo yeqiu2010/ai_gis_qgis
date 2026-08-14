@@ -302,6 +302,35 @@ def build_sam3_tools(
             "maxItems": 3,
         },
     }
+
+    def segmentation_artifacts(result: dict[str, Any]) -> list[dict[str, Any]]:
+        artifacts = []
+        for output in result.get("outputs") or []:
+            if not isinstance(output, dict):
+                continue
+            artifacts.append(
+                {
+                    "artifact_type": str(output.get("type") or "segmentation_output"),
+                    "name": output.get("name") or output.get("path"),
+                    "uri": output.get("path") or output.get("absolute_path"),
+                    "payload": output,
+                    "verified": True,
+                }
+            )
+        artifacts.append(
+            {
+                "artifact_type": "segmentation_outputs",
+                "name": "SAM3 segmentation outputs",
+                "payload": {
+                    "job_id": result.get("job_id"),
+                    "parameters": result.get("parameters") or {},
+                    "loaded_layers": result.get("loaded_layers") or [],
+                    "object_count": result.get("object_count"),
+                },
+                "verified": True,
+            }
+        )
+        return artifacts
     return [
         ToolEntry(
             name="check_sam3_service",
@@ -363,6 +392,23 @@ def build_sam3_tools(
             requires_confirmation=True,
             writes_project=True,
             preflight=preflight,
+            artifact_mapper=segmentation_artifacts,
+            idempotency_key_fields=(
+                "input_layer_id",
+                "scope_mode",
+                "aoi_layer_id",
+                "boxes_layer_id",
+                "mode",
+                "prompt",
+                "confidence_threshold",
+                "min_size_pixels",
+                "max_size_pixels",
+                "output_types",
+                "rgb_bands",
+            ),
+            resume_policy="continue_plan",
+            execution_affinity="main_thread",
+            timeout_seconds=int(sam3_config.get("request_timeout_seconds") or 1200),
         ),
     ]
 

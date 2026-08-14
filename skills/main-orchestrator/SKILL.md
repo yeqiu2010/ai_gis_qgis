@@ -25,28 +25,7 @@ metadata:
 5. 没有专用业务 Skill 匹配时，两个及以上步骤、多个输入、CRS/字段推断、统计汇总或中间依赖的任务加载 `gis-pipeline`。
 6. `fast-path` 仅处理不适合 QGIS Processing 的简单单步逻辑。
 
-遥感、卫星或航空影像中的地物识别/提取，包含植被、林地、农田、建筑、水体、道路、运动场、屋顶、树冠等可见区域，语义上都匹配 `sam3-remote-segmentation`。必须通过该 Skill 的受信任工具产生真实 QGIS 图层。不得因为目标是植被就自行改成 NDVI、波段运算或栅格分类；只有用户明确要求这些光谱方法时才走对应流程。若同一请求还包含矢量处理或面积/占比统计，必须先创建多步骤计划，通常第一步使用 `sam3-remote-segmentation`，后续步骤依赖第一步并使用其真实输出 `layer_id`，分割成功后才可加载后处理 Skill。禁止在 SAM3 分割产物产生前启动替代性 Pipeline 或生成替代性代码，也禁止在 `execute_gis_code` 中调用 SAM3 HTTP API。
-
-唯一的顺序例外是：用户要求的 SAM3 处理范围必须先由现有矢量生成，例如“筛选青年路 → 生成 500m 缓冲区 → 在缓冲区内从影像分割建筑物”。此时计划必须按依赖顺序设为“AOI 矢量预处理 → SAM3 分割 → 导出/统计”。AOI 步骤确认成功后只是中间产物，必须自动继续计划、加载 `sam3-remote-segmentation`，并把缓冲结果 `loaded_layers[].id` 作为 `aoi_layer_id`；不得在缓冲区生成后结束任务。
-
-当 `inspect_layer` 或 `inspect_layers` 已确认用户指定的地物来源是遥感栅格时，原请求已经足以选择 SAM3，不得再询问“提供建筑物矢量数据还是使用 SAM3”。`sample_features` 只是一小部分样例，样例中没有出现“青年路”不能证明完整图层中不存在该道路，也不能据此要求用户重复确认；应在实际筛选步骤中验证并在零结果时报告。
-
-例如“提取 satellite 图层中的植被区域，并统计植被面积相当于影像面积的占比”的强制工具顺序是：
-
-1. `create_plan`：SAM3 分割步骤在前，面积与占比统计步骤依赖分割步骤。
-2. `load_skill({"skill_name":"sam3-remote-segmentation"})`。
-3. 按 SAM3 Skill 完成图层检查、服务检查、输入检查、确认执行和分割产物登记。
-4. 仅在分割步骤完成后 `load_skill({"skill_name":"gis-pipeline"})`，使用 `loaded_layers[].id` 计算面积和占比。
-
-不得先调用 `record_pipeline_stage`，不得用 NDVI 阈值结果冒充 SAM3 分割产物。
-
-用户为同一目标明确给出多个 SAM3 阈值时，计划必须按阈值拆成多个独立 `sam3-remote-segmentation` 步骤，每个步骤保存自己的 `confidence_threshold` 和唯一 `output_name`。例如“阈值分别为 0.5、0.3”必须恰好执行一次 0.5 和一次 0.3；完成记录以返回的 `parameters.confidence_threshold` 和 `job_id` 为准。不得把第一个阈值的步骤反复执行，也不得在收到 `duplicate_prevented=true` 后重新提交。
-
-例如“提取 line1 中青年路周边 500m 范围内 whch 影像中的建筑物，并保存为 building.geojson”的强制计划是：
-
-1. 用 `qgis-toolbox` 按道路名称筛选青年路，重投影到适合米制距离的 CRS，并生成融合后的 500m 面缓冲区。
-2. 加载 `sam3-remote-segmentation`，对 whch 使用 `mode=text`、`prompt=building`、`scope_mode=aoi`，并传入缓冲图层真实 ID。
-3. SAM3 成功后再用结果真实 ID 输出用户要求的 `building.geojson`；不能把道路缓冲文件当成最终交付物。
+专用能力的触发条件、调用顺序、参数拆分和与其他 Skill 的组合规则，必须由该能力自身的 Skill 描述，不得写入主调度。涉及多个能力时先建立依赖计划；每一步只消费前序步骤登记的真实 Artifact 或 QGIS layer ID。确认后的成功结果如果是中间步骤，必须按 Tool 的 `resume_policy` 恢复计划。
 
 `search_skills` 只返回未排序的可路由 Skill 卡片，不替 AI 做匹配。需要刷新目录时传入未经改写的用户原始请求；收到结果后由当前 AI 比较每个 `description` 并选择。
 

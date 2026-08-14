@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
+ArtifactMapper = Callable[[dict[str, Any]], list[dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,15 @@ class ToolEntry:
     destructive: bool = False
     writes_project: bool = False
     preflight: ToolHandler | None = None
+    result_schema: dict[str, Any] | None = None
+    artifact_mapper: ArtifactMapper | None = None
+    idempotency_key_fields: tuple[str, ...] = ()
+    idempotency_scope: str = "request"
+    resume_policy: str = "return_result"
+    execution_affinity: str = "any"
+    timeout_seconds: int | None = None
+    availability: Callable[[], tuple[bool, str]] | None = None
+    source: str = "core"
 
     def definition(self) -> dict[str, Any]:
         return {
@@ -40,8 +50,15 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolEntry] = {}
         self._skill_tools: dict[str, set[str]] = {}
+        self._before_execute: Callable[[str, dict[str, Any]], None] | None = None
+        self._after_execute: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None
 
     def register(self, entry: ToolEntry) -> None:
+        existing = self._tools.get(entry.name)
+        if existing is not None and existing != entry:
+            raise ValueError(
+                f"Tool name collision: {entry.name} ({existing.source} vs {entry.source})"
+            )
         self._tools[entry.name] = entry
 
     def set_skill_tools(self, skill_tools: dict[str, list[str]]) -> None:
@@ -50,6 +67,15 @@ class ToolRegistry:
             for skill_name, tool_names in skill_tools.items()
             if tool_names
         }
+
+    def set_execution_hooks(
+        self,
+        *,
+        before: Callable[[str, dict[str, Any]], None] | None = None,
+        after: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._before_execute = before
+        self._after_execute = after
 
     def get(self, name: str) -> ToolEntry:
         if name not in self._tools:
@@ -74,21 +100,54 @@ class ToolRegistry:
         return [
             entry.definition()
             for entry in self._tools.values()
-            if entry.name in allowed or entry.category in {"skill", "planning", "delegation"}
+            if entry.name in allowed
+            or entry.category in {"skill", "planning", "delegation", "learning"}
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], int]:
         entry = self.get(name)
         started = time.monotonic()
         try:
+            if self._before_execute is not None:
+                self._before_execute(name, arguments)
+            if entry.availability is not None:
+                available, reason = entry.availability()
+                if not available:
+                    raise RuntimeError(reason or f"Tool unavailable: {name}")
             result = entry.handler(arguments)
             if "success" not in result:
                 result = {"success": True, **result}
+            if result.get("success") and entry.artifact_mapper is not None:
+                result = {**result, "artifacts": entry.artifact_mapper(result)}
             result = make_json_safe(result)
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
+        if self._after_execute is not None:
+            try:
+                self._after_execute(name, arguments, result)
+            except Exception:
+                # Hook failures are diagnostic-only and may never overwrite a
+                # completed tool result.
+                pass
         duration_ms = int((time.monotonic() - started) * 1000)
         return result, duration_ms
+
+    def idempotency_key(self, name: str, arguments: dict[str, Any]) -> str | None:
+        entry = self.get(name)
+        if not entry.idempotency_key_fields:
+            return None
+        import json
+
+        values = {
+            field_name: arguments.get(field_name)
+            for field_name in entry.idempotency_key_fields
+        }
+        return json.dumps(
+            {"tool": name, "scope": entry.idempotency_scope, "values": values},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 def make_json_safe(value: Any) -> Any:

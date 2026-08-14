@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,14 +25,23 @@ class SettingsManager:
     def load(self) -> dict[str, Any]:
         config = copy.deepcopy(DEFAULT_CONFIG)
         loaded_config_version = 0
-        for stored in self._read_raw_values():
+        candidates: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+        for priority, stored in enumerate(self._read_raw_values()):
             if stored:
                 try:
                     parsed = json.loads(stored)
-                    self._deep_update(config, parsed)
-                    loaded_config_version = int(parsed.get("config_version") or 0)
-                except json.JSONDecodeError:
+                    if not isinstance(parsed, dict):
+                        continue
+                    revision = int(parsed.get("settings_revision") or 0)
+                    # A revisioned value always wins over legacy values. For
+                    # equally old values, _read_raw_values source priority is
+                    # used as the compatibility tiebreaker.
+                    candidates.append(((1 if revision else 0, revision, priority), parsed))
+                except (json.JSONDecodeError, TypeError, ValueError):
                     pass
+        for _, parsed in sorted(candidates, key=lambda item: item[0]):
+            self._deep_update(config, parsed)
+            loaded_config_version = int(parsed.get("config_version") or 0)
         if loaded_config_version < CONFIG_VERSION:
             legacy_max_tokens = int(config.get("llm", {}).get("max_tokens") or 0)
             if legacy_max_tokens in {4096, 8192}:
@@ -39,17 +51,41 @@ class SettingsManager:
         return config
 
     def save(self, config: dict[str, Any]) -> dict[str, Any]:
-        merged = copy.deepcopy(DEFAULT_CONFIG)
+        # Merge partial settings updates over the latest persisted state, not
+        # only over defaults. This prevents one settings page from resetting
+        # keys owned by another page or Plugin.
+        merged = self.load()
         self._deep_update(merged, config)
         self._normalize(merged)
+        merged["config_version"] = CONFIG_VERSION
+        merged["settings_revision"] = time.time_ns()
         raw = json.dumps(merged, ensure_ascii=False, indent=2)
         if self._qsettings is not None:
             self._qsettings.setValue(SETTINGS_KEY, raw)
+            sync = getattr(self._qsettings, "sync", None)
+            if callable(sync):
+                sync()
         FALLBACK_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FALLBACK_SETTINGS_PATH.write_text(raw, encoding="utf-8")
-        return merged
+        self._atomic_write(FALLBACK_SETTINGS_PATH, raw)
+        # Read through the same precedence path used on the next dialog open
+        # and application restart. Returning this verified copy also exposes a
+        # persistence mismatch to the caller immediately.
+        return self.load()
 
     def _normalize(self, config: dict[str, Any]) -> None:
+        plugins = config.setdefault("plugins", {})
+        for key in ("enabled", "disabled"):
+            values = plugins.get(key) or []
+            if not isinstance(values, list):
+                raise ValueError(f"plugins.{key} 必须是字符串数组。")
+            plugins[key] = [str(value).strip() for value in values if str(value).strip()]
+        plugins["user_dir"] = str(
+            plugins.get("user_dir") or "~/.qgis_hermes_agent/plugins"
+        )
+        plugins["project_dir"] = str(plugins.get("project_dir") or "")
+        plugins["enable_project_plugins"] = bool(
+            plugins.get("enable_project_plugins", False)
+        )
         sam3 = config.setdefault("sam3", {})
         base_url = str(sam3.get("base_url") or "").strip().rstrip("/")
         if base_url:
@@ -76,16 +112,40 @@ class SettingsManager:
 
     def _read_raw_values(self) -> list[str]:
         values = []
-        qsettings_raw = self._read_qsettings_raw()
-        if qsettings_raw:
-            values.append(qsettings_raw)
+        # Legacy unversioned precedence: bundled < QSettings < user file.
         bundled_raw = self._read_bundled_raw()
         if bundled_raw:
             values.append(bundled_raw)
+        qsettings_raw = self._read_qsettings_raw()
+        if qsettings_raw:
+            values.append(qsettings_raw)
         file_raw = self._read_file_raw()
         if file_raw:
             values.append(file_raw)
         return values
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        temporary_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_name = handle.name
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, path)
+        finally:
+            if temporary_name:
+                temporary_path = Path(temporary_name)
+                if temporary_path.exists():
+                    temporary_path.unlink()
 
     def _read_bundled_raw(self) -> str | None:
         if BUNDLED_SETTINGS_PATH.exists():

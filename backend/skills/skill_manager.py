@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +14,50 @@ class SkillManager:
     def __init__(self, skills_dir: Path | str | list[Path | str]):
         self.loader = SkillLoader(skills_dir)
         self._documents = self.loader.load_all()
+        self._aliases: dict[str, str] = {}
         self._runtime_available_tools: set[str] | None = None
         self._runtime_active_toolsets: set[str] | None = None
 
     def reload(self) -> None:
         self._documents = self.loader.load_all()
+        self._aliases = {}
+
+    def register_skill(
+        self,
+        name: str,
+        path: Path | str,
+        *,
+        source: str,
+        aliases: Iterable[str] = (),
+        read_only: bool = True,
+    ) -> SkillDocument:
+        """Register a Plugin-provided Skill without changing AgentCore."""
+        canonical = str(name).strip()
+        if not canonical:
+            raise ValueError("Skill name cannot be empty")
+        document = replace(
+            self.loader.load(Path(path)),
+            name=canonical,
+            source=source,
+            read_only=read_only,
+        )
+        existing = self._documents.get(canonical)
+        if existing is not None and existing.source != source:
+            raise ValueError(
+                f"Skill name collision: {canonical} ({existing.source} vs {source})"
+            )
+        self._documents[canonical] = document
+        for raw_alias in aliases:
+            alias = str(raw_alias).strip()
+            if alias and alias != canonical:
+                self._aliases[alias] = canonical
+        return document
+
+    def canonical_name(self, name: str) -> str:
+        return self._aliases.get(str(name), str(name))
 
     def get(self, name: str) -> SkillDocument | None:
-        return self._documents.get(name)
+        return self._documents.get(self.canonical_name(name))
 
     def all(self) -> dict[str, SkillDocument]:
         return dict(self._documents)
@@ -62,7 +99,10 @@ class SkillManager:
             for include_name in document.includes
         }
         catalog: list[dict[str, object]] = []
+        aliased_documents = set(self._aliases)
         for document in self._documents.values():
+            if document.name in aliased_documents:
+                continue
             is_custom = ".qgis_hermes_agent" in str(document.path)
             if not include_builtin and not is_custom:
                 continue
@@ -122,6 +162,8 @@ class SkillManager:
             "tags": list(document.tags),
             "related_skills": list(document.related_skills),
             "custom": ".qgis_hermes_agent" in str(document.path),
+            "source": document.source,
+            "read_only": document.read_only,
             "lifecycle": document.lifecycle or "persistent",
             "available": bool(available),
             "unavailable_reasons": list(reasons or []),
@@ -193,7 +235,7 @@ class SkillManager:
         if include_coordinator and "main-orchestrator" in self._documents:
             ordered.append("main-orchestrator")
         for raw_name in names:
-            name = str(raw_name).strip()
+            name = self.canonical_name(str(raw_name).strip())
             if not name or name in ordered or name not in self._documents:
                 continue
             ordered.append(name)

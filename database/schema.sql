@@ -190,3 +190,85 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS artifacts_task_created
 ON artifacts(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_outcomes (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    completion_score REAL,
+    feedback_score REAL,
+    user_feedback TEXT,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS solution_recipes (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    intent TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    version INTEGER NOT NULL DEFAULT 1,
+    schema_json TEXT NOT NULL DEFAULT '{}',
+    source_task_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT 'agent',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    archived_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS solution_recipes_intent_status
+ON solution_recipes(intent, status);
+
+CREATE TABLE IF NOT EXISTS recipe_runs (
+    id TEXT PRIMARY KEY,
+    recipe_id TEXT NOT NULL REFERENCES solution_recipes(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    success INTEGER NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_candidates (
+    id TEXT PRIMARY KEY,
+    candidate_type TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'observed',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    evaluation_json TEXT NOT NULL DEFAULT '{}',
+    source_task_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL DEFAULT 'agent',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS knowledge_candidates_status
+ON knowledge_candidates(status, candidate_type);
+
+CREATE TABLE IF NOT EXISTS knowledge_versions (
+    id TEXT PRIMARY KEY,
+    knowledge_type TEXT NOT NULL,
+    knowledge_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    UNIQUE(knowledge_type, knowledge_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS skill_usage (
+    skill_name TEXT PRIMARY KEY,
+    view_count INTEGER NOT NULL DEFAULT 0,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    patch_count INTEGER NOT NULL DEFAULT 0,
+    last_viewed_at REAL,
+    last_used_at REAL,
+    state TEXT NOT NULL DEFAULT 'active',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT 'system'
+);

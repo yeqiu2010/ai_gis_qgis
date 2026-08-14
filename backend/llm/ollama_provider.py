@@ -34,7 +34,7 @@ class OllamaProvider:
             "model": self.model,
             "stream": False,
             "messages": [{"role": "system", "content": system}]
-            + [{"role": message.role, "content": message.content} for message in messages],
+            + [message.as_api_message() for message in messages],
         }
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",

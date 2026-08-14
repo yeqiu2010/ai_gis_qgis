@@ -210,6 +210,10 @@ def build_execute_gis_code_tool(
         category="execution",
         requires_confirmation=True,
         writes_project=True,
+        idempotency_key_fields=("code", "expected_outputs", "delivery_outputs"),
+        resume_policy="return_result",
+        execution_affinity="main_thread",
+        timeout_seconds=int((executor_config or {}).get("timeout_seconds") or 300),
     )
 
 
