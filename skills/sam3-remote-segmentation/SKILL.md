@@ -1,5 +1,6 @@
 ---
 name: sam3-remote-segmentation
+lifecycle: task
 description: 通过已配置的 SAM3-Geo-API 从 QGIS 遥感、卫星或航空影像中分割植被、林地、农田、建筑、水体、道路、运动场、屋顶、树冠等可见地物或区域，支持文本提示、自动分割、AOI 范围和选中矢量要素边界框提示，输出地理配准掩码或面图层。适用于影像地物识别与提取、遥感影像分割，以及必须先分割再继续裁剪、相交、空间连接、面积/占比统计或制图的任务。
 allowed-tools:
   - list_layers

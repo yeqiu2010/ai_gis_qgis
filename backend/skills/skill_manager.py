@@ -205,6 +205,7 @@ class SkillManager:
         names: Iterable[str],
         *,
         active_skill: str | None = None,
+        include_names: Iterable[str] | None = None,
     ) -> str:
         ordered = self.normalize_loaded_skills(names)
         parts: list[str] = []
@@ -218,10 +219,25 @@ class SkillManager:
             elif document.name == "main-orchestrator":
                 label = "Coordinator Skill"
             else:
-                label = "Loaded Skill"
+                # Inactive Skills remain discoverable as cards, but their full
+                # instructions must not permanently inflate every later turn.
+                parts.append(self._format_card(document, "Loaded Skill Card"))
+                seen.add(document.name)
+                continue
             parts.append(self._format_document(document, label))
             seen.add(document.name)
-            self._append_includes(parts, document, seen=seen)
+            if document.name == active_skill:
+                allowed_includes = (
+                    {self.canonical_name(name) for name in include_names}
+                    if include_names is not None
+                    else None
+                )
+                self._append_includes(
+                    parts,
+                    document,
+                    seen=seen,
+                    allowed=allowed_includes,
+                )
         return "\n\n".join(parts)
 
     def normalize_loaded_skills(
@@ -262,14 +278,17 @@ class SkillManager:
         document: SkillDocument,
         *,
         seen: set[str],
+        allowed: set[str] | None = None,
     ) -> None:
         for include_name in document.includes:
             included = self.get(include_name)
             if included is None or included.name in seen:
                 continue
+            if allowed is not None and included.name not in allowed:
+                continue
             parts.append(self._format_document(included, "Included Skill"))
             seen.add(included.name)
-            self._append_includes(parts, included, seen=seen)
+            self._append_includes(parts, included, seen=seen, allowed=allowed)
 
     def _format_document(self, document: SkillDocument, label: str) -> str:
         header = f"## {label}: {document.name}"
@@ -278,3 +297,12 @@ class SkillManager:
         if document.tools:
             header = f"{header}\n允许工具：{', '.join(document.tools)}"
         return f"{header}\n\n{document.body}"
+
+    @staticmethod
+    def _format_card(document: SkillDocument, label: str) -> str:
+        header = f"## {label}: {document.name}"
+        if document.description:
+            header += f"\n描述：{document.description}"
+        if document.lifecycle:
+            header += f"\n生命周期：{document.lifecycle}"
+        return header

@@ -11,6 +11,7 @@ from typing import Any
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 ArtifactMapper = Callable[[dict[str, Any]], list[dict[str, Any]]]
+ContextReducer = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class ToolEntry:
     preflight: ToolHandler | None = None
     result_schema: dict[str, Any] | None = None
     artifact_mapper: ArtifactMapper | None = None
+    context_reducer: ContextReducer | None = None
     idempotency_key_fields: tuple[str, ...] = ()
     idempotency_scope: str = "request"
     resume_policy: str = "return_result"
@@ -87,6 +89,14 @@ class ToolRegistry:
 
     def toolsets(self) -> set[str]:
         return {entry.toolset for entry in self._tools.values()}
+
+    def context_reducers(self) -> dict[str, ContextReducer]:
+        """Return Plugin/core projections used only for model context compaction."""
+        return {
+            name: entry.context_reducer
+            for name, entry in self._tools.items()
+            if entry.context_reducer is not None
+        }
 
     def definitions_for_skill(self, skill_name: str) -> list[dict[str, Any]]:
         return self.definitions_for_skills([skill_name])

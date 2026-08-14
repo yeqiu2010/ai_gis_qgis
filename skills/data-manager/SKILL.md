@@ -1,5 +1,6 @@
 ---
 name: data-manager
+lifecycle: task
 description: 安全、可审计地管理 QGIS 图层、样式与导出
 version: 1.0.0
 author: AI GIS QGIS Plugin

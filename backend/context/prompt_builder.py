@@ -29,6 +29,7 @@ class PromptBuilder:
         qgis_context: QGISContext,
         *,
         loaded_skills: list[str] | None = None,
+        include_skills: list[str] | None = None,
     ) -> str:
         layer_names = ", ".join(layer["name"] for layer in qgis_context.layers) or "无"
         normalized_loaded = self.skill_manager.normalize_loaded_skills(
@@ -46,6 +47,7 @@ class PromptBuilder:
             skill_prompt = self.skill_manager.compose_loaded_prompt(
                 normalized_loaded,
                 active_skill=active_skill,
+                include_names=include_skills,
             )
         routing_catalog = self._routing_catalog_prompt()
         return (

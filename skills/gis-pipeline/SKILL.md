@@ -1,6 +1,7 @@
 ---
 name: gis-pipeline
 description: 完整 GIS 分析 Pipeline
+lifecycle: task
 tools:
   - list_layers
   - inspect_layer

@@ -20,6 +20,14 @@ DEFAULT_CONFIG = {
         "path": "~/.qgis_hermes_agent/state.db",
         "max_sessions": 1000,
     },
+    "context": {
+        "compression_enabled": True,
+        "soft_threshold_ratio": 0.55,
+        "minimum_output_tokens": 2048,
+        "safety_tokens": 256,
+        "max_inline_tool_result_chars": 2400,
+        "historical_message_limit": 8,
+    },
     "executor": {
         "execution_mode": "current_qgis",
         "timeout_seconds": 300,

@@ -6,6 +6,37 @@ from dataclasses import replace
 from typing import Any
 
 
+def _sam3_context_reducer(
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Project a completed segmentation into a compact, reusable GIS artifact."""
+    parameters = result.get("parameters")
+    parameters = dict(parameters) if isinstance(parameters, dict) else {}
+    return {
+        key: value
+        for key, value in {
+            "success": result.get("success", True),
+            "error": result.get("error"),
+            "error_code": result.get("error_code"),
+            "job_id": result.get("job_id"),
+            "input_layer_id": parameters.get("input_layer_id")
+            or arguments.get("input_layer_id"),
+            "prompt": parameters.get("prompt") or arguments.get("prompt"),
+            "confidence_threshold": parameters.get("confidence_threshold")
+            or result.get("confidence_threshold")
+            or arguments.get("confidence_threshold"),
+            "scope_mode": parameters.get("scope_mode") or arguments.get("scope_mode"),
+            "object_count": result.get("object_count") or result.get("count"),
+            "outputs": result.get("outputs") or result.get("output_files"),
+            "loaded_layers": result.get("loaded_layers"),
+            "artifacts": result.get("artifacts"),
+            "context_compacted": True,
+        }.items()
+        if value is not None
+    }
+
+
 def register(context: Any) -> None:
     package = __package__ or "plugins.sam3"
     root = package.rsplit(".plugins", 1)[0] if ".plugins" in package else ""
@@ -31,6 +62,7 @@ def register(context: Any) -> None:
         replace(
             entry,
             resume_policy="continue_plan",
+            context_reducer=_sam3_context_reducer,
             idempotency_key_fields=(
                 entry.idempotency_key_fields
                 or (

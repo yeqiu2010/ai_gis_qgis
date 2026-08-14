@@ -136,7 +136,10 @@ def build_load_skill_tool(
             "success": True,
             "skill_name": skill_name,
             "loaded_skills": loaded,
-            "skill": skill_manager.inspect(skill_name, include_body=True),
+            # The full body is injected once by PromptBuilder after activation.
+            # Returning it here duplicates the same SKILL.md in the tool result
+            # and makes every later provider request larger.
+            "skill": skill_manager.skill_card(document),
         }
 
     return ToolEntry(

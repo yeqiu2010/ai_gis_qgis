@@ -12,9 +12,11 @@ from typing import Any
 
 from ..json_recovery import recover_json_object, unwrap_raw_arguments
 from .base_provider import ChatMessage, ChatResponse, ToolCall
+from .errors import ContextWindowExceeded
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32768
 CONTEXT_WINDOW_SAFETY_TOKENS = 64
+MINIMUM_OUTPUT_TOKENS = 2048
 
 
 class OpenAICompatibleProvider:
@@ -180,7 +182,14 @@ class OpenAICompatibleProvider:
             return self.max_tokens
         prompt_tokens = self._estimate_prompt_tokens(messages, tools)
         available = self.max_context_tokens - prompt_tokens - CONTEXT_WINDOW_SAFETY_TOKENS
-        return max(1, min(self.max_tokens, available))
+        minimum_output = min(self.max_tokens, MINIMUM_OUTPUT_TOKENS)
+        if available < minimum_output:
+            raise ContextWindowExceeded(
+                "请求输入过大，无法保留最低输出预算："
+                f"估算输入 {prompt_tokens} tokens，上下文 {self.max_context_tokens} tokens，"
+                f"至少需要输出 {minimum_output} tokens。"
+            )
+        return min(self.max_tokens, available)
 
     def _estimate_prompt_tokens(
         self,

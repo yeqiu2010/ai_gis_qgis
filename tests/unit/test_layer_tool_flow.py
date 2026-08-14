@@ -177,10 +177,12 @@ class BufferThenSamProvider:
     def __init__(self):
         self.calls = 0
         self.messages_by_call = []
+        self.systems_by_call = []
 
     def chat(self, system, messages, tools=None):
         self.calls += 1
         self.messages_by_call.append(messages)
+        self.systems_by_call.append(system)
         if self.calls == 1:
             return ChatResponse(
                 content="",
@@ -1132,8 +1134,8 @@ def test_confirmed_buffer_resumes_plan_and_passes_aoi_layer_to_sam3(
         message.content for message in provider.messages_by_call[1]
     )
     assert "buffer-layer-id" in resumed_context
-    assert "道路缓冲区应作为后续 SAM3 的" in resumed_context
-    assert "aoi_layer_id" in resumed_context
+    assert "道路缓冲区应作为后续 SAM3 的" in provider.systems_by_call[2]
+    assert "aoi_layer_id" in provider.systems_by_call[2]
     sam_confirmation = next(
         event for event in confirmed_events if event["type"] == "confirm_request"
     )

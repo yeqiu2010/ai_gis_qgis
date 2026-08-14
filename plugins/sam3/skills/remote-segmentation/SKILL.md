@@ -1,5 +1,6 @@
 ---
 name: remote-segmentation
+lifecycle: task
 description: 使用 SAM3 对 QGIS 遥感栅格进行文本、自动或边界框提示分割，并把结果作为后续矢量分析的真实输入。
 tools:
   - check_sam3_service

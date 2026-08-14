@@ -11,10 +11,15 @@ from typing import Any
 
 from ..database.session_db import SessionDB
 from ..qwebengine.message_protocol import agent_event
+from .context.context_engine import (
+    ContextEngine,
+    QGISContextEngine,
+)
 from .context.prompt_builder import PromptBuilder
 from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, ChatResponse, LLMProvider
+from .llm.errors import ContextWindowExceeded
 from .plugin_system import PluginManager
 from .tools.code_execution import (
     build_execute_gis_code_tool,
@@ -159,8 +164,10 @@ class AgentCore:
         executor_config: dict[str, Any] | None = None,
         sam3_config: dict[str, Any] | None = None,
         plugins_config: dict[str, Any] | None = None,
+        context_config: dict[str, Any] | None = None,
         custom_tools_dir: str | None = None,
         should_cancel: CancelChecker | None = None,
+        context_engine: ContextEngine | None = None,
         llm_retry_attempts: int = 3,
         llm_retry_delay_seconds: float = 0.8,
     ):
@@ -172,9 +179,28 @@ class AgentCore:
         self.executor_config = executor_config or {}
         self.sam3_config = sam3_config or {}
         self.plugins_config = plugins_config or {}
+        self.context_config = context_config or {}
         self.plugin_manager: PluginManager | None = None
         self.custom_tools_dir = custom_tools_dir
         self.should_cancel = should_cancel or (lambda: False)
+        self.context_engine = context_engine or QGISContextEngine(
+            context_window_tokens=(
+                int(getattr(llm_provider, "max_context_tokens", 0) or 0)
+                if self.context_config.get("compression_enabled", True)
+                else 0
+            ),
+            max_output_tokens=int(getattr(llm_provider, "max_tokens", 4096) or 4096),
+            minimum_output_tokens=int(
+                self.context_config.get("minimum_output_tokens", 2048)
+            ),
+            safety_tokens=int(self.context_config.get("safety_tokens", 256)),
+            soft_threshold_ratio=float(
+                self.context_config.get("soft_threshold_ratio", 0.55)
+            ),
+            max_inline_tool_result_chars=int(
+                self.context_config.get("max_inline_tool_result_chars", 2400)
+            ),
+        )
         self.llm_retry_attempts = max(1, llm_retry_attempts)
         self.llm_retry_delay_seconds = max(0.0, llm_retry_delay_seconds)
 
@@ -281,7 +307,8 @@ class AgentCore:
             # Build the registry first so Hermes availability metadata can be
             # evaluated against the tools/toolsets that are actually active.
             tool_registry = self._build_tool_registry(session_id)
-            system_prompt = self.prompt_builder.build(
+            system_prompt = self._build_system_prompt(
+                session_id,
                 active_skill,
                 qgis_context,
                 loaded_skills=loaded_skills,
@@ -606,7 +633,8 @@ class AgentCore:
                         if next_skill == "gis-pipeline" and active_skill != "gis-pipeline":
                             start_pipeline_cycle(self.session_db, session_id)
                         active_skill = next_skill
-                        system_prompt = self.prompt_builder.build(
+                        system_prompt = self._build_system_prompt(
+                            session_id,
                             active_skill,
                             qgis_context,
                             loaded_skills=loaded_skills,
@@ -621,7 +649,8 @@ class AgentCore:
                         )
                         if active_skill == "gis-pipeline" and previous_skill != "gis-pipeline":
                             start_pipeline_cycle(self.session_db, session_id)
-                        system_prompt = self.prompt_builder.build(
+                        system_prompt = self._build_system_prompt(
+                            session_id,
                             active_skill,
                             qgis_context,
                             loaded_skills=loaded_skills,
@@ -638,7 +667,8 @@ class AgentCore:
                             self.session_db.get_state(f"{session_id}:active_skill")
                             or "main-orchestrator"
                         )
-                        system_prompt = self.prompt_builder.build(
+                        system_prompt = self._build_system_prompt(
+                            session_id,
                             active_skill,
                             qgis_context,
                             loaded_skills=loaded_skills,
@@ -751,6 +781,7 @@ class AgentCore:
                     run_id=run_id,
                 )
             )
+            self._reset_task_scoped_skills(session_id)
         except Exception as exc:
             content = self._format_llm_error(exc)
             self._publish_final_error(content, publish, session_id, run_id)
@@ -995,6 +1026,7 @@ class AgentCore:
                 run_id=run_id,
             )
         )
+        self._reset_task_scoped_skills(session_id)
         publish(agent_event("complete", {}, session_id=session_id, run_id=run_id))
         return events
 
@@ -1027,7 +1059,8 @@ class AgentCore:
                 (name for name in reversed(loaded_skills) if name != "main-orchestrator"),
                 "main-orchestrator",
             )
-        system_prompt = self.prompt_builder.build(
+        system_prompt = self._build_system_prompt(
+            session_id,
             active_skill,
             qgis_context,
             loaded_skills=loaded_skills,
@@ -1330,7 +1363,8 @@ class AgentCore:
                 budget.record_tool_call()
 
             qgis_context = self._collect_qgis_context()
-            system_prompt = self.prompt_builder.build(
+            system_prompt = self._build_system_prompt(
+                session_id,
                 active_skill,
                 qgis_context,
                 loaded_skills=loaded_skills,
@@ -1513,6 +1547,7 @@ class AgentCore:
             active_toolsets=registry.toolsets(),
         )
         registry.set_skill_tools(self.prompt_builder.skill_manager.tool_allowlist())
+        self.context_engine.set_tool_reducers(registry.context_reducers())
         return registry
 
     def _managed_task_must_continue(self, session_id: str) -> bool:
@@ -2006,6 +2041,34 @@ class AgentCore:
             [name for name in loaded if name != active_skill],
         )
 
+    def _reset_task_scoped_skills(self, session_id: str) -> None:
+        """Unload operational instructions after the current task is terminal."""
+        task = self.session_db.get_active_task(session_id)
+        if task is not None and task.get("status") not in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return
+        loaded = read_loaded_skills(
+            self.session_db.get_state,
+            session_id,
+            self.prompt_builder.skill_manager,
+        )
+        retained = []
+        for name in loaded:
+            document = self.prompt_builder.skill_manager.get(name)
+            if document is not None and document.lifecycle == "task":
+                continue
+            retained.append(name)
+        if retained != loaded:
+            write_loaded_skills(
+                self.session_db.set_state,
+                session_id,
+                self.prompt_builder.skill_manager,
+                retained,
+            )
+
     def _confirmed_tool_replay(
         self,
         session_id: str,
@@ -2070,6 +2133,30 @@ class AgentCore:
             return self.qgis_executor(lambda: QGISContext.collect(self.iface))
         return QGISContext.collect(self.iface)
 
+    def _build_system_prompt(
+        self,
+        session_id: str,
+        active_skill: str,
+        qgis_context: QGISContext,
+        *,
+        loaded_skills: list[str],
+    ) -> str:
+        include_skills: list[str] | None = None
+        if active_skill == "gis-pipeline":
+            include_skills = {
+                "data_overview": ["data-overview"],
+                "structured_query": ["query-tuner"],
+                "solution_plan": ["solution-planner"],
+                "generated_code": ["code-generator", "code-reviewer"],
+                "execution_result": ["executor"],
+            }.get(next_pipeline_stage(self.session_db, session_id), [])
+        return self.prompt_builder.build(
+            active_skill,
+            qgis_context,
+            loaded_skills=loaded_skills,
+            include_skills=include_skills,
+        )
+
     def _publish_message_deltas(
         self,
         content: str,
@@ -2104,6 +2191,34 @@ class AgentCore:
         run_id: str = "",
         on_response: Callable[[ChatResponse], None] | None = None,
     ) -> ChatResponse:
+        prepared = self.context_engine.prepare(
+            system=system,
+            messages=messages,
+            tools=tools,
+        )
+        if session_id:
+            self.session_db.set_state(
+                f"{session_id}:context_stats",
+                json.dumps(prepared.as_dict(), ensure_ascii=False),
+            )
+        if prepared.compacted:
+            messages[:] = prepared.messages
+            notice = (
+                "已压缩历史上下文并保留当前 GIS 任务状态与工具调用链："
+                f"估算输入 {prepared.estimated_input_tokens} tokens，"
+                f"预留输出 {prepared.reserved_output_tokens} tokens。"
+            )
+            if publish is not None and session_id:
+                self._save_process_message(session_id, notice)
+                publish(
+                    agent_event(
+                        "thinking",
+                        {"message": notice, "context": prepared.as_dict()},
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
+                )
+        effective_messages = prepared.messages
         last_exc: Exception | None = None
         for attempt in range(1, self.llm_retry_attempts + 1):
             if self.should_cancel():
@@ -2111,10 +2226,12 @@ class AgentCore:
             try:
                 response = self.llm_provider.chat(
                     system=system,
-                    messages=messages,
+                    messages=effective_messages,
                     tools=tools,
                 )
             except Exception as exc:
+                if isinstance(exc, ContextWindowExceeded):
+                    raise
                 last_exc = exc
                 if session_id:
                     try:
@@ -2148,7 +2265,7 @@ class AgentCore:
                 response = self._ensure_response_usage(
                     response,
                     system=system,
-                    messages=messages,
+                    messages=effective_messages,
                     tools=tools,
                 )
                 if on_response is not None:
@@ -2217,6 +2334,12 @@ class AgentCore:
         return max(1, int(ascii_chars / 4 + non_ascii * 1.1))
 
     def _format_llm_error(self, exc: Exception) -> str:
+        if isinstance(exc, ContextWindowExceeded):
+            return (
+                "当前会话上下文过大，系统无法在保留 GIS 任务状态的同时为完整回答预留足够空间。\n"
+                f"错误原因：{self._short_error(exc)}\n"
+                "请检查模型 Context Window 配置；完整历史仍保存在会话数据库中。"
+            )
         return (
             "Agent 暂时无法从 LLM 提供商获得响应。\n"
             f"错误原因：{self._short_error(exc)}\n"
@@ -2326,7 +2449,8 @@ class AgentCore:
             session_id,
             self.prompt_builder.skill_manager,
         )
-        system_prompt = self.prompt_builder.build(
+        system_prompt = self._build_system_prompt(
+            session_id,
             active_skill,
             self._collect_qgis_context(),
             loaded_skills=loaded_skills,
@@ -2481,12 +2605,64 @@ class AgentCore:
         return messages
 
     def _build_conversation_messages(self, session_id: str) -> list[ChatMessage]:
-        history = self.session_db.get_conversation_messages(session_id, limit=50)
+        history = self.session_db.get_context_messages(
+            session_id,
+            historical_limit=int(
+                self.context_config.get("historical_message_limit", 8)
+            ),
+        )
         messages = [self._chat_message_from_row(row) for row in history]
         memory_message = self._build_memory_message(session_id)
         if memory_message is not None:
             messages.insert(0, memory_message)
+        task_state_message = self._build_task_state_message(session_id)
+        if task_state_message is not None:
+            messages.insert(0, task_state_message)
         return messages
+
+    def _build_task_state_message(self, session_id: str) -> ChatMessage | None:
+        task = self.session_db.get_active_task(session_id)
+        if task is None:
+            return None
+        task_state = self.session_db.get_task_state(str(task["id"]))
+        if task_state is None:
+            return None
+        snapshot = {
+            "task_id": task_state.get("id"),
+            "objective": task_state.get("objective"),
+            "status": task_state.get("status"),
+            "plan_version": task_state.get("plan_version"),
+            "steps": [
+                {
+                    "id": step.get("id"),
+                    "skill_name": step.get("skill_name"),
+                    "instruction": step.get("instruction"),
+                    "dependencies": step.get("dependencies") or [],
+                    "status": step.get("status"),
+                    "inputs": step.get("inputs") or {},
+                    "outputs": step.get("outputs") or {},
+                    "error": step.get("error"),
+                }
+                for step in task_state.get("steps") or []
+            ],
+            "artifacts": [
+                {
+                    "id": artifact.get("id"),
+                    "type": artifact.get("artifact_type"),
+                    "name": artifact.get("name"),
+                    "uri": artifact.get("uri"),
+                    "verified": artifact.get("verified"),
+                    "payload": artifact.get("payload") or {},
+                }
+                for artifact in task_state.get("artifacts") or []
+            ],
+        }
+        content = (
+            "[GIS TASK STATE — AUTHORITATIVE]\n"
+            "以下 JSON 是当前任务的无损状态；历史摘要只能作为参考，不能覆盖其中的图层、字段、参数、步骤或产物。\n"
+            + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        )
+        return ChatMessage(role="assistant", content=content)
 
     @staticmethod
     def _tool_calls_payload(calls: list[Any]) -> list[dict[str, Any]]:
@@ -2674,46 +2850,6 @@ class AgentCore:
         tool_calls = self.session_db.get_recent_tool_calls(session_id, limit=8)
         stage_artifacts = self.session_db.get_recent_stage_artifacts(session_id, limit=5)
         lines = []
-        loaded_skills = read_loaded_skills(
-            self.session_db.get_state,
-            session_id,
-            self.prompt_builder.skill_manager,
-        )
-        if loaded_skills:
-            lines.append("当前已加载 Skills：" + ", ".join(loaded_skills))
-        active_task = self.session_db.get_active_task(session_id)
-        if active_task is not None:
-            task_state = self.session_db.get_task_state(str(active_task["id"]))
-            if task_state is not None:
-                compact_task = {
-                    "id": task_state.get("id"),
-                    "objective": task_state.get("objective"),
-                    "status": task_state.get("status"),
-                    "steps": [
-                        {
-                            "id": step.get("id"),
-                            "skill_name": step.get("skill_name"),
-                            "status": step.get("status"),
-                            "outputs": step.get("outputs"),
-                            "error": step.get("error"),
-                        }
-                        for step in task_state.get("steps") or []
-                    ],
-                    "artifacts": [
-                        {
-                            "id": artifact.get("id"),
-                            "type": artifact.get("artifact_type"),
-                            "name": artifact.get("name"),
-                            "uri": artifact.get("uri"),
-                            "verified": artifact.get("verified"),
-                        }
-                        for artifact in task_state.get("artifacts") or []
-                    ],
-                }
-                lines.append(
-                    "当前通用任务状态："
-                    + json.dumps(compact_task, ensure_ascii=False, separators=(",", ":"))
-                )
         if tool_calls:
             lines.append("最近工具记忆：")
             for call in tool_calls:
@@ -2733,7 +2869,7 @@ class AgentCore:
             "不要重复询问已经由工具确认过的图层、字段或筛选依据。\n"
             + "\n".join(lines)
         )
-        return ChatMessage(role="assistant", content=content[:6000])
+        return ChatMessage(role="assistant", content=content[:3600])
 
     def _summarize_tool_memory(self, call: dict[str, Any]) -> list[str]:
         name = str(call.get("tool_name") or "")

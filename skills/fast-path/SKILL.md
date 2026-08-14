@@ -1,5 +1,6 @@
 ---
 name: fast-path
+lifecycle: task
 description: 简单 GIS 任务快速路径
 tools:
   - list_layers

@@ -287,8 +287,69 @@ class SessionDB:
                 """,
                 (session_id, limit),
             ).fetchall()
+        return self._decode_conversation_rows(reversed(rows))
+
+    def get_context_messages(
+        self,
+        session_id: str,
+        *,
+        historical_limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Return compact cross-task history plus the complete active task chain.
+
+        Full tool exchanges remain in the audit store. A new user message is a
+        task boundary: older completed tool calls are recalled through compact
+        memory/session search, while every model-visible message from the latest
+        user request onward is retained for tool-call and confirmation recovery.
+        """
+        with self._connect() as connection:
+            latest_user = connection.execute(
+                """
+                SELECT MAX(id) AS id
+                FROM messages
+                WHERE session_id = ? AND role = 'user'
+                """,
+                (session_id,),
+            ).fetchone()
+            latest_user_id = int(latest_user["id"] or 0) if latest_user else 0
+            if latest_user_id <= 0:
+                return []
+            historical = connection.execute(
+                """
+                SELECT id, role, content, timestamp, event_type, finish_reason,
+                       tool_call_id, tool_calls, tool_name
+                FROM messages
+                WHERE session_id = ?
+                  AND id < ?
+                  AND role IN ('user', 'assistant')
+                  AND COALESCE(event_type, '') NOT IN (
+                      'confirm_request', 'process', 'tool_call', 'tool_result'
+                  )
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, latest_user_id, max(0, int(historical_limit))),
+            ).fetchall()
+            active = connection.execute(
+                """
+                SELECT id, role, content, timestamp, event_type, finish_reason,
+                       tool_call_id, tool_calls, tool_name
+                FROM messages
+                WHERE session_id = ?
+                  AND id >= ?
+                  AND role IN ('user', 'assistant', 'tool')
+                  AND COALESCE(event_type, '') NOT IN ('confirm_request', 'process')
+                ORDER BY id
+                """,
+                (session_id, latest_user_id),
+            ).fetchall()
+        rows = [*reversed(historical), *active]
+        return self._decode_conversation_rows(rows)
+
+    @staticmethod
+    def _decode_conversation_rows(rows) -> list[dict[str, Any]]:
         result = []
-        for row in reversed(rows):
+        for row in rows:
             item = dict(row)
             raw_calls = item.get("tool_calls")
             if raw_calls:

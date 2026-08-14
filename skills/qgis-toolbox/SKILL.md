@@ -1,5 +1,6 @@
 ---
 name: qgis-toolbox
+lifecycle: task
 description: QGIS Processing 算法知识检索与简单单步 GIS 任务
 tools:
   - load_skill
