@@ -429,7 +429,12 @@ def _normalize_arguments(arguments: dict[str, Any], config: dict[str, Any]) -> d
         raise ValueError("output_types 只能包含 vector 和 raster。")
     min_size = int(arguments.get("min_size_pixels") or 0)
     max_size_raw = arguments.get("max_size_pixels")
-    max_size = int(max_size_raw) if max_size_raw not in {None, "", 0} else None
+    if max_size_raw is None or max_size_raw == "" or max_size_raw == 0:
+        max_size = None
+    elif isinstance(max_size_raw, (int, float, str)):
+        max_size = int(max_size_raw)
+    else:
+        raise ValueError("max_size_pixels 必须是整数或 null。")
     if min_size < 0 or (max_size is not None and max_size < max(1, min_size)):
         raise ValueError("对象像素大小范围无效。")
     confidence = arguments.get("confidence_threshold")

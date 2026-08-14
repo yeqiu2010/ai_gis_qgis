@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from ai_gis_qgis.backend.skills.skill_manager import SkillManager
-from ai_gis_qgis.backend.tools.sam3_segmentation import build_sam3_tools
+from ai_gis_qgis.backend.tools.sam3_segmentation import (
+    _normalize_arguments,
+    build_sam3_tools,
+)
 
 
 def test_sam3_tools_are_trusted_and_confirmation_gated():
@@ -24,6 +28,18 @@ def test_sam3_tools_are_trusted_and_confirmation_gated():
     assert by_name["segment_remote_sensing_image"].requires_confirmation is True
     assert by_name["segment_remote_sensing_image"].writes_project is True
     assert by_name["segment_remote_sensing_image"].preflight is not None
+
+
+def test_sam3_max_size_is_type_narrowed_and_validated():
+    base_arguments = {"input_layer_id": "raster", "mode": "automatic"}
+
+    assert _normalize_arguments(base_arguments, {})["max_size_pixels"] is None
+    assert _normalize_arguments(
+        {**base_arguments, "max_size_pixels": "512"}, {}
+    )["max_size_pixels"] == 512
+
+    with pytest.raises(ValueError, match="max_size_pixels 必须是整数或 null"):
+        _normalize_arguments({**base_arguments, "max_size_pixels": []}, {})
 
 
 def test_sam3_skill_is_discoverable_with_registered_tools():
