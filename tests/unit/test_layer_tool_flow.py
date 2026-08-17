@@ -9,6 +9,7 @@ from pathlib import Path
 from ai_gis_qgis.backend.agent_core import AgentCore
 from ai_gis_qgis.backend.context.prompt_builder import PromptBuilder
 from ai_gis_qgis.backend.context.qgis_context import QGISContext
+from ai_gis_qgis.backend.executor.artifact_verifier import ArtifactVerifier
 from ai_gis_qgis.backend.executor.qgis_executor import (
     QGISCodeExecutor,
     _process_qt_events,
@@ -19,8 +20,6 @@ from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
     find_generated_code_issues,
     find_uncreated_workspace_inputs,
-    find_unwritten_expected_outputs,
-    infer_expected_outputs_from_code,
     validate_execute_gis_code_arguments,
 )
 from ai_gis_qgis.backend.tools.layer_ops import _layer_name_aliases, _normalize_source
@@ -402,6 +401,183 @@ class RepeatingSmoothingProvider:
         )
 
 
+class CompletedSamPlanProvider:
+    name = "completed-sam-plan-test"
+    model = "completed-sam-plan-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        del system, messages, tools
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("已完成的 SAM3 计划不应再次调用模型")
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id="segment-completed-plan",
+                    name="segment_remote_sensing_image",
+                    arguments={
+                        "input_layer_id": "whch-layer-id",
+                        "mode": "text",
+                        "prompt": "building",
+                        "scope_mode": "aoi",
+                        "aoi_layer_id": "buffer-layer-id",
+                        "confidence_threshold": 0.1,
+                        "output_types": ["vector"],
+                        "output_name": "sam3_buildings",
+                    },
+                )
+            ],
+        )
+
+
+class RepeatedFailedPostSamProvider(CompletedSamPlanProvider):
+    name = "repeated-failed-post-sam-test"
+    model = "repeated-failed-post-sam-test-model"
+
+    def chat(self, system, messages, tools=None):
+        del system, messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="segment-before-export",
+                        name="segment_remote_sensing_image",
+                        arguments={
+                            "input_layer_id": "whch-layer-id",
+                            "mode": "text",
+                            "prompt": "building",
+                            "confidence_threshold": 0.1,
+                            "output_types": ["vector"],
+                        },
+                    )
+                ],
+            )
+        if self.calls > 3:
+            raise AssertionError("相同的预检失败应在第二次后熔断")
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=f"invalid-export-{self.calls}",
+                    name="execute_gis_code",
+                    arguments={
+                        "code": "print('未写入声明的文件')",
+                        "expected_outputs": [
+                            {
+                                "path": "qingnian_road_buffer.geojson",
+                                "name": "qingnian_road_buffer",
+                                "type": "vector",
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+
+
+def _completed_plan_sam_factory(output_path: Path, execution_count: dict[str, int]):
+    def build_fake_sam3_tools(**kwargs):
+        del kwargs
+        parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+
+        def segment(arguments):
+            execution_count["value"] += 1
+            return {
+                "success": True,
+                "job_id": "job-completed-plan",
+                "parameters": arguments,
+                "object_count": 808,
+                "outputs": [
+                    {
+                        "path": str(output_path),
+                        "name": "sam3_buildings_objects",
+                        "type": "vector",
+                    }
+                ],
+                "loaded_layers": [
+                    {
+                        "id": "sam3-buildings-layer-id",
+                        "name": "sam3_buildings_objects",
+                        "type": "vector",
+                    }
+                ],
+            }
+
+        def artifacts(result):
+            return [
+                {
+                    "artifact_type": "vector",
+                    "name": "sam3_buildings_objects",
+                    "uri": str(output_path),
+                    "verified": True,
+                },
+                {
+                    "artifact_type": "qgis_layer",
+                    "name": "sam3_buildings_objects",
+                    "uri": "sam3-buildings-layer-id",
+                    "verified": True,
+                },
+                {
+                    "artifact_type": "segmentation_outputs",
+                    "name": "SAM3 segmentation outputs",
+                    "payload": {"job_id": result["job_id"]},
+                    "verified": True,
+                },
+            ]
+
+        return [
+            ToolEntry(
+                name="check_sam3_service",
+                description="Fake SAM3 health check.",
+                parameters=parameters,
+                handler=lambda arguments: {"success": True, "status": "ok"},
+                category="sam3",
+            ),
+            ToolEntry(
+                name="inspect_sam3_segmentation_inputs",
+                description="Fake SAM3 inspection.",
+                parameters=parameters,
+                handler=lambda arguments: {
+                    "success": True,
+                    "inspection_complete": True,
+                },
+                category="sam3",
+            ),
+            ToolEntry(
+                name="segment_remote_sensing_image",
+                description="Fake successful SAM3 segmentation.",
+                parameters=parameters,
+                handler=segment,
+                category="sam3",
+                requires_confirmation=True,
+                writes_project=True,
+                preflight=lambda arguments: {
+                    "success": True,
+                    "arguments": arguments,
+                },
+                artifact_mapper=artifacts,
+            ),
+        ]
+
+    return build_fake_sam3_tools
+
+
 class SchoolCoverageExecutionProvider:
     name = "school-coverage-test"
     model = "school-coverage-test-model"
@@ -511,6 +687,63 @@ class RetryCodeExecutionProvider:
                         "code": "with open('parks.txt', 'w', encoding='utf-8') as handle:\n    handle.write('fixed')",
                         "expected_outputs": [
                             {"path": "parks.txt", "name": "parks", "type": "file"}
+                        ],
+                    },
+                )
+            ],
+        )
+
+
+class DuplicateRetryCodeExecutionProvider:
+    name = "duplicate-retry-code-test"
+    model = "duplicate-retry-code-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        del system, messages, tools
+        self.calls += 1
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=f"duplicate-{self.calls}",
+                    name="execute_gis_code",
+                    arguments={
+                        "code": "print('missing.txt')",
+                        "expected_outputs": [
+                            {"path": "missing.txt", "name": "missing", "type": "file"}
+                        ],
+                    },
+                )
+            ],
+        )
+
+
+class RepeatedRuntimeFailureProvider(DuplicateRetryCodeExecutionProvider):
+    name = "repeated-runtime-failure-test"
+    model = "repeated-runtime-failure-test-model"
+
+    def chat(self, system, messages, tools=None):
+        del system, messages, tools
+        self.calls += 1
+        if self.calls > 2:
+            raise AssertionError("相同运行时失败出现两次后不应继续生成代码")
+        return ChatResponse(
+            content="",
+            model=self.model,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=f"runtime-failure-{self.calls}",
+                    name="execute_gis_code",
+                    arguments={
+                        "code": f"print('attempt {self.calls}, still missing output')",
+                        "expected_outputs": [
+                            {"path": "missing.txt", "name": "missing", "type": "file"}
                         ],
                     },
                 )
@@ -1480,10 +1713,12 @@ def test_completed_single_step_plan_does_not_repeat_confirmed_gis_code(
                 "outputs": [
                     {
                         "path": str(output_path),
-                        "name": "building_smoothed",
-                        "type": "vector",
-                        "exists": True,
-                    }
+                            "name": "building_smoothed",
+                            "type": "vector",
+                            "exists": True,
+                            "valid": True,
+                            "verified": True,
+                        }
                 ],
                 "loaded_layers": [
                     {
@@ -1543,6 +1778,140 @@ def test_completed_single_step_plan_does_not_repeat_confirmed_gis_code(
         event for event in reversed(confirmed_events) if event["type"] == "message"
     )
     assert "平滑处理完成" in final_message["payload"]["content"]
+
+
+def test_completed_sam3_plan_stops_without_another_model_or_tool_call(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = tmp_path / "sam3_buildings.gpkg"
+    output_path.touch()
+    execution_count = {"value": 0}
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        _completed_plan_sam_factory(output_path, execution_count),
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="completed SAM3 plan",
+        model="completed-sam-plan-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(
+        session.id,
+        "提取青年路周边500m范围内whch影像中的建筑物",
+    )
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "buffer",
+                "skill_name": "qgis-toolbox",
+                "instruction": "生成青年路500m缓冲区",
+                "dependencies": [],
+                "status": "completed",
+                "outputs": {"layer_id": "buffer-layer-id"},
+            },
+            {
+                "id": "segment",
+                "skill_name": "sam3-remote-segmentation",
+                "instruction": "使用SAM3在缓冲区内提取建筑物",
+                "dependencies": ["buffer"],
+                "status": "in_progress",
+            },
+        ],
+    )
+    session_db.set_state(f"{session.id}:active_skill", "sam3-remote-segmentation")
+    provider = CompletedSamPlanProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(
+        session_id=session.id,
+        user_message="使用SAM3完成建筑物提取，阈值0.1",
+    )
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert provider.calls == 1
+    assert execution_count["value"] == 1
+    assert session_db.get_plan_step(task_id, "segment")["status"] == "completed"
+    assert session_db.get_task(task_id)["status"] == "completed"
+    assert not any(event["type"] == "confirm_request" for event in confirmed_events)
+    final_message = next(
+        event for event in reversed(confirmed_events) if event["type"] == "message"
+    )
+    assert "SAM3 分割已完成" in final_message["payload"]["content"]
+    assert "808" in final_message["payload"]["content"]
+
+
+def test_post_sam_output_contract_is_deferred_to_confirmed_runtime(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = tmp_path / "sam3_buildings.gpkg"
+    output_path.touch()
+    execution_count = {"value": 0}
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.agent_core.build_sam3_tools",
+        _completed_plan_sam_factory(output_path, execution_count),
+    )
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="post SAM failure circuit breaker",
+        model="repeated-failed-post-sam-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(session.id, "分割建筑物并导出附加结果")
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "segment",
+                "skill_name": "sam3-remote-segmentation",
+                "instruction": "使用SAM3提取建筑物",
+                "dependencies": [],
+                "status": "in_progress",
+            },
+            {
+                "id": "export",
+                "skill_name": "qgis-toolbox",
+                "instruction": "导出附加结果",
+                "dependencies": ["segment"],
+                "status": "pending",
+            },
+        ],
+    )
+    session_db.set_state(f"{session.id}:active_skill", "sam3-remote-segmentation")
+    provider = RepeatedFailedPostSamProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(session_id=session.id, user_message="继续执行计划")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert provider.calls == 2
+    assert execution_count["value"] == 1
+    failed_preflights = [
+        event
+        for event in confirmed_events
+        if event["type"] == "tool_end"
+        and event["payload"]["name"] == "execute_gis_code"
+        and not event["payload"]["result"].get("success")
+    ]
+    assert failed_preflights == []
+    next_confirmation = next(
+        event for event in confirmed_events if event["type"] == "confirm_request"
+    )
+    assert next_confirmation["payload"]["tool_name"] == "execute_gis_code"
+    assert session_db.get_plan_step(task_id, "export")["status"] == "pending"
 
 
 def test_identical_confirmed_gis_code_is_idempotent_within_user_turn(tmp_path: Path):
@@ -1699,6 +2068,66 @@ def test_code_executor_rejects_new_qgis_application(tmp_path: Path):
     assert "QgsApplication" in result["error"]
 
 
+def test_artifact_verifier_reports_runtime_file_evidence(tmp_path: Path):
+    report_path = tmp_path / "report.json"
+    report_path.write_text('{"status":"ok"}', encoding="utf-8")
+
+    result = ArtifactVerifier().verify(
+        {
+            "path": str(report_path),
+            "name": "report",
+            "type": "file",
+            "required": True,
+        }
+    )
+
+    assert result["exists"] is True
+    assert result["valid"] is True
+    assert result["verified"] is True
+    assert result["size_bytes"] > 0
+    assert result["metadata"]["json_type"] == ""
+
+
+def test_artifact_verifier_rejects_empty_and_missing_required_files(tmp_path: Path):
+    empty_path = tmp_path / "empty.txt"
+    empty_path.touch()
+    verifier = ArtifactVerifier()
+
+    empty = verifier.verify(
+        {"path": str(empty_path), "name": "empty", "type": "file"}
+    )
+    missing = verifier.verify(
+        {"path": str(tmp_path / "missing.tif"), "name": "missing", "type": "raster"}
+    )
+
+    assert empty["verified"] is False
+    assert empty["validation_errors"] == ["输出文件为空"]
+    assert missing["verified"] is False
+    assert missing["validation_errors"] == ["预期输出文件不存在"]
+
+
+def test_optional_missing_output_does_not_fail_execution(tmp_path: Path):
+    executor = QGISCodeExecutor(
+        {"workspace_dir": str(tmp_path / "workspaces"), "timeout_seconds": 5}
+    )
+
+    result = executor.execute(
+        code="print('optional output intentionally omitted')",
+        expected_outputs=[
+            {
+                "path": "optional.txt",
+                "name": "optional",
+                "type": "file",
+                "required": False,
+            }
+        ],
+    )
+
+    assert result["success"] is True
+    assert result["outputs"][0]["exists"] is False
+    assert result["outputs"][0]["verified"] is False
+
+
 def test_current_qgis_namespace_includes_processing_symbols(monkeypatch, tmp_path: Path):
     fake_core = types.ModuleType("qgis.core")
     symbol_names = [
@@ -1808,6 +2237,73 @@ def test_pipeline_generated_code_allows_empty_file_outputs_for_direct_result():
     }
 
     assert _validate_stage_artifact("generated_code", artifact) is None
+
+
+def test_processing_clip_extent_uses_runtime_projwin_parameter_name():
+    code = '''
+processing.run("gdal:cliprasterbyextent", {
+    "INPUT": raster_layer,
+    "EXTENT": road_layer.extent(),
+    "OUTPUT": output_path,
+})
+'''
+
+    issues = find_generated_code_issues(code)
+    message = next(issue for issue in issues if "EXTENT" in issue)
+
+    assert "允许参数" in message
+    assert "PROJWIN" in message
+    assert "Catalog 代码示例" in message
+    assert "'PROJWIN': '0,10,0,10'" in message
+
+    valid_code = '''
+processing.run("gdal:cliprasterbyextent", {
+    "INPUT": raster_layer,
+    "PROJWIN": road_layer,
+    "OUTPUT": output_path,
+})
+'''
+    assert find_generated_code_issues(valid_code) == []
+
+
+def test_heatmap_output_value_typo_has_precise_correction():
+    invalid_code = '''
+processing.run("qgis:heatmapkerneldensityestimation", {
+    "INPUT": points,
+    "RADIUS": 400,
+    "PIXEL_SIZE": 25,
+    "OUTPUT_VALUES": 0,
+    "OUTPUT": output_path,
+})
+'''
+    valid_code = invalid_code.replace('"OUTPUT_VALUES"', '"OUTPUT_VALUE"')
+
+    issues = find_generated_code_issues(invalid_code)
+
+    assert len(issues) == 1
+    assert "单数 OUTPUT_VALUE" in issues[0]
+    assert find_generated_code_issues(valid_code) == []
+
+
+def test_rejects_string_land_area_as_implicit_geometric_area():
+    invalid_code = '''
+processing.run("native:fieldcalculator", {
+    "INPUT": parcels,
+    "FIELD_NAME": "land_area_num",
+    "FIELD_TYPE": 0,
+    "FORMULA": 'to_real("land_area")',
+    "OUTPUT": "memory:",
+})
+'''
+    valid_code = invalid_code.replace(
+        "'to_real(\"land_area\")'",
+        "'$area'",
+    )
+
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any("String 字段 land_area" in issue and "$area" in issue for issue in issues)
+    assert find_generated_code_issues(valid_code) == []
 
 
 def test_responsive_processing_injects_feedback_and_restores_run(monkeypatch, tmp_path: Path):
@@ -1946,7 +2442,7 @@ def test_qt_event_pump_falls_back_when_binding_rejects_flag_overload():
     assert calls == [(0, 25), ()]
 
 
-def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
+def test_execute_gis_code_rejects_missing_output_after_runtime_verification(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="stderr fallback", model="test", source="test")
     tool = build_execute_gis_code_tool(
@@ -1967,9 +2463,12 @@ def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
     )
 
     assert result["success"] is False
-    assert result["preflight_failed"] is True
-    assert "代码没有写入" in result["error"]
+    assert result.get("preflight_failed") is not True
+    assert result["error_code"] == "missing_expected_output"
+    assert "运行时验证" in result["error"]
     assert "missing.txt" in result["error"]
+    assert result["outputs"][0]["exists"] is False
+    assert result["outputs"][0]["verified"] is False
 
     session_db.log_tool_call(
         session.id,
@@ -1982,34 +2481,9 @@ def test_execute_gis_code_rejects_unwritten_expected_output(tmp_path: Path):
         duration_ms=0,
     )
     failures = session_db.get_failure_records(session_id=session.id)
-    assert failures[-1]["error_code"] == "output_contract"
+    assert failures[-1]["error_code"] == "missing_output"
     assert failures[-1]["source_type"] == "tool_call"
     assert failures[-1]["generated_code"] == "print('missing.txt')"
-
-
-def test_infers_expected_outputs_from_generated_output_path():
-    code = """
-from pathlib import Path
-input_path = "E:/Desktop/test/buildings.shp"
-output_path = Path(QGIS_AGENT_WORKSPACE) / "500m.shp"
-processing.run(
-    "native:intersection",
-    {"INPUT": input_path, "OVERLAY": buffer_layer, "OUTPUT": str(output_path)},
-)
-"""
-
-    assert infer_expected_outputs_from_code(code) == [
-        {"path": "500m.shp", "name": "500m", "type": "vector"}
-    ]
-
-
-def test_detects_expected_output_that_is_only_printed():
-    code = "print('type_values_check.txt')\nprint('公园')"
-
-    assert find_unwritten_expected_outputs(
-        code,
-        [{"path": "type_values_check.txt", "name": "values", "type": "file"}],
-    ) == ["type_values_check.txt"]
 
 
 def test_preflight_rejects_text_field_type_for_density_calculation():
@@ -2071,7 +2545,7 @@ processing.run(
     assert find_uncreated_workspace_inputs(code) == []
 
 
-def test_invalid_output_contract_is_rejected_before_confirmation(tmp_path: Path):
+def test_unrecognized_writer_is_not_rejected_before_confirmation(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="preflight", model="test", source="test")
     provider = InvalidOutputContractProvider()
@@ -2082,48 +2556,9 @@ def test_invalid_output_contract_is_rejected_before_confirmation(tmp_path: Path)
         iface=None,
     ).run(session_id=session.id, user_message="按 type 提取公园")
 
-    assert not any(event["type"] == "confirm_request" for event in events)
-    tool_end = next(event for event in events if event["type"] == "tool_end")
-    assert tool_end["payload"]["result"]["preflight_failed"] is True
-    assert provider.calls == 2
-
-
-def test_accepts_processing_and_text_file_output_writes():
-    code = """
-from pathlib import Path
-output_path = Path(QGIS_AGENT_WORKSPACE) / "parks.gpkg"
-processing.run("native:extractbyexpression", {"INPUT": layer, "OUTPUT": str(output_path)})
-report_path = Path(QGIS_AGENT_WORKSPACE) / "report.txt"
-report_path.write_text("ok", encoding="utf-8")
-"""
-
-    assert find_unwritten_expected_outputs(
-        code,
-        [
-            {"path": "parks.gpkg", "name": "parks", "type": "vector"},
-            {"path": "report.txt", "name": "report", "type": "file"},
-        ],
-    ) == []
-
-
-def test_accepts_qgis_named_style_output_writes():
-    code = """
-from pathlib import Path
-workspace = Path(QGIS_AGENT_WORKSPACE)
-stretch_style_path = workspace / "surface1_stretch.qml"
-class_style_path = workspace / "surface1_class7.qml"
-stretch_layer.saveNamedStyle(str(stretch_style_path))
-class_layer.saveNamedStyle(uri=str(class_style_path))
-"""
-    expected_outputs = [
-        {"path": "surface1_stretch.qml", "name": "stretch style", "type": "file"},
-        {"path": "surface1_class7.qml", "name": "class style", "type": "file"},
-    ]
-
-    assert find_unwritten_expected_outputs(code, expected_outputs) == []
-    assert validate_execute_gis_code_arguments(
-        {"code": code, "expected_outputs": expected_outputs}
-    ) is None
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    assert confirmation["payload"]["tool_name"] == "execute_gis_code"
+    assert provider.calls == 1
 
 
 def test_detects_recurrent_generated_pyqgis_mistakes():
@@ -2148,11 +2583,148 @@ QgsProject.instance().addVectorLayer("result.gpkg", "result", "ogr")
     issues = find_generated_code_issues(code)
 
     assert any("qgis.PyQt" in issue for issue in issues)
-    assert any("mapLayersByName" in issue for issue in issues)
+    assert not any("mapLayersByName" in issue for issue in issues)
     assert any("QgsProcessingFeedback" in issue for issue in issues)
     assert any("featureCount" in issue for issue in issues)
     assert any("QgsVectorFileWriter" in issue for issue in issues)
     assert any("addVectorLayer" in issue for issue in issues)
+
+
+def test_direct_map_layers_by_name_index_is_not_a_hard_code_check_failure():
+    code = '''
+from qgis.core import QgsProject
+
+layer = QgsProject.instance().mapLayersByName("建筑物")[0]
+print(layer.featureCount())
+'''
+
+    assert find_generated_code_issues(code) == []
+
+
+def test_classifies_projwin_runtime_message_as_public_processing_parameter():
+    classification = classify_failure("无法执行算法\nPROJWIN的参数值错误")
+
+    assert classification["error_code"] == "processing_parameters"
+    assert "公开 Processing" in classification["cause"]
+    assert "EXTENT" in classification["cause"]
+
+
+def test_rejects_qgis_layer_id_strings_and_unguarded_map_layer_in_processing():
+    invalid_code = r'''
+from qgis.core import QgsProject
+import processing
+
+input_points = "popu_smp_1d56cb20_ee00_49a7_90e1_e776bcd5e944"
+road_layer = QgsProject.instance().mapLayer(
+    "road_0ffde1b3_371e_4058_9a34_dd7a5b8717e3"
+)
+extent = road_layer.extent()
+processing.run("qgis:heatmapkerneldensityestimation", {
+    "INPUT": input_points,
+    "RADIUS": 400,
+    "PIXEL_SIZE": 25,
+    "EXTENT": extent,
+    "OUTPUT": "kdst_400.tif",
+})
+'''
+
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any("不能直接传 QGIS 图层 ID 字符串" in issue for issue in issues)
+    assert any("road_layer 未检查是否为 None" in issue for issue in issues)
+    assert any("参数不在 Catalog 证据中：EXTENT" in issue for issue in issues)
+
+    valid_code = r'''
+from qgis.core import QgsProject
+import processing
+
+project = QgsProject.instance()
+input_points = project.mapLayer(
+    "popu_smp_1d56cb20_ee00_49a7_90e1_e776bcd5e944"
+)
+road_layer = project.mapLayer("road_0ffde1b3_371e_4058_9a34_dd7a5b8717e3")
+if input_points is None or road_layer is None:
+    raise ValueError("找不到输入点图层或范围图层")
+processing.run("qgis:heatmapkerneldensityestimation", {
+    "INPUT": input_points,
+    "RADIUS": 400,
+    "PIXEL_SIZE": 25,
+    "OUTPUT": "kdst_400.tif",
+})
+'''
+
+    valid_issues = find_generated_code_issues(valid_code)
+    assert not any("QGIS 图层 ID" in issue for issue in valid_issues)
+    assert not any("未检查是否为 None" in issue for issue in valid_issues)
+    assert not any("参数不在 Catalog" in issue for issue in valid_issues)
+
+
+def test_generated_code_literal_analysis_handles_reassigned_variables():
+    code = '''
+layer_id = "first_1d56cb20_ee00_49a7_90e1_e776bcd5e944"
+layer_id = "second_0ffde1b3_371e_4058_9a34_dd7a5b8717e3"
+print(layer_id)
+'''
+
+    assert isinstance(find_generated_code_issues(code), list)
+
+
+def test_pipeline_rejects_unapproved_algorithm_substitution():
+    artifact = {
+        "summary": (
+            "两次核密度估计，并使用 Uniform 核函数替代用户要求的点密度分析"
+        ),
+        "steps": [
+            {
+                "name": "点密度",
+                "algorithm": "qgis:heatmapkerneldensityestimation",
+            }
+        ],
+    }
+
+    error = _validate_stage_artifact("solution_plan", artifact)
+
+    assert error is not None
+    assert "没有用户批准证据" in error
+    assert _validate_stage_artifact(
+        "solution_plan",
+        {**artifact, "substitution_approved": True},
+    ) is None
+
+
+def test_generated_code_preserves_structured_output_names():
+    structured_query = {
+        "output": {
+            "expected_outputs": [
+                {"path": "kdst_400.tif", "name": "kdst_400", "type": "raster"},
+                {"path": "kdst_800.tif", "name": "kdst_800", "type": "raster"},
+                {"path": "pdst_250.tif", "name": "pdst_250", "type": "raster"},
+            ]
+        }
+    }
+    generated = {
+        "code": '''
+open("kdst_400.tif", "wb").close()
+open("kdst_800.tif", "wb").close()
+open("pdst_255.tif", "wb").close()
+''',
+        "expected_outputs": [
+            {"path": "kdst_400.tif", "name": "kdst_400", "type": "raster"},
+            {"path": "kdst_800.tif", "name": "kdst_800", "type": "raster"},
+            {"path": "pdst_255.tif", "name": "pdst_255", "type": "raster"},
+        ],
+        "review": {"passed": True},
+    }
+
+    error = _validate_stage_artifact(
+        "generated_code",
+        generated,
+        structured_query=structured_query,
+    )
+
+    assert error is not None
+    assert "pdst_250" in error
+    assert "数字后缀" in error
 
 
 def test_rejects_color_ramp_shader_passed_directly_to_pseudocolor_renderer():
@@ -2403,7 +2975,7 @@ def test_classifies_invalid_join_field_after_aggregate():
     assert "没有显式输出连接键" in classification["cause"]
 
 
-def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
+def test_execute_gis_code_does_not_infer_output_contract_from_code(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="infer expected outputs", model="test", source="test")
     tool = build_execute_gis_code_tool(
@@ -2422,9 +2994,9 @@ def test_execute_gis_code_infers_missing_file_expected_outputs(tmp_path: Path):
     )
 
     assert result["success"] is True
-    assert result["expected_outputs_inferred"] is True
-    assert result["expected_outputs"][0]["path"].endswith("result.txt")
-    assert result["outputs"][0]["exists"] is True
+    assert result["expected_outputs_inferred"] is False
+    assert result["expected_outputs"] == []
+    assert result["outputs"] == []
 
 
 def test_execute_gis_code_delivers_outputs_to_external_path(tmp_path: Path):
@@ -2704,6 +3276,113 @@ def test_solution_plan_context_receives_only_structured_query(tmp_path: Path):
     assert "large_samples" not in messages[0].content
 
 
+def test_pipeline_preserves_processing_details_and_rejects_unverified_plan_algorithms(
+    tmp_path: Path,
+):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="processing evidence", model="test", source="test")
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="data_overview",
+        artifact={"layers": ["popu_smp", "road"]},
+        summary="数据已检查",
+    )
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="structured_query",
+        artifact={"task": "按 road 范围生成核密度栅格"},
+        summary="需求已结构化",
+    )
+    core = AgentCore(session_db=session_db, llm_provider=ToolCallingProvider(), iface=None)
+    registry = core._build_tool_registry(session.id)
+    details = registry.get("get_qgis_processing_tool")
+    stage = registry.get("record_pipeline_stage")
+
+    details.handler({"tool_id": "qgis:heatmapkerneldensityestimation"})
+    missing_detail = stage.handler(
+        {
+            "stage_name": "solution_plan",
+            "artifact": {
+                "operations": [
+                    {
+                        "algorithm": "qgis:heatmapkerneldensityestimation",
+                        "parameters": {"INPUT": "popu_smp", "RADIUS": 400},
+                    },
+                        {
+                            "algorithm": "gdal:cliprasterbyextent",
+                            "parameters": {"INPUT": "heatmap", "PROJWIN": "road"},
+                    },
+                ]
+            },
+        }
+    )
+
+    assert missing_detail["success"] is False
+    assert "尚未读取真实详情" in missing_detail["error"]
+    assert "gdal:cliprasterbyextent" in missing_detail["error"]
+
+    details.handler({"tool_id": "gdal:cliprasterbyextent"})
+    guessed_parameter = stage.handler(
+        {
+            "stage_name": "solution_plan",
+            "artifact": {
+                "operations": [
+                    {
+                        "algorithm": "qgis:heatmapkerneldensityestimation",
+                        "parameters": {
+                            "INPUT": "popu_smp",
+                            "RADIUS": 400,
+                            "EXTENT": "road",
+                        },
+                    },
+                        {
+                            "algorithm": "gdal:cliprasterbyextent",
+                            "parameters": {"INPUT": "heatmap", "PROJWIN": "road"},
+                    },
+                ]
+            },
+        }
+    )
+
+    assert guessed_parameter["success"] is False
+    assert "qgis:heatmapkerneldensityestimation" in guessed_parameter["error"]
+    assert "不存在的参数：EXTENT" in guessed_parameter["error"]
+    assert "Catalog 示例" in guessed_parameter["error"]
+
+    accepted = stage.handler(
+        {
+            "stage_name": "solution_plan",
+            "artifact": {
+                "operations": [
+                    {
+                        "algorithm": "qgis:heatmapkerneldensityestimation",
+                        "parameters": {"INPUT": "popu_smp", "RADIUS": 400},
+                    },
+                        {
+                            "algorithm": "gdal:cliprasterbyextent",
+                            "parameters": {"INPUT": "heatmap", "PROJWIN": "road"},
+                    },
+                ],
+                "algorithm_evidence": [
+                    "qgis:heatmapkerneldensityestimation",
+                    "gdal:cliprasterbyextent",
+                ],
+            },
+        }
+    )
+
+    assert accepted["success"] is True
+    envelope = json.loads(core._build_pipeline_stage_messages(session.id)[0].content)
+    persisted = envelope["processing_algorithm_evidence"]
+    assert set(persisted) == {
+        "qgis:heatmapkerneldensityestimation",
+        "gdal:cliprasterbyextent",
+    }
+    assert "PROJWIN" in persisted["gdal:cliprasterbyextent"]["parameter_names"]
+    assert "'PROJWIN': '0,10,0,10'" in persisted["gdal:cliprasterbyextent"]["code_example"]
+    assert "不得凭记忆改名" in envelope["processing_evidence_instruction"]
+
+
 def test_conversation_limit_is_applied_after_role_filtering(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="role filtered history", model="test", source="test")
@@ -2785,6 +3464,78 @@ def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
     assert tool_end_events[1]["payload"]["result"]["retry_count"] == 1
     final_message = next(event for event in reversed(confirmed_events) if event["type"] == "message")
     assert "自动修复并重试 1 次" in final_message["payload"]["content"]
+
+
+def test_confirmed_code_execution_does_not_rerun_identical_failed_code(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="duplicate retry",
+        model="duplicate-retry-code-test-model",
+        source="test",
+    )
+    provider = DuplicateRetryCodeExecutionProvider()
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        qgis_executor=lambda func: func(),
+        executor_config={
+            "execution_mode": "current_qgis",
+            "workspace_dir": str(tmp_path / "workspaces"),
+        },
+    )
+
+    events = core.run(session_id=session.id, user_message="生成 missing.txt")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    tool_end_events = [event for event in confirmed_events if event["type"] == "tool_end"]
+    assert len(tool_end_events) == 1
+    assert provider.calls == 2
+    final_message = next(
+        event for event in reversed(confirmed_events) if event["type"] == "message"
+    )
+    assert "相同代码和输出契约" in final_message["payload"]["content"]
+
+
+def test_confirmed_code_execution_stops_after_same_runtime_failure_twice(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="same runtime failure",
+        model="repeated-runtime-failure-test-model",
+        source="test",
+    )
+    provider = RepeatedRuntimeFailureProvider()
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        qgis_executor=lambda func: func(),
+        executor_config={
+            "execution_mode": "current_qgis",
+            "workspace_dir": str(tmp_path / "workspaces"),
+        },
+    )
+
+    events = core.run(session_id=session.id, user_message="生成 missing.txt")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    tool_end_events = [event for event in confirmed_events if event["type"] == "tool_end"]
+    assert len(tool_end_events) == 2
+    assert provider.calls == 2
+    final_message = next(
+        event for event in reversed(confirmed_events) if event["type"] == "message"
+    )
+    assert "相同的运行时失败已连续出现两次" in final_message["payload"]["content"]
 
 
 def test_prompt_builder_composes_pipeline_includes():
@@ -3081,7 +3832,7 @@ def test_pipeline_identifies_truncated_generated_code_arguments(tmp_path: Path):
     assert classification["retryable"] is True
 
 
-def test_generated_code_stage_rejects_unwritten_output(tmp_path: Path):
+def test_generated_code_stage_defers_output_existence_to_runtime(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="output gate", model="test", source="test")
     for stage_name in ("data_overview", "structured_query", "solution_plan"):
@@ -3111,9 +3862,45 @@ def test_generated_code_stage_rejects_unwritten_output(tmp_path: Path):
         }
     )
 
+    assert result["success"] is True
+    assert result["requested_tool_call"]["name"] == "execute_gis_code"
+    assert session_db.list_pipeline_stage_names(session.id)[-1] == "generated_code"
+
+
+def test_generated_code_stage_rejects_invalid_output_declaration(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="output declaration", model="test", source="test")
+    for stage_name in ("data_overview", "structured_query", "solution_plan"):
+        session_db.log_stage_artifact(
+            session.id,
+            stage_name=stage_name,
+            artifact={"summary": stage_name},
+            summary=stage_name,
+        )
+    tool = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )._build_tool_registry(session.id).get("record_pipeline_stage")
+
+    result = tool.handler(
+        {
+            "stage_name": "generated_code",
+            "artifact": {
+                "code": "print('done')",
+                "expected_outputs": [
+                    {"path": "result.tif", "name": "result", "type": "raster"},
+                    {"path": "result.tif", "name": "duplicate", "type": "unknown"},
+                ],
+                "review": {"passed": True},
+            },
+        }
+    )
+
     assert result["success"] is False
-    assert "没有写入" in result["error"]
-    assert session_db.list_pipeline_stage_names(session.id)[-1] == "solution_plan"
+    assert "expected_outputs 契约无效" in result["error"]
+    assert "重复路径" in result["error"]
+    assert "type 无效" in result["error"]
 
 
 def test_generated_code_stage_rejects_feature_count_on_processing_output(tmp_path: Path):

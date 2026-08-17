@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..processing.algorithm_evidence import record_processing_evidence
 from ..processing.toolbox_catalog import default_catalog
 from .registry import ToolEntry
 
 
-def build_qgis_toolbox_tools(**_: Any) -> list[ToolEntry]:
+def build_qgis_toolbox_tools(
+    *,
+    session_db: Any = None,
+    session_id: str = "",
+    **_: Any,
+) -> list[ToolEntry]:
     catalog = default_catalog()
 
     def search_domains(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -45,6 +51,7 @@ def build_qgis_toolbox_tools(**_: Any) -> list[ToolEntry]:
         missing = [item for item in tool_ids if catalog.get(item) is None]
         if not tools:
             return {"success": False, "error": f"找不到 QGIS Processing 工具：{', '.join(missing)}"}
+        record_processing_evidence(session_db, session_id, tools)
         result: dict[str, Any] = {"tools": tools}
         if len(tool_ids) == 1:
             result["tool"] = tools[0]

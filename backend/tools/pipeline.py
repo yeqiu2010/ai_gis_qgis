@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 from ...database.session_db import SessionDB
@@ -10,7 +12,17 @@ from ..json_recovery import (
     recover_json_object,
     unwrap_raw_arguments,
 )
-from .code_execution import find_generated_code_issues, find_unwritten_expected_outputs
+from ..processing.algorithm_evidence import (
+    clear_processing_evidence,
+    compact_processing_evidence,
+    processing_algorithm_ids,
+    processing_parameter_names,
+    read_processing_evidence,
+)
+from .code_execution import (
+    find_expected_output_contract_issues,
+    find_generated_code_issues,
+)
 from .registry import ToolEntry
 
 PIPELINE_STAGES = [
@@ -105,13 +117,40 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
                 "received_stage": stage_name,
                 "completed_stages": completed_stages,
             }
-        validation_error = _validate_stage_artifact(stage_name, artifact)
+        structured_query = _latest_stage_artifact(
+            session_db,
+            session_id,
+            "structured_query",
+        )
+        processing_evidence = read_processing_evidence(session_db, session_id)
+        solution_plan = _latest_stage_artifact(
+            session_db,
+            session_id,
+            "solution_plan",
+        )
+        validation_error = _validate_stage_artifact(
+            stage_name,
+            artifact,
+            structured_query=structured_query,
+            solution_plan=solution_plan,
+            processing_evidence=processing_evidence,
+        )
         if validation_error:
-            return {
+            response = {
                 "success": False,
                 "error": validation_error,
                 "expected_stage": expected_stage,
             }
+            relevant_ids = processing_algorithm_ids(artifact) | processing_algorithm_ids(
+                solution_plan
+            )
+            repair_evidence = compact_processing_evidence(
+                processing_evidence,
+                relevant_ids,
+            )
+            if repair_evidence:
+                response["processing_algorithm_evidence"] = repair_evidence
+            return response
         message_id = session_db.log_stage_artifact(
             session_id,
             stage_name=stage_name,
@@ -238,6 +277,7 @@ def start_pipeline_cycle(session_db: SessionDB, session_id: str) -> None:
         f"{session_id}:{PIPELINE_CYCLE_STATE_SUFFIX}",
         str(stage_count),
     )
+    clear_processing_evidence(session_db, session_id)
 
 
 def _current_pipeline_cycle(session_db: SessionDB, session_id: str) -> list[str]:
@@ -262,7 +302,42 @@ def _current_pipeline_cycle(session_db: SessionDB, session_id: str) -> list[str]
     return current_cycle
 
 
-def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str | None:
+def _validate_stage_artifact(
+    stage_name: str,
+    artifact: dict[str, Any],
+    *,
+    structured_query: dict[str, Any] | None = None,
+    solution_plan: dict[str, Any] | None = None,
+    processing_evidence: dict[str, dict[str, Any]] | None = None,
+) -> str | None:
+    if stage_name == "solution_plan" and processing_evidence is not None:
+        selected_ids = processing_algorithm_ids(artifact)
+        missing_ids = sorted(selected_ids.difference(processing_evidence))
+        if missing_ids:
+            return (
+                "solution_plan 使用了尚未读取真实详情的 Processing 算法："
+                + "、".join(missing_ids)
+                + "。必须先调用 get_qgis_processing_tool，并在同一次调用的 tool_ids 中读取这些算法；"
+                "不得凭搜索摘要或记忆填写参数。"
+            )
+        parameter_issue = _find_solution_parameter_issue(artifact, processing_evidence)
+        if parameter_issue:
+            return parameter_issue
+    if stage_name == "solution_plan" and not artifact.get("substitution_approved"):
+        selected_text = _selected_solution_text(artifact)
+        if re.search(
+            r"(?:使用|采用|改用).{0,80}(?:替代|代替|近似)|"
+            r"(?:替代|代替).{0,80}(?:分析|算法|工具)|"
+            r"\bsubstitut(?:e|ed|ion)\b|\bapproximate\b",
+            selected_text,
+            flags=re.IGNORECASE,
+        ):
+            return (
+                "solution_plan 选择了替代或近似算法，但没有用户批准证据。"
+                "必须保留用户要求的分析语义；若 Catalog 中没有等价工具，"
+                "请停止流程并询问用户是否接受替代。只有用户明确同意后才能设置 "
+                "substitution_approved=true。"
+            )
     if stage_name == "generated_code":
         if not str(artifact.get("code") or "").strip():
             return "generated_code 阶段缺少非空 code。"
@@ -273,6 +348,34 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
             return "generated_code 阶段缺少 review。"
         if review.get("passed") is not True:
             return "generated_code 的 review.passed 必须为 true；请修正代码后重新记录本阶段。"
+        if processing_evidence is not None:
+            code_ids = _processing_ids_from_code(str(artifact.get("code") or ""))
+            planned_ids = processing_algorithm_ids(solution_plan or {})
+            # Legacy stage artifacts may predate algorithm evidence entirely.
+            # Enforce the cross-stage contract whenever this Pipeline cycle has
+            # declared or retrieved Processing algorithms.
+            if planned_ids or processing_evidence:
+                unplanned_ids = sorted(code_ids.difference(planned_ids))
+                if unplanned_ids:
+                    return (
+                        "generated_code 使用了 solution_plan 未选择的 Processing 算法："
+                        + "、".join(unplanned_ids)
+                        + "。不得在代码阶段临时猜测辅助算法；只能使用方案中已读取详情并明确选择的算法。"
+                    )
+                missing_ids = sorted(code_ids.difference(processing_evidence))
+                if missing_ids:
+                    return (
+                        "generated_code 缺少以下 Processing 算法的权威参数证据："
+                        + "、".join(missing_ids)
+                        + "。请回到方案证据，先读取算法详情，不能继续猜参数。"
+                    )
+        declaration_issues = find_expected_output_contract_issues(
+            artifact.get("expected_outputs") or []
+        )
+        if declaration_issues:
+            return "generated_code 的 expected_outputs 契约无效：" + "；".join(
+                declaration_issues
+            )
         code_issues = find_generated_code_issues(str(artifact.get("code") or ""))
         if code_issues:
             return (
@@ -280,21 +383,138 @@ def _validate_stage_artifact(stage_name: str, artifact: dict[str, Any]) -> str |
                 + "；".join(code_issues)
                 + "。请修正代码后重新记录本阶段。"
             )
-        unwritten = find_unwritten_expected_outputs(
-            str(artifact.get("code") or ""),
-            artifact["expected_outputs"],
+        output_contract_error = _validate_expected_output_contract(
+            artifact.get("expected_outputs") or [],
+            structured_query or {},
         )
-        if unwritten:
-            return (
-                "generated_code 的代码没有写入以下 expected_outputs："
-                + "、".join(unwritten)
-                + "。仅打印到 stdout 不会创建输出文件。"
-            )
+        if output_contract_error:
+            return output_contract_error
     if stage_name == "execution_result" and not any(
         key in artifact for key in ("stdout", "stderr", "outputs", "error", "success")
     ):
         return "execution_result 必须包含真实执行结果：success、stdout、stderr、outputs 或 error。"
     return None
+
+
+def _processing_ids_from_code(code: str) -> set[str]:
+    return {
+        match.lower()
+        for match in re.findall(
+            r"processing\.run\(\s*['\"]([a-zA-Z][\w-]*:[a-zA-Z0-9_.-]+)['\"]",
+            code,
+        )
+    }
+
+
+def _find_solution_parameter_issue(
+    artifact: dict[str, Any],
+    evidence: dict[str, dict[str, Any]],
+) -> str | None:
+    raw_steps = artifact.get("steps") or artifact.get("operations") or []
+    if not isinstance(raw_steps, list):
+        return None
+    for step in raw_steps:
+        if not isinstance(step, dict) or not isinstance(step.get("parameters"), dict):
+            continue
+        step_ids = processing_algorithm_ids({"algorithm": step.get("algorithm")})
+        # Composite operations normally use nested parameter dictionaries. They
+        # are covered by the evidence gate and checked again against actual code.
+        if len(step_ids) != 1:
+            continue
+        tool_id = next(iter(step_ids))
+        detail = evidence.get(tool_id)
+        if not detail:
+            continue
+        allowed = processing_parameter_names(detail)
+        if len(allowed) < 4:
+            continue
+        unknown = sorted(set(map(str, step["parameters"])).difference(allowed))
+        if not unknown:
+            continue
+        example = " ".join(str(detail.get("code_example") or "").split())[:1200]
+        return (
+            f"solution_plan 为 {tool_id} 使用了 Catalog 中不存在的参数："
+            + "、".join(unknown)
+            + "。允许参数："
+            + "、".join(allowed)
+            + (f"。Catalog 示例：{example}" if example else "")
+        )
+    return None
+
+
+def _latest_stage_artifact(
+    session_db: SessionDB,
+    session_id: str,
+    stage_name: str,
+) -> dict[str, Any]:
+    for item in reversed(session_db.get_recent_stage_artifacts(session_id, limit=8)):
+        if item.get("stage_name") == stage_name:
+            artifact = item.get("stage_artifact")
+            return dict(artifact) if isinstance(artifact, dict) else {}
+    return {}
+
+
+def _selected_solution_text(artifact: dict[str, Any]) -> str:
+    selected = {
+        key: artifact.get(key)
+        for key in ("summary", "steps", "algorithms", "algorithm_evidence")
+        if artifact.get(key) is not None
+    }
+    return json.dumps(selected, ensure_ascii=False, default=str)
+
+
+def _validate_expected_output_contract(
+    generated_outputs: list[Any],
+    structured_query: dict[str, Any],
+) -> str | None:
+    required_outputs = _find_expected_output_specs(structured_query)
+    if not required_outputs:
+        return None
+    required_names = _output_contract_names(required_outputs)
+    generated_names = _output_contract_names(generated_outputs)
+    missing = sorted(required_names.difference(generated_names))
+    if not missing:
+        return None
+    return (
+        "generated_code 改写或遗漏了结构化需求中的最终输出名称："
+        + "、".join(missing)
+        + "。代码文件名、图层名和 expected_outputs 必须逐字保留用户指定的名称及数字后缀。"
+    )
+
+
+def _find_expected_output_specs(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        direct = value.get("expected_outputs")
+        if isinstance(direct, list) and direct:
+            return direct
+        for child in value.values():
+            found = _find_expected_output_specs(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_expected_output_specs(child)
+            if found:
+                return found
+    return []
+
+
+def _output_contract_names(outputs: list[Any]) -> set[str]:
+    names: set[str] = set()
+    for output in outputs:
+        if isinstance(output, dict):
+            candidates = (output.get("name"), output.get("path"))
+        else:
+            candidates = (output,)
+        for candidate in candidates:
+            value = str(candidate or "").strip().replace("\\", "/")
+            if not value:
+                continue
+            filename = value.rsplit("/", 1)[-1]
+            names.add(filename.casefold())
+            if "." in filename:
+                names.add(filename.rsplit(".", 1)[0].casefold())
+    return names
 
 
 def _sync_pipeline_task_state(

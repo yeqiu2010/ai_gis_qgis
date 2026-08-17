@@ -31,6 +31,7 @@ metadata:
 - 用户要求生成的最终文件，例如 `500m.shp`、`result.gpkg`、`parks.geojson`，必须写入 `expected_outputs`；不要省略 `expected_outputs`，也不要只把文件名写在代码里。
 - 用户只说“导出/生成结果”但没有给文件名时，不要询问保存目录；使用合理默认文件名并写入 `expected_outputs`，例如 `park_parcels.geojson`。
 - 输出路径用 `Path(QGIS_AGENT_WORKSPACE) / "文件名"` 构造，不要写绝对路径到工作目录外。
+- `expected_outputs` 中的 vector/raster 文件会由 `execute_gis_code` 验证并自动加载到 QGIS，生成代码不要再用 `QgsRasterLayer`/`QgsVectorLayer` 和 `QgsProject.addMapLayer()` 手动加载同一最终文件，否则会产生重复图层。只有不生成文件、且用户明确要求创建工程内存图层或样式副本时才自行添加图层。
 - 如果用户明确要求导出到外部目录，例如 `E:\Desktop\test`，代码仍然只能写入 `QGIS_AGENT_WORKSPACE`；在 `execute_gis_code` 参数中增加 `delivery_outputs`，把工作目录内输出复制到用户目录。
 - 外部导出示例：代码输出 `qn_500_area_8000.geojson`，`expected_outputs=[{"path":"qn_500_area_8000.geojson","name":"qn_500_area_8000","type":"vector"}]`，`delivery_outputs=[{"source_path":"qn_500_area_8000.geojson","target_path":"E:\\Desktop\\test\\qn_500_area_8000.geojson"}]`。
 - 可以直接使用当前命名空间中的常用对象：`QgsProject`、`QgsVectorLayer`、`QgsFeature`、`QgsFeatureRequest`、`QgsGeometry`、`QgsVectorFileWriter`、`QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback`、`processing`、`iface`、`Path`。
@@ -41,6 +42,7 @@ metadata:
 - 记录 `generated_code` artifact：`code`、`expected_outputs`、`dependencies`、`assumptions`、`summary`、`review`。
 - 代码中的每个 `processing.run` 必须来自 `solution_plan.algorithm_evidence`，
   参数名必须依据 `get_qgis_processing_tool` 返回的真实参数，不得凭记忆猜测。
+- 阶段上下文中的 `processing_algorithm_evidence` 是服务端跨上下文压缩保留的本轮权威详情，包含允许参数和 Catalog 示例。生成代码必须直接依据它；不得把搜索摘要、旧会话知识或代码注释中的说法当成参数证据。
 - 多步骤任务生成一份完整脚本；中间结果在脚本内显式衔接，整个任务只调用一次
   `execute_gis_code`。
 - 任一输入超过 10 万要素时，不得生成对两个图层执行 `getFeatures()` 的嵌套循环。
@@ -49,7 +51,10 @@ metadata:
 - 大数据任务的缓冲筛选默认溶解缓冲区，最终结果优先输出 GeoPackage。
 - 耗时 Processing 调用必须保留或传入 `QgsProcessingFeedback`，以支持进度、取消和界面事件刷新。
 - 每个用户任务只生成一次面向最终结果的 `execute_gis_code` 调用。不得先生成“打印唯一值”的诊断脚本，不得为 stdout 虚构 `.txt` 输出；字段和值已由用户指定时直接生成最终筛选结果。
+- `inspect_layer`/`inspect_layers` 返回的 `layer_id` 只是 QGIS 工程索引键，不能作为字符串直接传给 `processing.run` 的 `INPUT`、`OVERLAY`、`JOIN`、`MASK` 等图层参数。必须先执行 `layer = QgsProject.instance().mapLayer(layer_id)`，随后用 `if layer is None: raise ValueError(...)` 检查，再把真实 `QgsMapLayer` 对象传给 Processing。所有按 ID 获取的输入和范围图层都必须分别检查。
 - 不得使用 `mapLayersByName(...)[0]`；先保存 `matches` 并检查非空，再取 `matches[0]`。
+- 用户指定的每个最终输出名称必须逐字保留，并在代码变量、实际文件名、加载图层名和 `expected_outputs.name/path` 中一致；不得自行修改数字后缀，例如不能把 `pdst_250` 写成 `pdst_255`。
+- 不得用“相似算法”“不同核函数”或自编近似计算静默替代用户明确要求的算法。若 Catalog 中没有语义等价的工具，必须停在方案阶段说明缺口并请求用户确认替代方案；只有结构化需求中记录了用户已批准替代，代码阶段才能实现。
 - `processing.run` 的 `OUTPUT` 返回类型取决于输出目标：`"memory:"`、`"TEMPORARY_OUTPUT"` 或 `QgsProcessing.TEMPORARY_OUTPUT` 通常直接返回图层对象，可以调用 `featureCount()`，不得再用 `QgsVectorLayer(..., "memory")` 包装；写入 `.gpkg`、`.shp`、`.geojson` 等文件路径时通常返回路径字符串，不能直接调用 `featureCount()`。文件结果需要计数时用 `QgsVectorLayer(result["OUTPUT"], "result", "ogr")` 验证有效后计数，或省略非必要计数。
 - `generated_code` artifact 必须一次性提交完整 JSON。为避免工具参数超过输出预算，代码只保留必要的校验、处理和结果摘要，省略逐步骤 banner、字段列表调试打印及重复注释；不要续写被截断的代码片段。
 - `QgsProcessingFeedback` 从 `qgis.core` 导入，不得写成 `processing.QgsProcessingFeedback()`。
@@ -60,6 +65,7 @@ metadata:
 - `native:aggregate` 的 `AGGREGATES` 必须是聚合定义 object 列表，不得传单个 object 或 JSON 字符串。`GROUP_BY` 只控制分组，不会自动成为输出字段；如果下游需要按分组键连接、排序或写表，必须在 `AGGREGATES` 中对分组字段增加 `first_value` 输出并使用明确别名，优先使用 ASCII 内部名，例如 `land_type`。下游 `FIELD`/`FIELD_2` 必须引用该真实输出别名，不能继续引用源字段名。`native:joinattributesbylocation` 的连接图层参数是 `JOIN`，不得混用其他算法的 `OVERLAY`。
 - `QgsGeometry` 空几何判断使用 `isEmpty()`，不得调用不存在的 `isGeosEmpty()`。分析流程的无效几何仍交给 `GeometrySkipInvalid` 排除。
 - 空间连接、聚合等中间结果可能改名或丢弃字段。后续引用前必须检查实际 `result_layer.fields()`；不得假定 `SHAPE_Area` 等源字段一定存在。如果统计目标来自土地图层，应优先在原土地图层上聚合，不要反向依赖连接后的建筑物字段。
+- 用户要求按平方米筛选面/地块的“面积”而没有明确指定属性字段时，面积指投影后几何面积：先统一到合适的米制 CRS，再用 `$area` 计算新的 Double 字段。不得因为存在名为 `land_area`、`area` 等 String 字段就直接 `to_real(...)`；只有 `inspect_layer` 样例已证明该字段非空、可转数值且单位符合需求，并且用户明确要求使用该属性时才可使用。对筛选、相交等预期应命中要素的步骤，必须输出并检查 `featureCount()`；中间或最终结果为 0 时应抛出包含步骤名的明确错误，不能把空文件报告为成功。
 - 用户明确指定“面积”等字段作为覆盖率分母时，必须检查该字段存在、值可转为数值且处理空值，并按用户定义汇总；不得悄悄改用 `geometry().area()`。若重叠面积来自投影后几何，必须确认它和面积字段单位一致；单位不明时应在 `structured_query` 阶段澄清，或在方案中明确改为对分子、分母使用同一投影几何口径。
 - 不得使用 `??_1` 等乱码或占位字段名。中间输出需自建字段时优先使用 ASCII 内部名，最终 CSV 表头再映射为中文。
 - 新增或覆盖派生字段时，必须按业务语义显式定义字段类型。密度、覆盖率、比例、均值、面积、长度、高度和金额等带小数的结果必须是数值型 Double；不得定义成 `QVariant.String`、`native:aggregate`/`native:refactorfields` 字段映射中的文本类型 `type: 10`，也不得选择 Processing 算法详情标记为 Text/String 的字段枚举或先 `str(value)` 再写入。字段的 `length`/`precision` 是数值存储元数据，不能用字符串长度代替数值类型；一般比值可使用长度 20、精度 10，最终仍以输出格式和本次算法证据为准。
@@ -329,11 +335,13 @@ processing.run(
 ## 生成代码前自检
 
 - 是否找到了图层？找不到时抛出清晰 `ValueError`。
+- 是否已把每个 QGIS `layer_id` 解析为 `QgsMapLayer` 对象、检查不是 `None`，并将对象而不是 ID 字符串传入 Processing？
 - 是否检查字段存在？字段不存在时不要静默输出空结果。
 - 是否把输出写进 `QGIS_AGENT_WORKSPACE`？
 - `expected_outputs.path` 是否和代码里的文件名一致？
 - 用户要求外部目录时，是否使用 `delivery_outputs` 而不是让代码直接写外部路径？
 - 是否包含用户要求的最终输出文件，例如 `500m.shp`？
+- 用户指定的输出名称和数字后缀是否逐字一致，且没有用近似算法替代原操作？
 - 输出类型是否是 `vector`、`raster`、`table` 或 `file`？
 - 是否避免了 `QgsApplication`、`subprocess`、`eval`、`exec`、删除文件？
 - `PREDICATE`、`JOIN_FIELDS`、`AGGREGATES` 的数值类型是否与算法详情完全一致？

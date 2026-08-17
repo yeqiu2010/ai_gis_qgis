@@ -59,12 +59,14 @@ class ExpectedOutput:
     path: Path
     name: str
     type: str
+    required: bool = True
 
-    def as_payload(self) -> dict[str, str]:
+    def as_payload(self) -> dict[str, Any]:
         return {
             "path": str(self.path),
             "name": self.name,
             "type": self.type,
+            "required": self.required,
         }
 
 
@@ -93,16 +95,30 @@ class SandboxPolicy:
 
     def normalize_expected_outputs(self, values: list[dict[str, Any]]) -> list[ExpectedOutput]:
         outputs = []
+        seen_paths: set[Path] = set()
         for index, raw in enumerate(values, start=1):
             raw_path = str(raw.get("path") or "").strip()
             if not raw_path:
                 raise ValueError(f"第 {index} 个 expected_outputs 缺少 path。")
             output_path = self._resolve_output_path(raw_path)
+            if output_path in seen_paths:
+                raise ValueError(f"expected_outputs 包含重复路径：{raw_path}")
+            seen_paths.add(output_path)
             output_type = str(raw.get("type") or "vector").strip().lower()
             if output_type not in {"vector", "raster", "table", "file"}:
                 raise ValueError(f"不支持的输出类型：{output_type}")
             name = str(raw.get("name") or output_path.stem).strip() or output_path.stem
-            outputs.append(ExpectedOutput(path=output_path, name=name, type=output_type))
+            required = raw.get("required", True)
+            if not isinstance(required, bool):
+                raise ValueError(f"第 {index} 个 expected_outputs 的 required 必须是 boolean。")
+            outputs.append(
+                ExpectedOutput(
+                    path=output_path,
+                    name=name,
+                    type=output_type,
+                    required=required,
+                )
+            )
         return outputs
 
     def _resolve_output_path(self, raw_path: str) -> Path:

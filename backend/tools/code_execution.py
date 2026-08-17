@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import ast
+import re
 import shutil
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from ...database.session_db import SessionDB
 from ..executor.qgis_executor import QGISCodeExecutor
+from ..failure_analysis import classify_failure
+from ..processing.algorithm_evidence import processing_parameter_names
+from ..processing.toolbox_catalog import default_catalog
 from .layer_ops import _infer_layer_type, _layer_summary, _qgis_classes, _run_qgis, _snapshot
 from .registry import ToolEntry
 
@@ -24,7 +28,6 @@ FILE_OUTPUT_EXTENSIONS = {
     ".png",
     ".qml",
 }
-OUTPUT_HINTS = ("output", "result", "save", "export", "write", "输出", "结果")
 SHAPEFILE_SIDECAR_EXTENSIONS = {
     ".shp",
     ".shx",
@@ -36,6 +39,10 @@ SHAPEFILE_SIDECAR_EXTENSIONS = {
     ".sbx",
     ".fix",
 }
+QGIS_LAYER_ID_PATTERN = re.compile(
+    r"(?:^|[_-])[0-9a-f]{8}(?:[_-][0-9a-f]{4}){3}[_-][0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def build_execute_gis_code_tool(
@@ -50,10 +57,6 @@ def build_execute_gis_code_tool(
         code = str(arguments.get("code") or "")
         expected_outputs = arguments.get("expected_outputs") or []
         delivery_outputs = arguments.get("delivery_outputs") or []
-        expected_outputs_inferred = False
-        if not expected_outputs:
-            expected_outputs = infer_expected_outputs_from_code(code)
-            expected_outputs_inferred = bool(expected_outputs)
         expected_outputs, delivery_outputs = _prepare_delivery_outputs(
             expected_outputs,
             delivery_outputs,
@@ -113,15 +116,23 @@ def build_execute_gis_code_tool(
         if not success and not error and result.get("stderr"):
             error = str(result["stderr"]).strip().splitlines()[-1]
 
+        classification: dict[str, object] = {}
+        if not success:
+            classification = classify_failure(
+                str(error or result.get("stderr") or ""),
+                preflight_failed=bool(result.get("preflight_failed")),
+            )
         final_result = {
             **result,
             "success": success,
             "error": error,
+            "error_code": result.get("error_code") or classification.get("error_code"),
+            "cause": classification.get("cause"),
             "loaded_layers": loaded_layers,
             "load_errors": load_errors,
             "delivered_outputs": delivered_outputs,
             "delivery_errors": delivery_errors,
-            "expected_outputs_inferred": expected_outputs_inferred,
+            "expected_outputs_inferred": False,
         }
         if session_db is not None:
             session_db.log_code_execution(
@@ -178,6 +189,10 @@ def build_execute_gis_code_tool(
                                 "enum": ["vector", "raster", "table", "file"],
                                 "description": "输出类型。vector/raster 会自动加载到 QGIS。",
                             },
+                            "required": {
+                                "type": "boolean",
+                                "description": "是否为任务成功所必需，默认 true。",
+                            },
                         },
                         "required": ["path", "name", "type"],
                         "additionalProperties": False,
@@ -217,119 +232,15 @@ def build_execute_gis_code_tool(
     )
 
 
-def infer_expected_outputs_from_code(code: str) -> list[dict[str, str]]:
-    """Infer expected outputs from obvious generated-code output path literals."""
-    if not code.strip():
-        return []
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []
-
-    lines = code.splitlines()
-    outputs: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-            continue
-        path = _candidate_output_path(node.value)
-        if not path:
-            continue
-        line = lines[node.lineno - 1].lower() if getattr(node, "lineno", 0) else ""
-        if not any(hint in line for hint in OUTPUT_HINTS):
-            continue
-        if path in seen:
-            continue
-        seen.add(path)
-        output_path = Path(path)
-        outputs.append(
-            {
-                "path": path,
-                "name": output_path.stem,
-                "type": _infer_expected_output_type(output_path.suffix.lower()),
-            }
-        )
-    return outputs
-
-
-def find_unwritten_expected_outputs(
-    code: str,
-    expected_outputs: list[dict[str, Any]],
-) -> list[str]:
-    """Return declared outputs that are not connected to an obvious write sink."""
-    if not code.strip() or not expected_outputs:
-        return []
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []  # Compilation reports the more useful syntax error later.
-
-    assignments: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            values = _path_names_from_expression(node.value, assignments)
-            for target in node.targets:
-                if isinstance(target, ast.Name) and values:
-                    assignments[target.id] = values
-
-    written: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func_name = _call_name(node.func)
-        if func_name == "open" and node.args:
-            mode = _literal_string(node.args[1]) if len(node.args) > 1 else "r"
-            if any(flag in (mode or "") for flag in "wax+"):
-                written.update(_path_names_from_expression(node.args[0], assignments))
-        elif func_name.endswith((".write_text", ".write_bytes")) and isinstance(
-            node.func, ast.Attribute
-        ):
-            written.update(_path_names_from_expression(node.func.value, assignments))
-        elif func_name.endswith("processing.run") or func_name == "processing.run":
-            if len(node.args) >= 2 and isinstance(node.args[1], ast.Dict):
-                for key, value in zip(node.args[1].keys, node.args[1].values, strict=True):
-                    if _literal_string(key) in {"OUTPUT", "OUTPUT_LAYER", "OUTPUT_TABLE"}:
-                        written.update(_path_names_from_expression(value, assignments))
-        elif func_name.endswith(("writeAsVectorFormatV3", "writeAsVectorFormatV2")):
-            if len(node.args) >= 2:
-                written.update(_path_names_from_expression(node.args[1], assignments))
-        elif func_name.endswith(("exportToImage", "exportToPdf")) and node.args:
-            written.update(_path_names_from_expression(node.args[0], assignments))
-        elif func_name.endswith(("saveNamedStyle", "saveSldStyle")):
-            # QgsMapLayer persists QGIS styles through these APIs rather than
-            # Python's open()/Path.write_* sinks.  Treat the URI argument as a
-            # file write so declared .qml outputs pass the static contract;
-            # the executor still verifies that the file actually exists.
-            output_arg = _call_argument(
-                node,
-                position=0,
-                keyword_names={"uri", "path", "fileName", "filename"},
-            )
-            if output_arg is not None:
-                written.update(_path_names_from_expression(output_arg, assignments))
-
-    missing = []
-    for output in expected_outputs:
-        filename = _output_filename(str(output.get("path") or ""))
-        if filename and filename not in written:
-            missing.append(filename)
-    return missing
-
-
 def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, Any] | None:
     """Validate the code/output contract before asking for execution approval."""
     code = str(arguments.get("code") or "")
     expected_outputs = arguments.get("expected_outputs") or []
     if not isinstance(expected_outputs, list):
         return None
-    unwritten_outputs = find_unwritten_expected_outputs(code, expected_outputs)
     uncreated_inputs = find_uncreated_workspace_inputs(code)
     issues = find_generated_code_issues(code)
-    if unwritten_outputs:
-        issues.insert(
-            0,
-            "以下文件已声明但代码没有写入：" + "、".join(unwritten_outputs),
-        )
+    issues[:0] = find_expected_output_contract_issues(expected_outputs)
     if uncreated_inputs:
         issues.insert(
             0,
@@ -356,6 +267,35 @@ def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, 
     }
 
 
+def find_expected_output_contract_issues(
+    expected_outputs: list[Any],
+) -> list[str]:
+    """Validate declarations without guessing how generated code writes files."""
+    issues: list[str] = []
+    seen_paths: set[str] = set()
+    for index, output in enumerate(expected_outputs, start=1):
+        if not isinstance(output, dict):
+            issues.append(f"第 {index} 个 expected_outputs 必须是 object")
+            continue
+        raw_path = str(output.get("path") or "").strip()
+        if not raw_path:
+            issues.append(f"第 {index} 个 expected_outputs 缺少 path")
+        else:
+            normalized_path = raw_path.replace("\\", "/").casefold()
+            if normalized_path in seen_paths:
+                issues.append(f"expected_outputs 包含重复路径：{raw_path}")
+            seen_paths.add(normalized_path)
+        if not str(output.get("name") or "").strip():
+            issues.append(f"第 {index} 个 expected_outputs 缺少 name")
+        output_type = str(output.get("type") or "").strip().lower()
+        if output_type not in {"vector", "raster", "table", "file"}:
+            issues.append(f"第 {index} 个 expected_outputs 的 type 无效：{output_type or '空'}")
+        required = output.get("required", True)
+        if not isinstance(required, bool):
+            issues.append(f"第 {index} 个 expected_outputs 的 required 必须是 boolean")
+    return issues
+
+
 def find_generated_code_issues(code: str) -> list[str]:
     """Detect recurrent PyQGIS mistakes observed in execution failure logs."""
     try:
@@ -380,6 +320,15 @@ def find_generated_code_issues(code: str) -> list[str]:
             if module in {"PyQt5", "PyQt6"} or module.startswith(("PyQt5.", "PyQt6.")):
                 _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
     assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    literal_string_assignments = _assigned_literal_strings(assignments)
+    map_layer_assignments = _assigned_map_layer_names(assignments)
+    guarded_layer_names = _null_guarded_names(tree)
+    for layer_name in sorted(map_layer_assignments.difference(guarded_layer_names)):
+        _append_issue(
+            issues,
+            f"QgsProject.mapLayer() 返回值 {layer_name} 未检查是否为 None；"
+            "必须在访问 extent、fields 或传入 Processing 前显式检查",
+        )
     color_ramp_shader_names = _assigned_constructor_names(
         assignments,
         "QgsColorRampShader",
@@ -483,17 +432,10 @@ def find_generated_code_issues(code: str) -> list[str]:
                     "processing.run 的文件 OUTPUT 是路径字符串，不能直接调用 featureCount；需加载 QgsVectorLayer 或省略计数",
                 )
             if _call_name(node.func) == "processing.run":
-                _check_processing_call(node, issues)
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call):
-            if (
-                isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "mapLayersByName"
-                and isinstance(node.slice, ast.Constant)
-                and node.slice.value == 0
-            ):
-                _append_issue(
+                _check_processing_call(
+                    node,
                     issues,
-                    "mapLayersByName(...)[0] 缺少空列表检查；必须先检查 matches",
+                    literal_string_assignments=literal_string_assignments,
                 )
         if isinstance(node, ast.Subscript):
             field_key = _subscript_string_key(node)
@@ -664,7 +606,12 @@ def _processing_call_writes_file(node: ast.AST) -> bool:
     return True
 
 
-def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
+def _check_processing_call(
+    node: ast.Call,
+    issues: list[str],
+    *,
+    literal_string_assignments: dict[str, str] | None = None,
+) -> None:
     """Validate parameter shapes that Processing otherwise rejects at runtime."""
     if len(node.args) < 2:
         return
@@ -672,6 +619,67 @@ def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
     parameters = _literal_dict_items(node.args[1])
     if not parameters:
         return
+
+    literal_string_assignments = literal_string_assignments or {}
+    tool_spec = default_catalog().get(algorithm_id) if algorithm_id else None
+    if tool_spec is not None:
+        catalog_parameters = set(processing_parameter_names(tool_spec.detail()))
+        unknown_parameters = set(parameters).difference(catalog_parameters)
+        if (
+            algorithm_id == "qgis:heatmapkerneldensityestimation"
+            and "OUTPUT_VALUES" in unknown_parameters
+        ):
+            _append_issue(
+                issues,
+                "qgis:heatmapkerneldensityestimation 的参数名是单数 OUTPUT_VALUE，"
+                "不是 OUTPUT_VALUES；请将键改为 OUTPUT_VALUE",
+            )
+            unknown_parameters.remove("OUTPUT_VALUES")
+        # Some legacy catalog entries are visibly partial (for example an
+        # overlay algorithm without its overlay input). Do not turn incomplete
+        # documentation into a false runtime blocker. Rich parameter records
+        # remain suitable for deterministic validation.
+        if len(catalog_parameters) >= 4 and unknown_parameters:
+            allowed = ", ".join(sorted(catalog_parameters))
+            example = " ".join(str(tool_spec.code_example or "").split())[:1600]
+            _append_issue(
+                issues,
+                f"Processing 算法 {algorithm_id} 的参数不在 Catalog 证据中："
+                + ", ".join(sorted(unknown_parameters))
+                + f"；允许参数：{allowed}"
+                + (f"；Catalog 代码示例：{example}" if example else "")
+                + "；必须严格按该证据修正，不能继续猜测参数名",
+            )
+    if algorithm_id == "gdal:cliprasterbyextent" and "PROJWIN" not in parameters:
+        _append_issue(
+            issues,
+            "Processing 算法 gdal:cliprasterbyextent 缺少必填参数 PROJWIN；"
+            "PROJWIN 是该算法公开的 Processing 裁剪范围参数名，不是仅供 GDAL 内部使用的名称；"
+            "可直接传范围图层、QgsRectangle，或 xmin,xmax,ymin,ymax 字符串",
+        )
+    for parameter_name, value in parameters.items():
+        if not _is_processing_layer_parameter(parameter_name):
+            continue
+        for layer_value in _iter_layer_parameter_values(value):
+            if isinstance(layer_value, ast.Call) and _call_name(
+                layer_value.func
+            ).endswith("mapLayer"):
+                _append_issue(
+                    issues,
+                    f"Processing {parameter_name} 不能直接调用 mapLayer(...)；"
+                    "必须先赋给变量、检查结果不是 None，再传入 QgsMapLayer 对象",
+                )
+                continue
+            literal = _resolved_literal_string(
+                layer_value,
+                literal_string_assignments,
+            )
+            if literal and QGIS_LAYER_ID_PATTERN.search(literal):
+                _append_issue(
+                    issues,
+                    f"Processing {parameter_name} 不能直接传 QGIS 图层 ID 字符串 {literal}；"
+                    "必须使用 QgsProject.instance().mapLayer(layer_id) 解析为图层对象并检查不是 None",
+                )
 
     predicate = parameters.get("PREDICATE")
     if isinstance(predicate, (ast.List, ast.Tuple)) and any(
@@ -747,12 +755,123 @@ def _check_processing_call(node: ast.Call, issues: list[str]) -> None:
                 "密度或除法结果必须使用算法详情中的 Decimal/Double 类型（当前算法通常为 FIELD_TYPE=0），"
                 "不能靠增大 FIELD_LENGTH 修复",
             )
+        if (
+            "area" in field_name
+            and re.fullmatch(
+                r"\s*to_(?:real|float)\(\s*['\"]land_area['\"]\s*\)\s*",
+                formula,
+                flags=re.IGNORECASE,
+            )
+        ):
+            _append_issue(
+                issues,
+                "地块几何面积不能直接由可能为空、单位不明的 String 字段 land_area 转换；"
+                "用户要求按平方米筛选地块面积时，应先统一到米制投影，再用 $area 计算 Double 字段。"
+                "只有用户明确指定 land_area 且 inspect_layer 已确认其非空数值和单位时才能转换该属性",
+            )
 
     if algorithm_id == "native:joinattributesbylocation" and "OVERLAY" in parameters:
         _append_issue(
             issues,
             "native:joinattributesbylocation 的连接图层参数名是 JOIN，不是 OVERLAY；调用前应以 inspect_processing_algorithm 返回的参数为准",
         )
+
+
+def _assigned_literal_strings(assignments: list[ast.Assign]) -> dict[str, str]:
+    candidates: dict[str, list[ast.AST]] = {}
+    for assignment in assignments:
+        for target in assignment.targets:
+            if isinstance(target, ast.Name):
+                candidates.setdefault(target.id, []).append(assignment.value)
+
+    values: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, candidate_values in candidates.items():
+            # Reassigned variables are intentionally treated as dynamic. This
+            # avoids both false certainty and oscillation between literals.
+            if name in values or len(candidate_values) != 1:
+                continue
+            value = _resolved_literal_string(candidate_values[0], values)
+            if value is None:
+                continue
+            values[name] = value
+            changed = True
+    return values
+
+
+def _resolved_literal_string(
+    node: ast.AST,
+    assignments: dict[str, str],
+) -> str | None:
+    literal = _literal_string(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Name):
+        return assignments.get(node.id)
+    return None
+
+
+def _assigned_map_layer_names(assignments: list[ast.Assign]) -> set[str]:
+    names: set[str] = set()
+    for assignment in assignments:
+        if not isinstance(assignment.value, ast.Call):
+            continue
+        if not _call_name(assignment.value.func).endswith("mapLayer"):
+            continue
+        names.update(
+            target.id for target in assignment.targets if isinstance(target, ast.Name)
+        )
+    return names
+
+
+def _null_guarded_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.Assert)):
+            names.update(_null_guard_names_from_test(node.test))
+    return names
+
+
+def _null_guard_names_from_test(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return {node.operand.id} if isinstance(node.operand, ast.Name) else set()
+    if isinstance(node, ast.BoolOp):
+        return {
+            name
+            for value in node.values
+            for name in _null_guard_names_from_test(value)
+        }
+    if not isinstance(node, ast.Compare):
+        return set()
+    operands = [node.left, *node.comparators]
+    if not any(isinstance(value, ast.Constant) and value.value is None for value in operands):
+        return set()
+    return {value.id for value in operands if isinstance(value, ast.Name)}
+
+
+def _is_processing_layer_parameter(name: str) -> bool:
+    normalized = str(name or "").upper()
+    return (
+        normalized == "INPUT"
+        or normalized.startswith("INPUT_")
+        or normalized
+        in {
+            "INTERSECT",
+            "JOIN",
+            "LAYERS",
+            "MASK",
+            "OVERLAY",
+            "REFERENCE_LAYER",
+        }
+    )
+
+
+def _iter_layer_parameter_values(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return list(node.elts)
+    return [node]
 
 
 def _literal_dict_items(node: ast.AST) -> dict[str, ast.AST]:
@@ -874,23 +993,6 @@ def _check_raster_shader_call(
 def _append_issue(issues: list[str], issue: str) -> None:
     if issue not in issues:
         issues.append(issue)
-
-
-def _path_names_from_expression(
-    node: ast.AST,
-    assignments: dict[str, set[str]],
-) -> set[str]:
-    if isinstance(node, ast.Name):
-        return assignments.get(node.id, set())
-    names = set()
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name):
-            names.update(assignments.get(child.id, set()))
-        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
-            candidate = _candidate_output_path(child.value)
-            if candidate:
-                names.add(_output_filename(candidate))
-    return names
 
 
 def _call_name(node: ast.AST) -> str:
@@ -1047,16 +1149,6 @@ def _candidate_output_path(value: str) -> str | None:
     return value.replace("\\", "/")
 
 
-def _infer_expected_output_type(suffix: str) -> str:
-    if suffix in VECTOR_OUTPUT_EXTENSIONS:
-        return "vector"
-    if suffix in RASTER_OUTPUT_EXTENSIONS:
-        return "raster"
-    if suffix in TABLE_OUTPUT_EXTENSIONS:
-        return "table"
-    return "file"
-
-
 def _load_output_layers(
     outputs: list[dict[str, Any]],
     *,
@@ -1065,7 +1157,10 @@ def _load_output_layers(
     qgis_executor=None,
 ) -> list[dict[str, Any]]:
     loadable_outputs = [
-        output for output in outputs if str(output.get("type") or "").lower() in {"vector", "raster"}
+        output
+        for output in outputs
+        if output.get("verified")
+        and str(output.get("type") or "").lower() in {"vector", "raster"}
     ]
     if not loadable_outputs:
         return []

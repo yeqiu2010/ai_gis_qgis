@@ -142,8 +142,20 @@ class RPCController:
             active = active_run_id is not None
             if active_run_id is not None:
                 self._cancelled_runs.add(active_run_id)
+        self._cancel_active_task(session_id)
         self._emit(agent_event("complete", {"cancelled": True}, session_id=session_id))
         return {"accepted": True, "session_id": session_id, "active": active, "cancelled": True}
+
+    def _cancel_active_task(self, session_id: str) -> None:
+        """Persist user cancellation so a later message cannot resume the plan."""
+        task = self.session_db.get_active_task(session_id)
+        if task is None:
+            return
+        self.session_db.update_task(
+            str(task["id"]),
+            status="cancelled",
+            summary="用户停止了该任务。",
+        )
 
     def get_settings(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._redact_settings(self.config)
@@ -187,12 +199,16 @@ class RPCController:
 
     def _run_chat(self, session_id: str, message: str, qgis_context: QGISContext) -> None:
         controller_run_id = str(uuid.uuid4())
+        superseded_previous_run = False
         with self._run_lock:
             previous_run_id = self._active_runs.get(session_id)
             if previous_run_id is not None:
                 self._cancelled_runs.add(previous_run_id)
+                superseded_previous_run = True
             self._active_runs[session_id] = controller_run_id
             self._cancelled_runs.discard(controller_run_id)
+        if superseded_previous_run:
+            self._cancel_active_task(session_id)
 
         def emit_current_run(event: dict[str, Any]) -> None:
             self._emit_for_run(event, session_id, controller_run_id)

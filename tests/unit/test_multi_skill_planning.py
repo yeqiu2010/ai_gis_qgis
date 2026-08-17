@@ -303,7 +303,7 @@ metadata:
                     "artifact_type": "result_layer",
                     "name": "coverage",
                     "payload": {"layer_id": "layer-id"},
-                    "verified": True,
+                    "verified": False,
                 }
             ],
         },
@@ -314,11 +314,61 @@ metadata:
     )
     assert report_done["success"] is True
 
+    unverified, _ = registry.execute("finalize_task", {"summary": "done"})
+    assert unverified["success"] is False
+    assert any("已验证" in error for error in unverified["completion_errors"])
+
+    registered, _ = registry.execute(
+        "register_artifact",
+        {
+            "artifact_type": "result_layer",
+            "name": "coverage_verified",
+            "payload": {"layer_id": "layer-id"},
+            "verified": True,
+        },
+    )
+    assert registered["success"] is True
+
     finalized, _ = registry.execute("finalize_task", {"summary": "done"})
     assert finalized["success"] is True
     task = session_db.get_active_task(session.id)
     assert task is not None
     assert task["status"] == "completed"
+
+
+def test_cancelled_plan_cannot_be_revised_or_resumed(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="cancelled plan")
+    manager = SkillManager(tmp_path / "skills")
+    registry = ToolRegistry()
+    for entry in build_task_planning_tools(session_db, session.id, manager):
+        registry.register(entry)
+
+    created, _ = registry.execute(
+        "create_plan",
+        {
+            "objective": "旧任务",
+            "steps": [{"id": "old", "instruction": "执行旧任务"}],
+        },
+    )
+    old_task_id = created["task"]["id"]
+    session_db.update_task(old_task_id, status="cancelled")
+
+    revised, _ = registry.execute(
+        "revise_plan",
+        {"steps": [{"id": "new", "instruction": "错误恢复旧任务"}]},
+    )
+    replacement, _ = registry.execute(
+        "create_plan",
+        {
+            "objective": "新任务",
+            "steps": [{"id": "new", "instruction": "执行新任务"}],
+        },
+    )
+
+    assert revised["success"] is False
+    assert replacement["success"] is True
+    assert replacement["task"]["id"] != old_task_id
 
 
 def test_invoke_skill_runs_isolated_read_only_loop_and_logs_invocation(tmp_path: Path):

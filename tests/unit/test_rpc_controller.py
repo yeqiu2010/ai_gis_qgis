@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from ai_gis_qgis.qwebengine.message_protocol import agent_event
 from ai_gis_qgis.qwebengine.rpc_controller import RPCController
+from ai_gis_qgis.database.session_db import SessionDB
 
 
 class RecordingBridge:
@@ -43,3 +45,21 @@ def test_rpc_controller_suppresses_cancelled_stale_run_events():
 
     assert [event["payload"]["message"] for event in controller.bridge.events] == ["新任务消息"]
 
+
+def test_cancel_run_persists_active_task_cancellation(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="cancel task", model="test", source="test")
+    task_id = session_db.create_task(session.id, "旧任务", status="running")
+
+    controller = RPCController.__new__(RPCController)
+    controller.session_db = session_db
+    controller.bridge = RecordingBridge()
+    controller._run_lock = threading.Lock()
+    controller._active_runs = {session.id: "old-run"}
+    controller._cancelled_runs = set()
+
+    result = controller.cancel_run({"session_id": session.id})
+
+    assert result["cancelled"] is True
+    assert session_db.get_task(task_id)["status"] == "cancelled"
+    assert session_db.get_active_task(session.id)["status"] == "cancelled"

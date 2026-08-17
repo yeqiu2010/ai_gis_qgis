@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from ...database.session_db import SessionDB
+from ..executor.artifact_verifier import ArtifactVerifier
 from ..skills.skill_manager import SkillManager
 from .registry import ToolEntry
 
@@ -123,7 +125,7 @@ def _create_or_revise_plan(
         return {"success": False, "error": error}
     task = session_db.get_active_task(session_id)
     if revise:
-        if task is None:
+        if task is None or task.get("status") in {"completed", "failed", "cancelled"}:
             return {"success": False, "error": "当前没有可修订的活动任务。"}
         task_id = str(task["id"])
         objective = objective or str(task["objective"])
@@ -383,8 +385,24 @@ def _register_artifact_specs(
             continue
         uri = str(artifact.get("uri") or "").strip() or None
         verified = bool(artifact.get("verified"))
-        if uri and _local_uri_exists(uri):
-            verified = True
+        if uri and _is_local_uri(uri) and not _local_uri_exists(uri):
+            verified = False
+        elif uri and _local_uri_exists(uri):
+            raw_payload = artifact.get("payload")
+            payload: dict[str, Any] = (
+                dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            )
+            verification = ArtifactVerifier().verify(
+                {
+                    "path": uri.removeprefix("file://").split("|", 1)[0],
+                    "name": artifact.get("name") or Path(uri).stem,
+                    "type": _artifact_output_type(artifact_type, uri, payload),
+                    "required": True,
+                }
+            )
+            payload = {**payload, "verification": verification}
+            artifact = {**artifact, "payload": payload}
+            verified = bool(verification.get("verified"))
         registered.append(
             session_db.register_artifact(
                 task_id,
@@ -398,6 +416,29 @@ def _register_artifact_specs(
             )
         )
     return registered
+
+
+def _artifact_output_type(
+    artifact_type: str,
+    uri: str,
+    payload: dict[str, Any],
+) -> str:
+    declared = str(payload.get("type") or "").lower()
+    if declared in {"vector", "raster", "table", "file"}:
+        return declared
+    suffix = Path(uri.removeprefix("file://").split("|", 1)[0]).suffix.lower()
+    if suffix in {".tif", ".tiff", ".vrt", ".img"}:
+        return "raster"
+    if suffix in {".shp", ".gpkg", ".geojson", ".kml"}:
+        return "vector"
+    if suffix in {".csv", ".xlsx", ".dbf"}:
+        return "table"
+    normalized_type = artifact_type.lower()
+    if "raster" in normalized_type or "mask" in normalized_type:
+        return "raster"
+    if "vector" in normalized_type or "layer" in normalized_type:
+        return "vector"
+    return "file"
 
 
 def _build_register_artifact_tool(session_db: SessionDB, session_id: str) -> ToolEntry:
@@ -447,7 +488,7 @@ def _build_finalize_task_tool(
                 "success": False,
                 "error": "任务尚未满足完成条件。",
                 "completion_errors": failures,
-                "task": state,
+                "task": _completion_state_summary(state),
             }
         summary = str(arguments.get("summary") or "").strip()
         finalization = {
@@ -532,9 +573,10 @@ def verify_task_completion(state: dict[str, Any], skill_manager: SkillManager) -
         if step.get("status") not in {"completed", "skipped"}:
             failures.append(f"步骤 {step.get('id')} 状态为 {step.get('status')}")
     artifacts = state.get("artifacts") or []
-    artifact_names = {
+    verified_artifact_names = {
         str(value)
         for artifact in artifacts
+        if artifact.get("verified")
         for value in (artifact.get("artifact_type"), artifact.get("name"))
         if value
     }
@@ -548,21 +590,71 @@ def verify_task_completion(state: dict[str, Any], skill_manager: SkillManager) -
         completion = document.execution_contract.get("completion") or {}
         required = completion.get("required_artifacts") or []
         for artifact_name in required:
-            if str(artifact_name) not in artifact_names and str(artifact_name) not in step.get("outputs", {}):
-                failures.append(f"步骤 {step.get('id')} 缺少必需产物 {artifact_name}")
+            if str(artifact_name) not in verified_artifact_names:
+                failures.append(
+                    f"步骤 {step.get('id')} 缺少已验证的必需产物 {artifact_name}"
+                )
     for artifact in artifacts:
         uri = str(artifact.get("uri") or "")
-        if uri and _is_local_uri(uri) and not _local_uri_exists(uri):
+        if not uri or not _is_local_uri(uri):
+            continue
+        payload = artifact.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("required", True) is False:
+            continue
+        if not _local_uri_exists(uri):
             failures.append(f"产物不存在: {uri}")
+        elif not artifact.get("verified"):
+            failures.append(f"产物未通过运行时验证: {uri}")
     return failures
 
 
+def _completion_state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Return only the state needed to repair a failed finalization."""
+    return {
+        "id": state.get("id"),
+        "objective": state.get("objective"),
+        "status": state.get("status"),
+        "steps": [
+            {
+                "id": step.get("id"),
+                "skill_name": step.get("skill_name"),
+                "status": step.get("status"),
+                "outputs": step.get("outputs") or {},
+                "error": step.get("error"),
+            }
+            for step in state.get("steps") or []
+        ],
+        "artifacts": [
+            {
+                "artifact_type": artifact.get("artifact_type"),
+                "name": artifact.get("name"),
+                "uri": artifact.get("uri"),
+                "verified": artifact.get("verified"),
+            }
+            for artifact in state.get("artifacts") or []
+        ],
+    }
+
+
 def _is_local_uri(uri: str) -> bool:
-    return uri.startswith("file://") or "://" not in uri
+    value = str(uri or "").strip()
+    if not value:
+        return False
+    if value.startswith("file://"):
+        return True
+    if "://" in value or value.startswith("memory:"):
+        return False
+    if value.startswith(("/", "\\\\")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return True
+    # Relative files remain verifiable, while opaque QGIS layer IDs such as
+    # ``building_ab12...`` are not misclassified as filesystem paths.
+    return "/" in value or "\\" in value or bool(Path(value).suffix)
 
 
 def _local_uri_exists(uri: str) -> bool:
     if not _is_local_uri(uri):
         return False
-    path = uri.removeprefix("file://")
+    path = uri.removeprefix("file://").split("|", 1)[0]
     return bool(path) and Path(path).expanduser().exists()

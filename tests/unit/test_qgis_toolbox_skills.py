@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from ai_gis_qgis.backend.processing.algorithm_evidence import (
+    processing_algorithm_ids,
+    processing_evidence_state_key,
+    read_processing_evidence,
+)
 from ai_gis_qgis.backend.processing.toolbox_catalog import QGISToolboxCatalog
 from ai_gis_qgis.backend.skills.skill_manager import SkillManager
 from ai_gis_qgis.backend.tools.code_execution import validate_execute_gis_code_arguments
@@ -25,6 +31,7 @@ from ai_gis_qgis.backend.tools.school_service_coverage import (
     build_school_service_coverage_code,
 )
 from ai_gis_qgis.backend.tools.skill_management import build_search_skills_tool
+from ai_gis_qgis.database.session_db import SessionDB
 
 
 def test_qgis_toolbox_catalog_searches_domains_and_tools():
@@ -99,6 +106,74 @@ def test_qgis_toolbox_gets_multiple_tool_details_in_one_call():
     assert result["success"] is True
     assert [tool["tool_id"] for tool in result["tools"]] == ["native:fieldcalculator", "gdal:slope"]
     assert "tool" not in result
+
+
+def test_qgis_toolbox_persists_exact_algorithm_evidence_for_pipeline(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="evidence", model="test", source="test")
+    registry = ToolRegistry()
+    for entry in build_qgis_toolbox_tools(
+        session_db=session_db,
+        session_id=session.id,
+    ):
+        registry.register(entry)
+
+    result, _ = registry.execute(
+        "get_qgis_processing_tool",
+        {"tool_ids": ["gdal:cliprasterbyextent", "gdal:rastercalculator"]},
+    )
+
+    assert result["success"] is True
+    evidence = read_processing_evidence(session_db, session.id)
+    assert set(evidence) == {"gdal:cliprasterbyextent", "gdal:rastercalculator"}
+    clip_evidence = evidence["gdal:cliprasterbyextent"]
+    assert "PROJWIN: Clipping extent" in clip_evidence["parameters"]
+    assert "EXTENT: Clipping extent" not in clip_evidence["parameters"]
+    assert "'PROJWIN': '0,10,0,10'" in clip_evidence["code_example"]
+
+
+def test_heatmap_catalog_example_uses_singular_output_value_and_compiles():
+    catalog = QGISToolboxCatalog()
+    detail = catalog.get("qgis:heatmapkerneldensityestimation").detail()
+
+    assert "OUTPUT_VALUE: Output value scaling" in detail["parameters"]
+    assert "OUTPUT_VALUES" not in detail["parameters"]
+    assert "'OUTPUT_VALUE': 0" in detail["code_example"]
+    compile(detail["code_example"], "<heatmap-catalog-example>", "exec")
+
+
+def test_processing_evidence_repairs_clip_extent_key_saved_by_older_build(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="legacy evidence", model="test", source="test")
+    session_db.set_state(
+        processing_evidence_state_key(session.id),
+        json.dumps(
+            {
+                "gdal:cliprasterbyextent": {
+                    "tool_id": "gdal:cliprasterbyextent",
+                    "parameters": "INPUT: Input raster\nEXTENT: Clipping extent\nOUTPUT: Result",
+                    "code_example": "params = {'INPUT': raster, 'EXTENT': road, 'OUTPUT': out}",
+                }
+            }
+        ),
+    )
+
+    detail = read_processing_evidence(session_db, session.id)[
+        "gdal:cliprasterbyextent"
+    ]
+
+    assert "PROJWIN: Clipping extent" in detail["parameters"]
+    assert "'PROJWIN': road" in detail["code_example"]
+
+
+def test_processing_algorithm_ids_include_fallback_algorithms_but_not_crs_ids():
+    assert processing_algorithm_ids(
+        {
+            "algorithm": "qgis:heatmapkerneldensityestimation",
+            "crs_strategy": "统一使用 EPSG:2385",
+            "fallback_plan": "必要时使用 gdal:cliprasterbyextent 裁剪",
+        }
+    ) == {"qgis:heatmapkerneldensityestimation", "gdal:cliprasterbyextent"}
 
 
 def test_qgis_toolbox_exposes_search_only_without_direct_runner():

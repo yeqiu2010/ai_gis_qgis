@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .artifact_verifier import ArtifactVerifier
 from .sandbox_policy import SandboxPolicy
 
 
@@ -90,17 +91,19 @@ class QGISCodeExecutor:
         duration_ms = int((time.monotonic() - started) * 1000)
         result = self._parse_worker_result(completed.stdout)
         stderr = f"{result.get('stderr') or ''}{completed.stderr or ''}"
-        outputs = result.get("outputs") or []
-        missing = [output for output in outputs if not output.get("exists")]
-        success = completed.returncode == 0 and result.get("success") is True and not missing
+        outputs = self._collect_outputs(payload_outputs)
+        invalid = _required_invalid_outputs(outputs)
+        success = completed.returncode == 0 and result.get("success") is True and not invalid
         error = result.get("error")
-        if missing and not error:
-            names = ", ".join(output.get("path", "") for output in missing)
-            error = f"代码执行结束，但缺少预期输出文件：{names}"
+        error_code = result.get("error_code")
+        if invalid and not error:
+            error = _format_output_contract_error(invalid)
+            error_code = _output_contract_error_code(invalid)
 
         return {
             "success": success,
             "error": error,
+            "error_code": error_code,
             "workspace_dir": str(workspace_dir),
             "expected_outputs": payload_outputs,
             "outputs": outputs,
@@ -173,20 +176,22 @@ class QGISCodeExecutor:
                 compiled = compile(code, "<ai_gis_agent_current_qgis_code>", "exec")
                 exec(compiled, namespace, namespace)
             outputs = self._collect_outputs(payload_outputs)
-            missing = [output for output in outputs if not output.get("exists")]
+            invalid = _required_invalid_outputs(outputs)
             error = None
-            if missing:
-                names = ", ".join(output.get("path", "") for output in missing)
-                error = f"代码执行结束，但缺少预期输出文件：{names}"
+            error_code = None
+            if invalid:
+                error = _format_output_contract_error(invalid)
+                error_code = _output_contract_error_code(invalid)
             return {
-                "success": not missing,
+                "success": not invalid,
                 "error": error,
+                "error_code": error_code,
                 "workspace_dir": str(workspace_dir),
                 "expected_outputs": payload_outputs,
                 "outputs": outputs,
                 "stdout": stdout_buffer.getvalue(),
                 "stderr": stderr_buffer.getvalue(),
-                "exit_code": 0 if not missing else 1,
+                "exit_code": 0 if not invalid else 1,
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "execution_mode": "current_qgis",
             }
@@ -195,6 +200,7 @@ class QGISCodeExecutor:
             return {
                 "success": False,
                 "error": str(exc),
+                "error_code": None,
                 "workspace_dir": str(workspace_dir),
                 "expected_outputs": payload_outputs,
                 "outputs": self._collect_outputs(payload_outputs),
@@ -373,20 +379,30 @@ class QGISCodeExecutor:
         return open_guard
 
     def _collect_outputs(self, expected_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        outputs = []
-        for expected in expected_outputs:
-            path = Path(str(expected.get("path") or "")).resolve()
-            exists = path.exists()
-            outputs.append(
-                {
-                    "path": str(path),
-                    "name": str(expected.get("name") or path.stem),
-                    "type": str(expected.get("type") or "vector"),
-                    "exists": exists,
-                    "size_bytes": path.stat().st_size if exists and path.is_file() else None,
-                }
-            )
-        return outputs
+        return ArtifactVerifier().verify_all(expected_outputs)
+
+
+def _required_invalid_outputs(outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        output
+        for output in outputs
+        if output.get("required", True) and not output.get("verified")
+    ]
+
+
+def _format_output_contract_error(outputs: list[dict[str, Any]]) -> str:
+    details = []
+    for output in outputs:
+        path = str(output.get("path") or "")
+        errors = output.get("validation_errors") or []
+        details.append(f"{path}（{'；'.join(str(item) for item in errors) or '验证失败'}）")
+    return "代码执行结束，但预期输出未通过运行时验证：" + "、".join(details)
+
+
+def _output_contract_error_code(outputs: list[dict[str, Any]]) -> str:
+    if any(not output.get("exists") for output in outputs):
+        return "missing_expected_output"
+    return "invalid_expected_output"
 
 
 def _process_qt_events(qcore_application, qevent_loop) -> None:

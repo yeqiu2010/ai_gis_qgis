@@ -65,6 +65,7 @@ metadata:
 - 复杂任务不要跳过图层检查；涉及多个图层时优先一次调用 `inspect_layers`，至少检查主要输入图层的字段、CRS、几何类型和样例，避免连续多次调用 `inspect_layer`。
 - `structured_query` 完成前不得搜索算法；必须先产出每个操作的标准 GIS 术语。
 - `solution_plan` 中只调用一次 `search_qgis_processing_tools`，用 `queries` 覆盖全部操作；随后只调用一次 `get_qgis_processing_tool` 批量读取候选详情。
+- 不同的用户操作不能仅因输出都是栅格就合并为同一算法。若某项没有找到语义等价的 Processing 工具，不得静默用核函数变化或近似算法代替；先报告缺口并取得用户确认。
 - 不得调用或假设存在 `run_qgis_processing`。所有步骤必须组合进一份脚本，审查通过后只调用一次 `execute_gis_code`。
 - 当前 Pipeline 计划步骤执行期间不得用其他 Skill 替代其中阶段；该步骤完成后，Coordinator
   可以继续加载后续任务所需的其他 Skill。domain 检索结果只是算法候选，不是切换 Skill 的指令。
@@ -113,6 +114,8 @@ metadata:
    - 新增密度、比例等小数派生字段时，核对表达式和目标字段均为 Double；已有同名 String 字段时必须先重构，不能直接写入浮点数。
    - 失败重试也必须生成从原始图层开始的完整脚本；每次执行的工作目录都是全新的，不能只修复失败步骤或复用上次中间文件。
    - 确保最终输出路径和 `expected_outputs.path` 完全一致，例如 `500m.shp`。
+   - 使用 `QgsProject.instance().mapLayer(layer_id)` 把检查工具返回的每个图层 ID 解析为真实图层对象，逐一检查不是 `None`；Processing 图层参数不得直接使用 ID 字符串。
+   - 逐字核对用户指定的所有输出名称及数字后缀；代码、文件名、图层名和 `expected_outputs` 必须一致。
 5. `execution_result`
    - 只调用一次 `execute_gis_code`，由用户确认整份脚本。
    - 成功时直接说明结果和加载图层；失败时把错误反馈给代码生成阶段重试。

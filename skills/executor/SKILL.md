@@ -25,6 +25,7 @@ metadata:
 ## 执行前
 
 - 代码如需写文件，只能写入 `QGIS_AGENT_WORKSPACE` 或 `expected_outputs` 中的文件。
+- 不根据代码中出现的写入 API 推断文件是否生成；执行结束后必须以 `expected_outputs` 对应产物的 `exists`、`valid`、`verified` 运行时结果为准。
 - 有文件结果时，`expected_outputs` 每项必须包含 `path`、`name`、`type`；仅返回最终统计结论或修改当前图层样式时允许空数组。
 - 分析结果默认保存在 `QGIS_AGENT_WORKSPACE` 并自动加载到 QGIS；不要在最终回答或执行前要求用户选择保存文件夹。
 - 用户明确指定外部目录时，`execute_gis_code` 使用 `delivery_outputs` 交付结果；代码本身仍不得写入外部目录。

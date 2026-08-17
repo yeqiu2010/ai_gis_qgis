@@ -23,11 +23,9 @@ metadata:
 - 创建 `QgsApplication`、`QApplication` 或调用 `initQgis`、`setPrefixPath`。
 - 使用 `subprocess`、`os.system`、`eval`、`exec`、`sys.exit`。
 - 删除或覆盖工作目录外文件。
-- 用户要求生成/导出的输出文件没有写入 `QGIS_AGENT_WORKSPACE`。
 - 用户要求导出到外部目录时，代码直接写外部目录；应改为工作目录输出 + `delivery_outputs`。
 - 用户要求生成文件（例如 `500m.shp`），但 `expected_outputs` 为空或没有包含该文件。仅需 stdout 最终统计结论或直接调整当前图层样式时允许空数组。
-- `expected_outputs.path` 和代码实际输出文件名不一致。
-- `expected_outputs` 声明了文件，但代码只向 stdout 打印内容，没有通过 Processing `OUTPUT`、文件写入或 Writer API 实际创建该文件。
+- `expected_outputs` 的文件名、类型或数量与用户需求及 `structured_query` 输出契约不一致。
 - 使用未定义变量，例如 `QgsProject` 未导入且不在当前命名空间说明中。
 - 使用 `QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback` 但既没有显式导入，也不在当前命名空间说明中；最终输出不能只使用 `QgsProcessing.TEMPORARY_OUTPUT`。
 - 对字段做筛选前没有检查字段是否存在。
@@ -38,6 +36,9 @@ metadata:
 - 用户未明确要求修复数据，却调用 `native:fixgeometries`；分析查询应通过 Processing context 的 `GeometrySkipInvalid` 排除空几何或无效几何要素。
 - 把枚举写成不存在的 `QgsProcessingContext.InvalidGeometryCheck`；正确写法必须是 `Qgis.InvalidGeometryCheck.GeometrySkipInvalid`。
 - 使用 `mapLayersByName(...)[0]` 而未先检查返回列表。
+- 把 `inspect_layer` 返回的 QGIS 图层 ID 字符串直接传给 Processing 图层参数；必须先用 `QgsProject.instance().mapLayer(layer_id)` 取得对象并检查返回值不是 `None`。调用 `mapLayer()` 后直接访问 `extent()`、`fields()` 或传给 Processing 而没有空值检查也必须阻断。
+- 用户指定的输出图层名、文件名或数字后缀被改写，例如要求 `pdst_250` 却生成 `pdst_255`。
+- 使用不同核函数、相似算法或自编近似计算替代用户明确要求的分析工具，但结构化需求中没有用户批准替代的证据。
 - 对 `processing.run` 的文件 `OUTPUT` 路径字符串直接调用 `featureCount()`；但不得把 `"memory:"` 或 `TEMPORARY_OUTPUT` 返回的图层对象误判成路径，也不得用 `QgsVectorLayer(..., "memory")` 重新包装该对象。
 - 使用 `processing.QgsProcessingFeedback()`；正确类位于 `qgis.core`。
 - Processing `PREDICATE` 传入 `"intersects"`/`"within"` 等字符串，而不是算法详情定义的整数枚举列表。
@@ -49,6 +50,9 @@ metadata:
 - 使用 `??_1` 等乱码/占位字段名，而不是来自 `inspect_layer` 或当前结果 `fields()` 的真实字段名。
 - 未读取精确 API 证据却直接调用 `QgsVectorFileWriter.create/writeAsVectorFormat*` 重载；常规矢量输出应使用 Processing。
 - 调用不存在的 `QgsProject.addVectorLayer`，或猜测未在算法详情中出现的结果键（如 `OUTPUT_COUNT`）。
+- 对已经列入 `expected_outputs`、将由执行器自动加载的最终 vector/raster 文件，又手工创建 `QgsRasterLayer`/`QgsVectorLayer` 并调用 `addMapLayer()`，导致结果图层重复加载。
+
+不要尝试通过穷举 Processing、GDAL、Writer 或 Python 文件 API 来静态证明输出一定会生成。代码审查只检查声明式输出契约、安全边界和确定性的 API 错误；文件是否存在、非空且可被对应 GIS 驱动打开，以执行后的 `verified` 结果为唯一依据。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
 - 把 `QgsColorRampShader` 直接传给 `QgsSingleBandPseudoColorRenderer` 构造器或 `renderer.setShader()`；二者要求 `QgsRasterShader`，必须先用 `setRasterShaderFunction()` 包装颜色函数。
@@ -58,6 +62,7 @@ metadata:
   `land_area = current_land_area`。地块面积必须按唯一地块去重汇总，不能按建筑重复累加，
   也不能只保留最后一个地块。
 - 用户指定面积字段作为覆盖率分母，但代码忽略该字段改用几何面积；或者分子使用投影后几何面积、分母使用单位不明的属性面积，却没有验证单位一致。
+- 用户只要求按平方米筛选地块面积、并未明确指定面积属性字段，代码却把可能为空或单位不明的 String 字段（例如 `land_area`）直接 `to_real(...)`，而不是在米制投影中用 `$area` 计算几何面积；预期应命中要素的筛选流程也必须检查中间及最终 `featureCount()`，不得把 0 要素文件直接当作成功结果。
 - 密度、覆盖率、比例、均值、面积、长度或高度等小数派生字段被定义为文本类型（例如 `QVariant.String`、`native:aggregate`/`native:refactorfields` 映射中的文本类型 `type: 10`，或算法详情标记为 Text/String 的字段枚举），或者向有长度限制的 String 字段写入浮点数。此类字段必须使用 Double，并设置合理的数值长度和精度。
 - 代码准备写入已有 `dense` 等派生字段，却没有检查同名字段的实际类型；若原字段是文本型，必须先重构为唯一的 Double 字段，不能仅增加字符串长度或直接写入浮点数。
 - 比值计算没有处理 NULL、非数值、分母为 0，或把结果转换成 `str`、`nan`、`inf` 后写入属性表。

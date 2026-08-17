@@ -21,6 +21,11 @@ from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, ChatResponse, LLMProvider
 from .llm.errors import ContextWindowExceeded
 from .plugin_system import PluginManager
+from .processing.algorithm_evidence import (
+    compact_processing_evidence,
+    processing_algorithm_ids,
+    read_processing_evidence,
+)
 from .tools.code_execution import (
     build_execute_gis_code_tool,
     validate_execute_gis_code_arguments,
@@ -977,9 +982,32 @@ class AgentCore:
             )
         self._reset_one_shot_skill(session_id)
 
-        should_resume_plan = result.get("success", True) and (
-            tool_registry.get(tool_name).resume_policy == "continue_plan"
-            or self._managed_task_must_continue(session_id)
+        provisional_content = (
+            self._format_tool_success(tool_name, result)
+            if result.get("success", True)
+            else self._format_tool_failure(tool_name, result)
+        )
+        task_completed = result.get("success", True) and self._finalize_ready_task(
+            session_id,
+            provisional_content,
+        )
+        active_task = self.session_db.get_active_task(session_id)
+        should_resume_plan = result.get("success", True) and not task_completed and (
+            self._managed_task_must_continue(session_id)
+            or (
+                active_task is None
+                and tool_registry.get(tool_name).resume_policy == "continue_plan"
+            )
+            or (
+                active_task is not None
+                and active_task.get("status") not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "waiting_for_user",
+                    "waiting_confirmation",
+                }
+            )
         )
         if should_resume_plan:
             try:
@@ -1000,9 +1028,9 @@ class AgentCore:
             if paused_for_confirmation:
                 return events
         elif result.get("success", True):
-            content = self._format_tool_success(tool_name, result)
+            content = provisional_content
         else:
-            content = self._format_tool_failure(tool_name, result)
+            content = provisional_content
         self._finalize_ready_task(session_id, content)
         self.session_db.save_message(
             session_id,
@@ -1085,6 +1113,30 @@ class AgentCore:
         )
         budget = IterationBudget()
         last_response: ChatResponse | None = None
+        failure_counts: dict[str, int] = {}
+
+        def repeated_failure(
+            name: str,
+            arguments: dict[str, Any],
+            result: dict[str, Any],
+        ) -> bool:
+            if result.get("success", True):
+                return False
+            signature = json.dumps(
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "error": result.get("error"),
+                    "error_code": result.get("error_code"),
+                    "completion_errors": result.get("completion_errors") or [],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            failure_counts[signature] = failure_counts.get(signature, 0) + 1
+            return failure_counts[signature] >= 2
+
         while not budget.exhausted:
             response = self._chat_with_retries(
                 system=system_prompt,
@@ -1122,6 +1174,8 @@ class AgentCore:
 
             messages.append(self._assistant_tool_message(response))
             tool_results: list[dict[str, Any]] = []
+            terminal_failure: tuple[str, dict[str, Any]] | None = None
+            finalized_summary: str | None = None
             for call in response.tool_calls:
                 entry = tool_registry.get(call.name)
                 call_arguments = call.arguments
@@ -1205,6 +1259,19 @@ class AgentCore:
                         }
                     )
                     budget.record_tool_call()
+                    if repeated_failure(call.name, call_arguments, preflight_result):
+                        terminal_failure = (
+                            call.name,
+                            {
+                                **preflight_result,
+                                "error": (
+                                    f"{preflight_result.get('error') or '工具调用失败'} "
+                                    "相同参数已连续失败两次，已停止自动重试。"
+                                ),
+                                "duplicate_failure_prevented": True,
+                            },
+                        )
+                        break
                     continue
 
                 if entry.requires_confirmation:
@@ -1361,6 +1428,26 @@ class AgentCore:
                     }
                 )
                 budget.record_tool_call()
+                if call.name == "finalize_task" and result.get("success"):
+                    finalized_summary = str(
+                        result.get("summary")
+                        or call_arguments.get("summary")
+                        or "任务已完成。"
+                    )
+                    break
+                if repeated_failure(call.name, call_arguments, result):
+                    terminal_failure = (
+                        call.name,
+                        {
+                            **result,
+                            "error": (
+                                f"{result.get('error') or '工具调用失败'} "
+                                "相同参数已连续失败两次，已停止自动重试。"
+                            ),
+                            "duplicate_failure_prevented": True,
+                        },
+                    )
+                    break
 
             qgis_context = self._collect_qgis_context()
             system_prompt = self._build_system_prompt(
@@ -1377,6 +1464,11 @@ class AgentCore:
             )
             for item in tool_results:
                 messages.append(self._tool_result_message(item))
+            if finalized_summary is not None:
+                return finalized_summary, False
+            if terminal_failure is not None:
+                failed_tool, failed_result = terminal_failure
+                return self._format_tool_failure(failed_tool, failed_result), False
 
         if last_response is not None and last_response.content:
             return last_response.content, False
@@ -1810,7 +1902,11 @@ class AgentCore:
                     "name": output.get("name") or output.get("path"),
                     "uri": output.get("path") or output.get("absolute_path"),
                     "payload": output,
-                    "verified": True,
+                    "verified": (
+                        bool(output.get("verified"))
+                        if tool_name == "execute_gis_code"
+                        else bool(output.get("verified", True))
+                    ),
                 }
             )
         if tool_name == "generate_land_cover_map":
@@ -1823,25 +1919,33 @@ class AgentCore:
                 }
             )
         if tool_name == "execute_gis_code" and artifacts:
+            execution_outputs = [
+                output
+                for output in result.get("outputs") or []
+                if isinstance(output, dict)
+            ]
             artifacts.append(
                 {
                     "artifact_type": "execution_outputs",
                     "name": "GIS execution outputs",
                     "payload": {"outputs": result.get("outputs") or []},
-                    "verified": True,
+                    "verified": bool(execution_outputs)
+                    and all(output.get("verified") for output in execution_outputs),
                 }
             )
         return artifacts
 
-    def _finalize_ready_task(self, session_id: str, summary: str) -> None:
+    def _finalize_ready_task(self, session_id: str, summary: str) -> bool:
         task = self.session_db.get_active_task(session_id)
         if task is None:
-            return
+            return False
+        if task.get("status") == "completed":
+            return True
         state = self.session_db.get_task_state(str(task["id"]))
         if state is None:
-            return
+            return False
         if verify_task_completion(state, self.prompt_builder.skill_manager):
-            return
+            return False
         self.session_db.update_task(
             str(task["id"]),
             status="completed",
@@ -1862,6 +1966,7 @@ class AgentCore:
                 "automatic_after_confirmation": True,
             },
         )
+        return True
 
     def _pipeline_must_continue(self, session_id: str, active_skill: str) -> bool:
         if active_skill != "gis-pipeline":
@@ -2403,6 +2508,35 @@ class AgentCore:
         return "\n".join(lines)
 
     def _format_tool_success(self, tool_name: str, result: dict[str, Any]) -> str:
+        if tool_name == "segment_remote_sensing_image":
+            parameters = result.get("parameters") or {}
+            prompt = parameters.get("prompt") or result.get("prompt")
+            object_count = result.get("object_count")
+            loaded_layers = result.get("loaded_layers") or []
+            outputs = result.get("outputs") or []
+            lines = ["SAM3 分割已完成。"]
+            if prompt:
+                lines.append(f"目标类别：{prompt}")
+            if object_count is not None:
+                lines.append(f"提取对象数：{object_count}")
+            if loaded_layers:
+                names = ", ".join(
+                    str(layer.get("name") or layer.get("id") or "")
+                    for layer in loaded_layers
+                    if isinstance(layer, dict)
+                )
+                if names:
+                    lines.append(f"已加载结果图层：{names}")
+            if outputs:
+                paths = ", ".join(
+                    str(output.get("path") or output.get("absolute_path") or "")
+                    for output in outputs
+                    if isinstance(output, dict)
+                    and (output.get("path") or output.get("absolute_path"))
+                )
+                if paths:
+                    lines.append(f"输出文件：{paths}")
+            return "\n".join(lines)
         if tool_name not in {
             "execute_gis_code",
             "generate_land_cover_map",
@@ -2455,7 +2589,11 @@ class AgentCore:
             self._collect_qgis_context(),
             loaded_skills=loaded_skills,
         )
-        last_result: dict[str, Any] | None = None
+        last_result: dict[str, Any] | None = failed_result
+        seen_execution_signatures = {
+            self._code_execution_signature(failed_arguments)
+        }
+        previous_failure_signature = self._code_failure_signature(failed_result)
         for retry_index in range(1, 3):
             publish(
                 agent_event(
@@ -2485,6 +2623,23 @@ class AgentCore:
             for call in response.tool_calls:
                 if call.name != "execute_gis_code":
                     continue
+                signature = self._code_execution_signature(call.arguments)
+                if signature in seen_execution_signatures:
+                    duplicate_result = {
+                        **(last_result or failed_result),
+                        "success": False,
+                        "error": (
+                            f"{(last_result or failed_result).get('error') or '代码执行失败'} "
+                            "模型再次提交了相同代码和输出契约，已停止重复执行。"
+                        ),
+                        "duplicate_failure_prevented": True,
+                    }
+                    self._save_process_message(
+                        session_id,
+                        "检测到完全相同的失败代码，已停止自动重试。",
+                    )
+                    return duplicate_result
+                seen_execution_signatures.add(signature)
                 publish(
                     agent_event(
                         "tool_start",
@@ -2515,6 +2670,15 @@ class AgentCore:
                 last_result = result
                 if result.get("success", True):
                     return result
+                failure_signature = self._code_failure_signature(result)
+                if failure_signature == previous_failure_signature:
+                    result["error"] = (
+                        f"{result.get('error') or '代码执行失败'} "
+                        "相同的运行时失败已连续出现两次，已停止自动重试。"
+                    )
+                    result["duplicate_failure_prevented"] = True
+                    return result
+                previous_failure_signature = failure_signature
                 messages = self._retry_messages_for_code_failure(
                     session_id,
                     call.arguments,
@@ -2522,6 +2686,49 @@ class AgentCore:
                     original_failed_arguments=failed_arguments,
                 )
         return last_result
+
+    @staticmethod
+    def _code_execution_signature(arguments: dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                key: arguments.get(key)
+                for key in (
+                    "code",
+                    "expected_outputs",
+                    "delivery_outputs",
+                    "timeout_seconds",
+                )
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _code_failure_signature(result: dict[str, Any]) -> str:
+        outputs = []
+        for output in result.get("outputs") or []:
+            if not isinstance(output, dict) or output.get("verified"):
+                continue
+            outputs.append(
+                {
+                    "name": output.get("name"),
+                    "type": output.get("type"),
+                    "exists": output.get("exists"),
+                    "errors": output.get("validation_errors") or [],
+                }
+            )
+        return json.dumps(
+            {
+                "error_code": result.get("error_code"),
+                "error": None if outputs else result.get("error"),
+                "outputs": outputs,
+                "stderr_tail": str(result.get("stderr") or "").strip().splitlines()[-1:],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
 
     def _retry_messages_for_code_failure(
         self,
@@ -2564,6 +2771,9 @@ class AgentCore:
         failure_evidence = {
             "success": failed_result.get("success"),
             "error": failed_result.get("error"),
+            "error_code": failed_result.get("error_code"),
+            "cause": failed_result.get("cause"),
+            "outputs": failed_result.get("outputs") or [],
             "stderr": str(failed_result.get("stderr") or "")[-4000:],
             "stdout": str(failed_result.get("stdout") or "")[-1000:],
             "workspace_dir": failed_result.get("workspace_dir"),
@@ -2583,6 +2793,9 @@ class AgentCore:
                     "常见修复：如果使用 QgsProject/QgsVectorLayer 等 PyQGIS 类，"
                     "可以直接使用当前 QGIS 环境中已有符号，或显式 `from qgis.core import ...`；"
                     "输出仍必须写入 QGIS_AGENT_WORKSPACE。"
+                    "inspect_layer 返回的 QGIS layer_id 不能直接作为字符串传给 Processing 的 INPUT、"
+                    "OVERLAY、JOIN 或 MASK；必须先用 QgsProject.instance().mapLayer(layer_id) "
+                    "解析为 QgsMapLayer，检查返回值不是 None，再传入算法。"
                     "如果错误来自空几何或无效几何，应在 Processing context 中使用 "
                     "`Qgis.InvalidGeometryCheck.GeometrySkipInvalid` 排除这些要素；"
                     "InvalidGeometryCheck 枚举不属于 QgsProcessingContext。"
@@ -2822,6 +3035,23 @@ class AgentCore:
                 "stage_name": previous_stage,
                 "artifact": previous_item.get("stage_artifact") or {},
             }
+
+        if next_stage == "generated_code":
+            solution_artifact = (
+                latest_by_stage.get("solution_plan") or {}
+            ).get("stage_artifact") or {}
+            selected_ids = processing_algorithm_ids(solution_artifact)
+            evidence = compact_processing_evidence(
+                read_processing_evidence(self.session_db, session_id),
+                selected_ids,
+            )
+            if evidence:
+                envelope["processing_algorithm_evidence"] = evidence
+                envelope["processing_evidence_instruction"] = (
+                    "这是 get_qgis_processing_tool 在本轮实际返回并由服务端持久化的权威证据。"
+                    "每个 processing.run 只能使用这里列出的算法 ID 和参数名；"
+                    "代码形状以 code_example 为准，不得凭记忆改名或增加辅助算法。"
+                )
 
         if next_stage in {"data_overview", "structured_query"}:
             history = self.session_db.get_conversation_messages(session_id, limit=12)

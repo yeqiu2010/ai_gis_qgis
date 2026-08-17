@@ -55,8 +55,15 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
         return _result("pipeline_stage", "Pipeline 阶段顺序或阶段产物不符合约束。", False)
     if "无效几何" in message or "invalid geometr" in text or "null geometry" in text:
         return _result("invalid_geometry", "输入包含空几何或无效几何，应在分析中排除。", False)
-    if "缺少预期输出文件" in message or "missing expected output" in text:
+    if (
+        "missing_expected_output" in text
+        or ("预期输出未通过运行时验证" in message and "不存在" in message)
+        or "缺少预期输出文件" in message
+        or "missing expected output" in text
+    ):
         return _result("missing_output", "代码执行结束但没有生成声明的输出文件。", False)
+    if "invalid_expected_output" in text or "预期输出未通过运行时验证" in message:
+        return _result("invalid_output", "代码生成了文件，但文件未通过格式或内容验证。", False)
     if "timeout" in text or "timed out" in text or "超时" in message:
         return _result("timeout", "模型、工具或 GIS 运算超过等待时限。", True)
     if "no user query found" in text:
@@ -89,6 +96,18 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
         return _result(
             "processing_parameters",
             "空间连接缺少 JOIN 输入，或错用了其他算法的参数名。",
+            False,
+        )
+    if "projwin" in text and (
+        "参数值错误" in message
+        or "invalid value" in text
+        or "incorrect parameter value" in text
+    ):
+        return _result(
+            "processing_parameters",
+            "gdal:cliprasterbyextent 的公开 Processing 范围参数名就是 PROJWIN；"
+            "此错误通常表示代码误写为 EXTENT、遗漏了 PROJWIN，或传入的范围值无效。"
+            "应给 PROJWIN 传 QgsMapLayer、QgsRectangle 或 xmin,xmax,ymin,ymax 字符串。",
             False,
         )
     if "isgeosempty" in text:
