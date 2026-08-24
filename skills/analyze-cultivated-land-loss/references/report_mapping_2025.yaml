@@ -1,0 +1,29 @@
+version: "2025-v1"
+template: "../assets/xx区2025年度国土变更调查情况统计表.xlsx"
+sheet_index: 1
+cells:
+  title: A1
+  statistic_date: I2
+  unit_label: Q2
+  management_area_name: A12
+  increment_count: B12
+  increment_area: C12
+  unreasonable_outflow_area: F12
+  unreasonable_outflow_permanent_area: G12
+  non_agricultural_area: H12
+  non_agricultural_permanent_area: I12
+  non_grain_area: J12
+  non_grain_permanent_area: K12
+  forest_garden_area: L12
+  forest_garden_permanent_area: M12
+  other_agricultural_area: N12
+  other_agricultural_permanent_area: O12
+  added_cultivated_area: P12
+  previous_cultivated_area: Q12
+  cultivated_change_area: R12
+  current_cultivated_area: S12
+  note: A25
+formulas:
+  cultivated_change_area: "=F12-P12"
+  current_cultivated_area: "=Q12-F12+P12"
+unused_template_cells: [D12, E12]

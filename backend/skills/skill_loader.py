@@ -129,9 +129,9 @@ class SkillLoader:
             lifecycle=str(
                 metadata.get("lifecycle") or nested_metadata.get("lifecycle") or ""
             ).strip(),
-            author=str(metadata.get("author") or "").strip(),
+            author=str(metadata.get("author") or nested_metadata.get("author") or "").strip(),
             license=str(metadata.get("license") or "").strip(),
-            platforms=_as_list(metadata.get("platforms")),
+            platforms=_first_list(metadata.get("platforms"), nested_metadata.get("platforms")),
             related_skills=_as_list(hermes.get("related_skills")),
             requires_toolsets=_as_list(hermes.get("requires_toolsets")),
             requires_tools=_as_list(hermes.get("requires_tools")),

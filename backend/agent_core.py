@@ -30,6 +30,10 @@ from .tools.code_execution import (
     build_execute_gis_code_tool,
     validate_execute_gis_code_arguments,
 )
+from .tools.cultivated_land_loss import (
+    build_cultivated_land_loss_analysis_tool,
+    build_inspect_cultivated_land_loss_inputs_tool,
+)
 from .tools.custom_tools import load_custom_tool_entries
 from .tools.delegation import build_invoke_skill_tool
 from .tools.gis_analysis import build_get_task_context_tool
@@ -1547,6 +1551,11 @@ class AgentCore:
             )
         )
         registry.register(
+            build_inspect_cultivated_land_loss_inputs_tool(
+                qgis_executor=self.qgis_executor,
+            )
+        )
+        registry.register(
             build_inspect_land_use_building_metrics_inputs_tool(
                 qgis_executor=self.qgis_executor,
             )
@@ -1558,6 +1567,15 @@ class AgentCore:
         )
         registry.register(
             build_school_service_coverage_tool(
+                session_db=self.session_db,
+                session_id=session_id,
+                iface=self.iface,
+                qgis_executor=self.qgis_executor,
+                executor_config=self.executor_config,
+            )
+        )
+        registry.register(
+            build_cultivated_land_loss_analysis_tool(
                 session_db=self.session_db,
                 session_id=session_id,
                 iface=self.iface,
@@ -1884,6 +1902,12 @@ class AgentCore:
         type_map = {
             "execute_school_service_coverage": ["coverage_layer", "group_statistics"],
             "execute_land_use_building_metrics": ["metrics_layer", "metrics_table"],
+            "execute_cultivated_land_loss_analysis": [
+                "report_table",
+                "detail_layer",
+                "metrics_table",
+                "quality_report",
+            ],
             "generate_land_cover_map": ["map_png", "map_pdf"],
         }
         mapped_types = type_map.get(tool_name, [])
@@ -2508,6 +2532,62 @@ class AgentCore:
         return "\n".join(lines)
 
     def _format_tool_success(self, tool_name: str, result: dict[str, Any]) -> str:
+        if tool_name == "execute_cultivated_land_loss_analysis":
+            summary = result.get("analysis_summary") or {}
+            metrics = summary.get("metrics") or {}
+            data_quality = result.get("data_quality") or summary.get("data_quality") or {}
+            unit = str(summary.get("unit_label") or summary.get("area_unit") or "")
+
+            def metric(name: str) -> str:
+                value = metrics.get(name)
+                if isinstance(value, (int, float)):
+                    return f"{float(value):,.2f} {unit}".rstrip()
+                return "未返回"
+
+            area_name = str(summary.get("management_area_name") or "")
+            year = summary.get("analysis_year")
+            title = f"{year}年度国土变更调查耕地流失分析已完成。" if year else "国土变更调查耕地流失分析已完成。"
+            lines = [title]
+            if area_name:
+                lines.append(f"管理区：{area_name}")
+            if summary.get("increment_count") is not None:
+                lines.append(f"增量包原始要素：{summary['increment_count']} 个")
+            lines.extend(
+                [
+                    "",
+                    "指标汇总：",
+                    f"- 增量包面积：{metric('increment_area')}",
+                    f"- 耕地不合理流出：{metric('unreasonable_outflow_area')}，其中占永农 {metric('unreasonable_outflow_permanent_area')}",
+                    f"- 非农化：{metric('non_agricultural_area')}，其中占永农 {metric('non_agricultural_permanent_area')}",
+                    f"- 非粮化：{metric('non_grain_area')}，其中占永农 {metric('non_grain_permanent_area')}",
+                    f"- 流向林地、园地：{metric('forest_garden_area')}，其中占永农 {metric('forest_garden_permanent_area')}",
+                    f"- 流向其他农用地：{metric('other_agricultural_area')}，其中占永农 {metric('other_agricultural_permanent_area')}",
+                    f"- 新增耕地：{metric('added_cultivated_area')}",
+                    f"- 上年度耕地：{metric('previous_cultivated_area')}",
+                    f"- 耕地变化：{metric('cultivated_change_area')}",
+                    f"- 本年度耕地：{metric('current_cultivated_area')}",
+                ]
+            )
+            warning_count = int(data_quality.get("warning_count") or 0)
+            if warning_count:
+                lines.extend(["", f"数据质量警告：{warning_count} 条"])
+                for message in (data_quality.get("messages") or [])[:5]:
+                    lines.append(f"- {message}")
+                if data_quality.get("messages_truncated") or warning_count > 5:
+                    lines.append("- 其余警告请查看质量报告。")
+            outputs = result.get("outputs") or []
+            output_lines = []
+            for output in outputs:
+                if not isinstance(output, dict):
+                    continue
+                path = output.get("path") or output.get("absolute_path")
+                if path:
+                    output_lines.append(
+                        f"- {output.get('name') or path}：{path}"
+                    )
+            if output_lines:
+                lines.extend(["", "结果文件：", *output_lines])
+            return "\n".join(lines)
         if tool_name == "segment_remote_sensing_image":
             parameters = result.get("parameters") or {}
             prompt = parameters.get("prompt") or result.get("prompt")

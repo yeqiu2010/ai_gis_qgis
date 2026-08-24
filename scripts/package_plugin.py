@@ -24,6 +24,7 @@ INCLUDE_DIRS = [
     "resources",
     "skills",
     "plugins",
+    "vendor",
 ]
 
 EXCLUDED_PARTS = {

@@ -6,6 +6,7 @@ import csv
 import json
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile, ZipFile
 
 
 class ArtifactVerifier:
@@ -160,6 +161,43 @@ class ArtifactVerifier:
         errors: list[str],
         warnings: list[str],
     ) -> None:
+        if path.suffix.lower() == ".xlsx":
+            try:
+                with ZipFile(path) as archive:
+                    names = set(archive.namelist())
+                required_parts = {"[Content_Types].xml", "xl/workbook.xml"}
+                missing_parts = sorted(required_parts - names)
+                worksheet_count = sum(
+                    name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+                    for name in names
+                )
+                if missing_parts:
+                    errors.append("XLSX 缺少必要 OOXML 部件：" + "、".join(missing_parts))
+                elif worksheet_count <= 0:
+                    errors.append("XLSX 不包含可读取的工作表")
+                else:
+                    metadata.update(
+                        {
+                            "format": "OOXML/XLSX",
+                            "worksheet_count": worksheet_count,
+                            "validation_level": "structural",
+                        }
+                    )
+            except (OSError, BadZipFile) as exc:
+                errors.append(f"XLSX 无法读取：{exc}")
+            return
+        if path.suffix.lower() == ".xls":
+            try:
+                with path.open("rb") as handle:
+                    signature = handle.read(8)
+                if signature != bytes.fromhex("D0CF11E0A1B11AE1"):
+                    errors.append("XLS 文件不是有效的 OLE Compound File")
+                else:
+                    metadata["format"] = "BIFF8/OLE"
+                    metadata["validation_level"] = "signature"
+            except OSError as exc:
+                errors.append(f"XLS 无法读取：{exc}")
+            return
         if path.suffix.lower() != ".csv":
             warnings.append("当前表格格式仅完成文件存在性和非空检查")
             return
