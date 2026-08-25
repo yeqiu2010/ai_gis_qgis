@@ -276,8 +276,10 @@ def optional_projected_geometry(feature, layer, target_crs, role, quality):
         return None
 
 previous_cultivated_geometries = []
+previous_non_cultivated_geometries = []
 previous_codes_seen = set()
 previous_code_counts = {}
+previous_non_cultivated_code_counts = {}
 for feature in previous_layer.getFeatures():
     code = normalize_code(feature[previous_code_index])
     if not code:
@@ -287,32 +289,54 @@ for feature in previous_layer.getFeatures():
     if code not in known_codes:
         record_skipped_feature("previous", feature, f"未配置地类编码 {code}")
         continue
-    if code in cultivated_codes:
-        geometry = optional_projected_geometry(
-            feature, previous_layer, target_crs, "previous", quality
-        )
-        if geometry is not None:
+    geometry = optional_projected_geometry(
+        feature, previous_layer, target_crs, "previous", quality
+    )
+    if geometry is not None:
+        if code in cultivated_codes:
             previous_cultivated_geometries.append(geometry)
             previous_code_counts[code] = previous_code_counts.get(code, 0) + 1
+        else:
+            previous_non_cultivated_geometries.append(geometry)
+            previous_non_cultivated_code_counts[code] = (
+                previous_non_cultivated_code_counts.get(code, 0) + 1
+            )
 
 increment_records = []
+increment_cultivated_geometries = []
 increment_codes_seen = set()
 increment_code_counts = {}
+increment_area_m2_total = 0.0
+increment_area_feature_count = 0
 for feature in increment_layer.getFeatures():
-    code = normalize_code(feature[increment_code_index])
-    if not code:
-        record_skipped_feature("increment", feature, "地类编码为空")
-        continue
-    increment_codes_seen.add(code)
-    if code not in known_codes:
-        record_skipped_feature("increment", feature, f"未配置地类编码 {code}")
-        continue
     geometry = optional_projected_geometry(
         feature, increment_layer, target_crs, "increment", quality
     )
-    if geometry is not None:
-        increment_records.append((feature.id(), code, geometry))
-        increment_code_counts[code] = increment_code_counts.get(code, 0) + 1
+    if geometry is None:
+        continue
+    increment_area_m2_total += float(geometry.area())
+    increment_area_feature_count += 1
+
+    code = normalize_code(feature[increment_code_index])
+    if not code:
+        record_skipped_feature(
+            "increment",
+            feature,
+            "地类编码为空；仍计入增量包面积，但不参与分类指标",
+        )
+        continue
+    increment_codes_seen.add(code)
+    if code not in known_codes:
+        record_skipped_feature(
+            "increment",
+            feature,
+            f"未配置地类编码 {code}；仍计入增量包面积，但不参与分类指标",
+        )
+        continue
+    increment_records.append((feature.id(), code, geometry))
+    increment_code_counts[code] = increment_code_counts.get(code, 0) + 1
+    if code in cultivated_codes:
+        increment_cultivated_geometries.append(geometry)
 
 unknown_codes = sorted((previous_codes_seen | increment_codes_seen) - known_codes)
 quality["unknown_codes"] = unknown_codes
@@ -337,11 +361,22 @@ def collect_mask(layer, role):
 previous_cultivated = union_geometries(
     previous_cultivated_geometries, "上年度耕地"
 )
+previous_non_cultivated = union_geometries(
+    previous_non_cultivated_geometries, "上年度非耕地"
+)
+increment_cultivated = union_geometries(
+    increment_cultivated_geometries, "增量包耕地"
+)
+added_cultivated = safe_intersection(
+    previous_non_cultivated,
+    increment_cultivated,
+    "新增耕地",
+)
 management_mask = collect_mask(management_layer, "management")
 permanent_mask = collect_mask(permanent_layer, "permanent")
 
 metrics_m2 = {
-    "increment_area": 0.0,
+    "increment_area": increment_area_m2_total,
     "cultivated_outflow_area": 0.0,
     "reasonable_outflow_area": 0.0,
     "unreasonable_outflow_area": 0.0,
@@ -356,7 +391,9 @@ metrics_m2 = {
     "other_agricultural_permanent_area": 0.0,
     "unused_outflow_area": 0.0,
     "unused_outflow_permanent_area": 0.0,
-    "added_cultivated_area": 0.0,
+    "added_cultivated_area": (
+        float(added_cultivated.area()) if added_cultivated is not None else 0.0
+    ),
     "previous_cultivated_area": (
         float(previous_cultivated.area()) if previous_cultivated is not None else 0.0
     ),
@@ -393,7 +430,6 @@ detail_layer.updateFields()
 
 for source_fid, code, geometry in increment_records:
     increment_area_m2 = float(geometry.area())
-    metrics_m2["increment_area"] += increment_area_m2
     values = {
         "outflow_m2": 0.0,
         "reasonable_m2": 0.0,
@@ -411,8 +447,9 @@ for source_fid, code, geometry in increment_records:
     }
 
     if code in cultivated_codes:
+        # This field preserves the source-polygon area for feature-level auditing.
+        # The summary metric is calculated once from the dissolved intersection.
         values["added_m2"] = increment_area_m2
-        metrics_m2["added_cultivated_area"] += increment_area_m2
     else:
         outflow = safe_intersection(geometry, previous_cultivated, "耕地流出")
         if outflow is not None:
@@ -434,25 +471,25 @@ for source_fid, code, geometry in increment_records:
             ]
 
             if code in construction_codes:
-                values["nonagri_m2"] = values["outflow_m2"]
+                values["nonagri_m2"] = values["unreasonable_m2"]
                 values["nonagri_perm_m2"] = intersection_area(
-                    outflow, permanent_mask
+                    unreasonable, permanent_mask
                 )
                 metrics_m2["non_agricultural_area"] += values["nonagri_m2"]
                 metrics_m2["non_agricultural_permanent_area"] += values[
                     "nonagri_perm_m2"
                 ]
             elif code in non_grain_codes:
-                values["nongrain_m2"] = values["outflow_m2"]
+                values["nongrain_m2"] = values["unreasonable_m2"]
                 values["nongrain_perm_m2"] = intersection_area(
-                    outflow, permanent_mask
+                    unreasonable, permanent_mask
                 )
                 metrics_m2["non_grain_area"] += values["nongrain_m2"]
                 metrics_m2["non_grain_permanent_area"] += values[
                     "nongrain_perm_m2"
                 ]
                 if code in forest_garden_codes:
-                    values["forest_garden_m2"] = values["outflow_m2"]
+                    values["forest_garden_m2"] = values["nongrain_m2"]
                     values["forest_garden_perm_m2"] = values[
                         "nongrain_perm_m2"
                     ]
@@ -463,7 +500,7 @@ for source_fid, code, geometry in increment_records:
                         "forest_garden_perm_m2"
                     ]
                 else:
-                    values["other_agri_m2"] = values["outflow_m2"]
+                    values["other_agri_m2"] = values["nongrain_m2"]
                     values["other_agri_perm_m2"] = values[
                         "nongrain_perm_m2"
                     ]
@@ -474,9 +511,9 @@ for source_fid, code, geometry in increment_records:
                         "other_agri_perm_m2"
                     ]
             elif code in unused_codes:
-                metrics_m2["unused_outflow_area"] += values["outflow_m2"]
+                metrics_m2["unused_outflow_area"] += values["unreasonable_m2"]
                 metrics_m2["unused_outflow_permanent_area"] += intersection_area(
-                    outflow, permanent_mask
+                    unreasonable, permanent_mask
                 )
 
     detail_feature = QgsFeature(detail_layer.fields())
@@ -563,8 +600,8 @@ checks = {
         metrics_m2["forest_garden_area"]
         + metrics_m2["other_agricultural_area"],
     ),
-    "outflow_category_partition": close_enough(
-        metrics_m2["cultivated_outflow_area"],
+    "unreasonable_outflow_category_partition": close_enough(
+        metrics_m2["unreasonable_outflow_area"],
         metrics_m2["non_agricultural_area"]
         + metrics_m2["non_grain_area"]
         + metrics_m2["unused_outflow_area"],
@@ -624,11 +661,15 @@ quality.update(
         "analysis_year": parameters["analysis_year"],
         "previous_year": parameters["previous_year"],
         "increment_count": increment_count,
+        "increment_area_feature_count": increment_area_feature_count,
         "processed_increment_count": len(increment_records),
         "skipped_feature_total": skipped_feature_total,
         "skipped_feature_counts": skipped_feature_counts,
         "code_domains": {
             "previous_cultivated": dict(sorted(previous_code_counts.items())),
+            "previous_non_cultivated": dict(
+                sorted(previous_non_cultivated_code_counts.items())
+            ),
             "increment": dict(sorted(increment_code_counts.items())),
             "non_cultivated_increment_count": non_cultivated_increment_count,
         },

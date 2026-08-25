@@ -8,3 +8,4 @@ md/
 .pytest_cache/
 config/settings.json
 .vscode/
+.idea/

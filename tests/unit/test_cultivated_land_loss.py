@@ -163,6 +163,66 @@ def test_fixed_script_builds_without_forbidden_runtime_calls(tmp_path: Path):
     assert '"skipped_feature_counts"' in code
     assert "clone_without_subset" in code
     assert "增量包全部有效要素的地类编码均为耕地" in code
+    assert "previous_non_cultivated_geometries" in code
+    assert "increment_cultivated_geometries" in code
+    assert 'safe_intersection(\n    previous_non_cultivated,\n    increment_cultivated' in code
+    assert 'float(added_cultivated.area())' in code
+    assert 'metrics_m2["added_cultivated_area"] += increment_area_m2' not in code
+    assert 'values["nonagri_m2"] = values["unreasonable_m2"]' in code
+    assert 'values["nongrain_m2"] = values["unreasonable_m2"]' in code
+    assert 'values["forest_garden_m2"] = values["nongrain_m2"]' in code
+    assert 'values["other_agri_m2"] = values["nongrain_m2"]' in code
+    assert 'values["forest_garden_m2"] = values["outflow_m2"]' not in code
+    assert 'values["other_agri_m2"] = values["outflow_m2"]' not in code
+    assert '"unreasonable_outflow_category_partition"' in code
+    assert '"outflow_category_partition"' not in code
+    assert "increment_area_m2_total += float(geometry.area())" in code
+    assert '"increment_area": increment_area_m2_total' in code
+    assert 'metrics_m2["increment_area"] += increment_area_m2' not in code
+    assert '"increment_area_feature_count": increment_area_feature_count' in code
+
+
+def test_added_cultivated_rule_uses_geometric_intersection():
+    root = Path(__file__).resolve().parents[2]
+    rules = (
+        root
+        / "skills"
+        / "analyze-cultivated-land-loss"
+        / "references"
+        / "metric_rules_2025.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Area(N ∩ C)" in rules
+    assert "应先分别融合" in rules
+
+
+def test_non_agricultural_and_non_grain_rules_use_unreasonable_outflow():
+    root = Path(__file__).resolve().parents[2]
+    rules = (
+        root
+        / "skills"
+        / "analyze-cultivated-land-loss"
+        / "references"
+        / "metric_rules_2025.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Area(U ∩ I[新地类属于建设用地])" in rules
+    assert "Area(U ∩ I[新地类属于非耕地农用地])" in rules
+    assert "两个分项之和应等于非粮化面积合计" in rules
+
+
+def test_increment_area_rule_does_not_filter_by_land_code():
+    root = Path(__file__).resolve().parents[2]
+    rules = (
+        root
+        / "skills"
+        / "analyze-cultivated-land-loss"
+        / "references"
+        / "metric_rules_2025.md"
+    ).read_text(encoding="utf-8")
+
+    assert "不按地类编码或其他属性过滤" in rules
+    assert "地类编码为空或未配置的地块仍计入该指标" in rules
 
 
 def test_active_layer_subset_is_cleared_only_on_analysis_clone():
