@@ -18,9 +18,9 @@ from ai_gis_qgis.backend.failure_analysis import classify_failure
 from ai_gis_qgis.backend.llm.base_provider import ChatMessage, ChatResponse, ToolCall
 from ai_gis_qgis.backend.llm.errors import LLMRequestRejected
 from ai_gis_qgis.backend.tools.code_execution import (
+    _load_output_layers,
     build_execute_gis_code_tool,
     find_generated_code_issues,
-    find_uncreated_workspace_inputs,
     validate_execute_gis_code_arguments,
 )
 from ai_gis_qgis.backend.tools.layer_ops import _layer_name_aliases, _normalize_source
@@ -2557,33 +2557,124 @@ processing.run(
     assert result is not None
     assert result["preflight_failed"] is True
     assert "FIELD_TYPE=2 是 Text/String，不是 Double" in result["error"]
-    assert "building_land_stats.gpkg" in result["error"]
-    assert "全新的空工作目录" in result["error"]
+    assert "尚未创建" not in result["error"]
 
 
-def test_workspace_input_is_valid_when_current_script_creates_it_first():
+def test_preflight_does_not_guess_processing_output_data_flow():
     code = """
-from pathlib import Path
-workspace = Path(QGIS_AGENT_WORKSPACE)
-intermediate_path = str(workspace / "building_land_stats.gpkg")
-output_path = str(workspace / "result.gpkg")
-processing.run(
-    "native:joinattributestable",
-    {"INPUT": source_layer, "INPUT_2": stats_layer, "OUTPUT": intermediate_path},
-)
-processing.run(
-    "native:fieldcalculator",
-    {
-        "INPUT": intermediate_path,
-        "FIELD_NAME": "dense",
-        "FIELD_TYPE": 0,
-        "FORMULA": '"sum_FAREA" / "land_sum_Shape_Area"',
-        "OUTPUT": output_path,
-    },
-)
+import os
+workspace = QGIS_AGENT_WORKSPACE
+dem_out = os.path.join(workspace, "wuhan_dem.tif")
+res = processing.run("custom:clip", {"INPUT": vrt, "MASK": mask, "OUTPUT": dem_out})
+clipped = res["OUTPUT"]
+slope_out = os.path.join(workspace, "wuhan_slope.tif")
+processing.run("custom:slope", {"INPUT": clipped, "OUTPUT": slope_out})
 """
 
-    assert find_uncreated_workspace_inputs(code) == []
+    result = validate_execute_gis_code_arguments(
+        {
+            "code": code,
+            "expected_outputs": [
+                {"path": "wuhan_dem.tif", "name": "wuhan_dem", "type": "raster"},
+                {"path": "wuhan_slope.tif", "name": "wuhan_slope", "type": "raster"},
+            ],
+        }
+    )
+
+    assert result is None
+
+
+def test_output_loader_reuses_layer_already_loaded_by_generated_code(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = (tmp_path / "wuhan_dem.tif").resolve()
+    output_path.touch()
+
+    class FakeCrs:
+        def isValid(self):
+            return True
+
+        def authid(self):
+            return "EPSG:32649"
+
+    class FakeExtent:
+        def isNull(self):
+            return True
+
+    class FakeLayer:
+        def id(self):
+            return "already-loaded-raster"
+
+        def name(self):
+            return "wuhan_dem"
+
+        def type(self):
+            return 1
+
+        def source(self):
+            return str(output_path)
+
+        def crs(self):
+            return FakeCrs()
+
+        def extent(self):
+            return FakeExtent()
+
+        def isValid(self):
+            return True
+
+    existing_layer = FakeLayer()
+
+    class FakeProject:
+        def __init__(self):
+            self.added = []
+
+        def mapLayers(self):
+            return {existing_layer.id(): existing_layer}
+
+        def addMapLayer(self, layer):
+            self.added.append(layer)
+
+    project = FakeProject()
+    constructed = []
+
+    class FakeProjectClass:
+        @staticmethod
+        def instance():
+            return project
+
+    class FakeRasterLayer:
+        def __init__(self, path, name):
+            constructed.append((path, name))
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.tools.code_execution._qgis_classes",
+        lambda: {
+            "QgsProject": FakeProjectClass,
+            "QgsRasterLayer": FakeRasterLayer,
+            "QgsVectorLayer": object,
+        },
+    )
+
+    loaded = _load_output_layers(
+        [
+            {
+                "path": str(output_path),
+                "name": "wuhan_dem",
+                "type": "raster",
+                "verified": True,
+            }
+        ],
+        session_db=None,
+        session_id="session",
+        qgis_executor=lambda operation: operation(),
+    )
+
+    assert project.added == []
+    assert constructed == []
+    assert loaded[0]["id"] == "already-loaded-raster"
+    assert loaded[0]["reused"] is True
 
 
 def test_unrecognized_writer_is_not_rejected_before_confirmation(tmp_path: Path):

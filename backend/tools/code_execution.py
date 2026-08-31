@@ -238,16 +238,8 @@ def validate_execute_gis_code_arguments(arguments: dict[str, Any]) -> dict[str, 
     expected_outputs = arguments.get("expected_outputs") or []
     if not isinstance(expected_outputs, list):
         return None
-    uncreated_inputs = find_uncreated_workspace_inputs(code)
     issues = find_generated_code_issues(code)
     issues[:0] = find_expected_output_contract_issues(expected_outputs)
-    if uncreated_inputs:
-        issues.insert(
-            0,
-            "以下工作目录输入在当前完整脚本中尚未创建："
-            + "、".join(uncreated_inputs)
-            + "；每次 execute_gis_code 都使用全新的空工作目录，重试必须从原始 QGIS 图层开始重新执行全部步骤",
-        )
     if not issues:
         return None
     return {
@@ -455,130 +447,6 @@ def find_generated_code_issues(code: str) -> list[str]:
                     "字段名中包含 ?? 乱码占位符；必须使用 inspect_layer 返回的真实字段名，中间输出优先使用 ASCII 别名",
                 )
     return issues
-
-
-def find_uncreated_workspace_inputs(code: str) -> list[str]:
-    """Find file inputs which incorrectly assume a previous execution workspace."""
-    if not code.strip():
-        return []
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []
-
-    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
-    workspace_base_vars = {"QGIS_AGENT_WORKSPACE"}
-    workspace_path_vars: dict[str, set[str]] = {}
-    changed = True
-    while changed:
-        changed = False
-        for assignment in assignments:
-            referenced_names = {
-                node.id for node in ast.walk(assignment.value) if isinstance(node, ast.Name)
-            }
-            uses_workspace = bool(referenced_names.intersection(workspace_base_vars))
-            path_names = _workspace_path_names(
-                assignment.value,
-                workspace_base_vars,
-                workspace_path_vars,
-            )
-            for target in assignment.targets:
-                if not isinstance(target, ast.Name):
-                    continue
-                if uses_workspace and target.id not in workspace_base_vars:
-                    workspace_base_vars.add(target.id)
-                    changed = True
-                if path_names and not path_names.issubset(
-                    workspace_path_vars.get(target.id, set())
-                ):
-                    workspace_path_vars.setdefault(target.id, set()).update(path_names)
-                    changed = True
-
-    written: set[str] = set()
-    missing: list[str] = []
-    calls = sorted(
-        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
-        key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
-    )
-    for call in calls:
-        func_name = _call_name(call.func)
-        if func_name == "open" and call.args:
-            path_names = _workspace_path_names(
-                call.args[0], workspace_base_vars, workspace_path_vars
-            )
-            mode = _literal_string(call.args[1]) if len(call.args) > 1 else "r"
-            if any(flag in (mode or "") for flag in "wax+"):
-                written.update(path_names)
-            else:
-                _append_missing_paths(missing, path_names.difference(written))
-            continue
-        if func_name.endswith((".write_text", ".write_bytes")) and isinstance(
-            call.func, ast.Attribute
-        ):
-            written.update(
-                _workspace_path_names(
-                    call.func.value,
-                    workspace_base_vars,
-                    workspace_path_vars,
-                )
-            )
-            continue
-        if func_name != "processing.run" or len(call.args) < 2:
-            continue
-        parameters = _literal_dict_items(call.args[1])
-        output_names: set[str] = set()
-        for key, value in parameters.items():
-            path_names = _workspace_path_names(
-                value,
-                workspace_base_vars,
-                workspace_path_vars,
-            )
-            if key in {"OUTPUT", "OUTPUT_LAYER", "OUTPUT_TABLE"}:
-                output_names.update(path_names)
-            elif key == "INPUT" or key.startswith("INPUT_") or key in {
-                "INPUT_2",
-                "JOIN",
-                "OVERLAY",
-                "MASK",
-            }:
-                _append_missing_paths(missing, path_names.difference(written))
-        written.update(output_names)
-    return missing
-
-
-def _workspace_path_names(
-    node: ast.AST,
-    workspace_base_vars: set[str],
-    workspace_path_vars: dict[str, set[str]],
-) -> set[str]:
-    if isinstance(node, ast.Name):
-        return set(workspace_path_vars.get(node.id, set()))
-    referenced_names = {
-        child.id for child in ast.walk(node) if isinstance(child, ast.Name)
-    }
-    names = set()
-    for referenced_name in referenced_names:
-        names.update(workspace_path_vars.get(referenced_name, set()))
-    uses_workspace = bool(referenced_names.intersection(workspace_base_vars))
-    for child in ast.walk(node):
-        if not isinstance(child, ast.Constant) or not isinstance(child.value, str):
-            continue
-        candidate = _candidate_output_path(child.value)
-        if not candidate:
-            continue
-        raw_path = child.value.strip()
-        is_relative = not Path(raw_path).is_absolute() and not PureWindowsPath(raw_path).drive
-        normalized_path = raw_path.replace("\\", "/").lower()
-        is_agent_workspace = ".qgis_hermes_agent/workspaces/" in normalized_path
-        if uses_workspace or is_relative or is_agent_workspace:
-            names.add(_output_filename(candidate))
-    return names
-
-
-def _append_missing_paths(missing: list[str], names: set[str]) -> None:
-    for name in sorted(names):
-        if name not in missing:
-            missing.append(name)
 
 
 def _is_processing_output_path_expression(
@@ -1232,6 +1100,11 @@ def _load_output_layers(
             if not path or not Path(path).exists():
                 raise ValueError(f"输出文件不存在，无法加载：{path}")
             name = str(output.get("name") or Path(path).stem)
+            existing_layer = _find_loaded_output_layer(project, path)
+            if existing_layer is not None and existing_layer.isValid():
+                _snapshot(session_db, session_id, existing_layer, "generated_reused")
+                loaded.append({**_layer_summary(existing_layer), "reused": True})
+                continue
             layer_type = _infer_layer_type(path, output_type)
             if layer_type == "raster":
                 layer = classes["QgsRasterLayer"](path, name)
@@ -1245,3 +1118,20 @@ def _load_output_layers(
         return loaded
 
     return _run_qgis(qgis_executor, operation)
+
+
+def _find_loaded_output_layer(project, path: str):
+    """Return an already loaded layer backed by the same output file."""
+    try:
+        target = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for layer in project.mapLayers().values():
+        try:
+            raw_source = str(layer.source() or "").split("|", 1)[0]
+            source = Path(raw_source).expanduser().resolve()
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            continue
+        if source == target:
+            return layer
+    return None

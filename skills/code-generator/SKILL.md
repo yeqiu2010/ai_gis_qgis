@@ -47,6 +47,7 @@ metadata:
 - 阶段上下文中的 `processing_algorithm_evidence` 是服务端跨上下文压缩保留的本轮权威详情，包含允许参数和 Catalog 示例。生成代码必须直接依据它；不得把搜索摘要、旧会话知识或代码注释中的说法当成参数证据。
 - 多步骤任务生成一份完整脚本；中间结果在脚本内显式衔接，整个任务只调用一次
   `execute_gis_code`。
+- 中间结果可以通过 Processing 返回字典、路径变量、GDAL/Writer 或 Python I/O 继续传递；执行前检查不会尝试穷举这些写法，最终文件统一由执行后的 `verified` 产物验证确认。
 - 任一输入超过 10 万要素时，不得生成对两个图层执行 `getFeatures()` 的嵌套循环。
 - 大图层空间筛选必须使用 Processing/数据源空间索引，并先缩小候选范围再做精确判断。
 - 分析查询遇到空几何或无效几何时，使用 `context = QgsProcessingContext()` 和 `context.setInvalidGeometryCheck(Qgis.InvalidGeometryCheck.GeometrySkipInvalid)` 排除这些要素，并在输出摘要中说明。`InvalidGeometryCheck` 枚举属于 `Qgis`，严禁写成 `QgsProcessingContext.InvalidGeometryCheck`。代码必须导入 `from qgis.core import Qgis, QgsProcessingContext`，或确认两者都在执行命名空间中。除非用户明确要求修复数据，否则禁止生成 `native:fixgeometries`。

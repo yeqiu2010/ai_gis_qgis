@@ -52,7 +52,7 @@ metadata:
 - 调用不存在的 `QgsProject.addVectorLayer`，或猜测未在算法详情中出现的结果键（如 `OUTPUT_COUNT`）。
 - 对已经列入 `expected_outputs`、将由执行器自动加载的最终 vector/raster 文件，又手工创建 `QgsRasterLayer`/`QgsVectorLayer` 并调用 `addMapLayer()`，导致结果图层重复加载。
 
-不要尝试通过穷举 Processing、GDAL、Writer 或 Python 文件 API 来静态证明输出一定会生成。代码审查只检查声明式输出契约、安全边界和确定性的 API 错误；文件是否存在、非空且可被对应 GIS 驱动打开，以执行后的 `verified` 结果为唯一依据。
+不要尝试通过穷举 Processing、GDAL、Writer 或 Python 文件 API 来静态证明输出一定会生成，也不要根据不完整的静态数据流推断工作目录中的中间文件尚未创建。代码审查只检查声明式输出契约、安全边界和确定性的 API 错误；文件是否存在、非空且可被对应 GIS 驱动打开，以执行后的 `verified` 结果为唯一依据。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
 - 把 `QgsColorRampShader` 直接传给 `QgsSingleBandPseudoColorRenderer` 构造器或 `renderer.setShader()`；二者要求 `QgsRasterShader`，必须先用 `setRasterShaderFunction()` 包装颜色函数。
