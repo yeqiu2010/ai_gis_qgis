@@ -7,6 +7,7 @@ import re
 import shutil
 from pathlib import Path, PureWindowsPath
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from ...database.session_db import SessionDB
 from ..executor.qgis_executor import QGISCodeExecutor
@@ -70,8 +71,10 @@ def build_execute_gis_code_tool(
 
         executor = QGISCodeExecutor(executor_config)
         use_current_qgis = qgis_executor is not None and executor.execution_mode == "current_qgis"
+        preexisting_layer_ids: set[str] | None = None
         if use_current_qgis:
             assert qgis_executor is not None
+            preexisting_layer_ids = _project_layer_ids(qgis_executor)
             result = qgis_executor(
                 lambda: executor.execute_current_qgis(
                     code=code,
@@ -95,6 +98,7 @@ def build_execute_gis_code_tool(
                     session_db=session_db,
                     session_id=session_id,
                     qgis_executor=qgis_executor,
+                    preexisting_layer_ids=preexisting_layer_ids,
                 )
             except Exception as exc:
                 load_errors.append(str(exc))
@@ -1080,6 +1084,7 @@ def _load_output_layers(
     session_db: SessionDB | None,
     session_id: str,
     qgis_executor=None,
+    preexisting_layer_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     loadable_outputs = [
         output
@@ -1100,7 +1105,13 @@ def _load_output_layers(
             if not path or not Path(path).exists():
                 raise ValueError(f"输出文件不存在，无法加载：{path}")
             name = str(output.get("name") or Path(path).stem)
-            existing_layer = _find_loaded_output_layer(project, path)
+            existing_layer = _find_loaded_output_layer(
+                project,
+                path,
+                output_name=name,
+                output_type=output_type,
+                preexisting_layer_ids=preexisting_layer_ids,
+            )
             if existing_layer is not None and existing_layer.isValid():
                 _snapshot(session_db, session_id, existing_layer, "generated_reused")
                 loaded.append({**_layer_summary(existing_layer), "reused": True})
@@ -1120,18 +1131,118 @@ def _load_output_layers(
     return _run_qgis(qgis_executor, operation)
 
 
-def _find_loaded_output_layer(project, path: str):
-    """Return an already loaded layer backed by the same output file."""
+def _project_layer_ids(qgis_executor) -> set[str] | None:
+    """Snapshot project layer IDs before generated code mutates the project."""
     try:
-        target = Path(path).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
+        return set(
+            _run_qgis(
+                qgis_executor,
+                lambda: _qgis_classes()["QgsProject"].instance().mapLayers().keys(),
+            )
+        )
+    except Exception:
+        # Source URI matching still provides a safe fallback if a project
+        # snapshot cannot be collected in a particular QGIS host.
         return None
+
+
+def _find_loaded_output_layer(
+    project,
+    path: str,
+    *,
+    output_name: str = "",
+    output_type: str = "",
+    preexisting_layer_ids: set[str] | None = None,
+):
+    """Return a layer already loaded by generated code for this output."""
+    target_paths = _local_source_paths(path)
+    for layer in project.mapLayers().values():
+        if any(
+            _same_local_file(target, source)
+            for target in target_paths
+            for raw_source in _layer_source_values(layer)
+            for source in _local_source_paths(raw_source)
+        ):
+            return layer
+
+    # Some providers expose decorated or opaque data-source URIs. Only fall
+    # back to name/type matching for layers created by this exact execution;
+    # this prevents an older same-named project layer from being reused.
+    if preexisting_layer_ids is None:
+        return None
+    candidates = []
+    normalized_name = output_name.strip().casefold()
     for layer in project.mapLayers().values():
         try:
-            raw_source = str(layer.source() or "").split("|", 1)[0]
-            source = Path(raw_source).expanduser().resolve()
-        except (AttributeError, OSError, RuntimeError, ValueError):
+            if str(layer.id()) in preexisting_layer_ids:
+                continue
+            if str(layer.name() or "").strip().casefold() != normalized_name:
+                continue
+            if (
+                output_type
+                and _infer_layer_type(str(layer.source() or ""), None) != output_type
+            ):
+                layer_kind = (
+                    "raster"
+                    if layer.type() == 1
+                    else "vector"
+                    if layer.type() == 0
+                    else ""
+                )
+                if layer_kind != output_type:
+                    continue
+        except (AttributeError, RuntimeError, ValueError):
             continue
-        if source == target:
-            return layer
+        candidates.append(layer)
+    if len(candidates) == 1:
+        return candidates[0]
     return None
+
+
+def _layer_source_values(layer) -> list[str]:
+    """Collect source strings exposed by a QGIS layer and its provider."""
+    values: list[str] = []
+    try:
+        values.append(str(layer.source() or ""))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        provider = layer.dataProvider()
+        if provider is not None:
+            values.append(str(provider.dataSourceUri() or ""))
+    except (AttributeError, RuntimeError):
+        pass
+    return [value for value in dict.fromkeys(values) if value]
+
+
+def _local_source_paths(value: str) -> list[Path]:
+    """Extract local paths from common QGIS/GDAL source URI forms."""
+    raw = unquote(str(value or "").strip().strip("\"'"))
+    if not raw:
+        return []
+    raw = raw.split("|", 1)[0]
+    quoted_path = re.match(r'^[A-Za-z0-9_]+:"([^"]+)"(?::.*)?$', raw)
+    if quoted_path:
+        raw = quoted_path.group(1)
+    if raw.casefold().startswith("file:"):
+        parsed = urlparse(raw)
+        raw = unquote(parsed.path)
+        if parsed.netloc:
+            raw = f"//{parsed.netloc}{raw}"
+        elif re.match(r"^/[A-Za-z]:/", raw):
+            raw = raw[1:]
+    try:
+        return [Path(raw).expanduser().resolve()]
+    except (OSError, RuntimeError, ValueError):
+        return []
+
+
+def _same_local_file(left: Path, right: Path) -> bool:
+    try:
+        if left.exists() and right.exists():
+            return left.samefile(right)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    normalized_left = str(left).replace("\\", "/").casefold()
+    normalized_right = str(right).replace("\\", "/").casefold()
+    return normalized_left == normalized_right

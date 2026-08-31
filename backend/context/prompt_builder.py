@@ -148,7 +148,8 @@ class PromptBuilder:
             "重新检索同一算法或再次执行等价代码。duplicate_prevented=true 表示必须复用已有结果。"
             "代码会在当前已打开的 QGIS Python 环境中执行，不能创建 QgsApplication/QApplication，"
             "不能初始化或启动新的 QGIS。"
-            "用户要求生成/导出文件时，expected_outputs 必须列出每个输出文件，vector/raster 输出会自动加载到 QGIS。"
+            "用户要求生成/导出文件时，expected_outputs 必须列出每个输出文件，vector/raster 输出会自动加载到 QGIS；"
+            "生成代码不得再用 QgsRasterLayer/QgsVectorLayer 和 QgsProject.addMapLayer() 手动加载这些最终输出，否则会产生重复图层。"
             "仅需 stdout 最终统计结论或直接调整当前图层样式时，expected_outputs 可以为空。"
             "不得让代码做用户未要求的源数据修改；用户明确要求的 renderer/样式调整可以作用于当前图层并触发重绘。"
         )

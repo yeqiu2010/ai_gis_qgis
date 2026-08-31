@@ -2613,7 +2613,10 @@ def test_output_loader_reuses_layer_already_loaded_by_generated_code(
             return 1
 
         def source(self):
-            return str(output_path)
+            return output_path.as_uri()
+
+        def dataProvider(self):
+            return None
 
         def crs(self):
             return FakeCrs()
@@ -2674,6 +2677,116 @@ def test_output_loader_reuses_layer_already_loaded_by_generated_code(
     assert project.added == []
     assert constructed == []
     assert loaded[0]["id"] == "already-loaded-raster"
+    assert loaded[0]["reused"] is True
+
+
+def test_output_loader_reuses_new_same_named_layer_when_provider_uri_is_opaque(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = (tmp_path / "wuhan_slope.tif").resolve()
+    output_path.touch()
+
+    class FakeCrs:
+        def isValid(self):
+            return True
+
+        def authid(self):
+            return "EPSG:32649"
+
+    class FakeExtent:
+        def isNull(self):
+            return True
+
+    class FakeLayer:
+        def __init__(self, layer_id, name, source):
+            self._layer_id = layer_id
+            self._name = name
+            self._source = source
+
+        def id(self):
+            return self._layer_id
+
+        def name(self):
+            return self._name
+
+        def type(self):
+            return 1
+
+        def source(self):
+            return self._source
+
+        def dataProvider(self):
+            return None
+
+        def crs(self):
+            return FakeCrs()
+
+        def extent(self):
+            return FakeExtent()
+
+        def isValid(self):
+            return True
+
+    old_layer = FakeLayer("old-slope", "wuhan_slope", "opaque:old-output")
+    generated_layer = FakeLayer(
+        "generated-slope",
+        "wuhan_slope",
+        "opaque:generated-output",
+    )
+
+    class FakeProject:
+        def __init__(self):
+            self.added = []
+
+        def mapLayers(self):
+            return {
+                old_layer.id(): old_layer,
+                generated_layer.id(): generated_layer,
+            }
+
+        def addMapLayer(self, layer):
+            self.added.append(layer)
+
+    project = FakeProject()
+    constructed = []
+
+    class FakeProjectClass:
+        @staticmethod
+        def instance():
+            return project
+
+    class FakeRasterLayer:
+        def __init__(self, path, name):
+            constructed.append((path, name))
+
+    monkeypatch.setattr(
+        "ai_gis_qgis.backend.tools.code_execution._qgis_classes",
+        lambda: {
+            "QgsProject": FakeProjectClass,
+            "QgsRasterLayer": FakeRasterLayer,
+            "QgsVectorLayer": object,
+        },
+    )
+
+    loaded = _load_output_layers(
+        [
+            {
+                "path": str(output_path),
+                "name": "wuhan_slope",
+                "type": "raster",
+                "verified": True,
+            }
+        ],
+        session_db=None,
+        session_id="session",
+        qgis_executor=lambda operation: operation(),
+        preexisting_layer_ids={"old-slope"},
+    )
+
+    assert project.added == []
+    assert constructed == []
+    assert loaded[0]["id"] == "generated-slope"
     assert loaded[0]["reused"] is True
 
 
@@ -3798,6 +3911,7 @@ def test_prompt_builder_routes_complex_analysis_to_pipeline():
     assert "{\"skill_name\":\"qgis-toolbox\"}" in prompt
     assert "不要在 main-orchestrator 中直接调用 execute_gis_code" in prompt
     assert "500m.shp" in prompt
+    assert "QgsProject.addMapLayer()" in prompt
 
 
 def test_record_pipeline_stage_emits_events_and_stores_artifact(tmp_path: Path):
