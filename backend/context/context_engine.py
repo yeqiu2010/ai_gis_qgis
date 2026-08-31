@@ -100,7 +100,11 @@ class QGISContextEngine:
         self.context_window_tokens = max(0, int(context_window_tokens))
         self.max_output_tokens = max(1, int(max_output_tokens))
         self.minimum_output_tokens = max(1, int(minimum_output_tokens))
-        self.safety_tokens = max(64, int(safety_tokens))
+        proportional_safety = int(self.context_window_tokens * 0.01)
+        self.safety_tokens = min(
+            4096,
+            max(256, int(safety_tokens), proportional_safety),
+        )
         self.soft_threshold_ratio = min(0.85, max(0.25, float(soft_threshold_ratio)))
         self.max_inline_tool_result_chars = max(400, int(max_inline_tool_result_chars))
         self._tool_reducers: dict[str, ToolContextReducer] = {}

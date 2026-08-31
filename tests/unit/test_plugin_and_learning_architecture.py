@@ -27,6 +27,7 @@ class StructuredToolProvider:
             return ChatResponse(
                 content="",
                 model=self.model,
+                reasoning_content="需要先调用图层工具。",
                 finish_reason="tool_calls",
                 tool_calls=[ToolCall(id="layers-1", name="list_layers", arguments={})],
             )
@@ -45,6 +46,7 @@ def test_agent_uses_native_assistant_tool_chain(tmp_path: Path):
 
     second_call = provider.messages[1]
     assert second_call[-2].role == "assistant"
+    assert second_call[-2].reasoning_content == "需要先调用图层工具。"
     assert second_call[-2].tool_calls[0]["id"] == "layers-1"
     assert second_call[-1].role == "tool"
     assert second_call[-1].tool_call_id == "layers-1"

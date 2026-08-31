@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     content TEXT,
+    reasoning_content TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,

@@ -13,10 +13,13 @@ class ChatMessage:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    reasoning_content: str | None = None
 
-    def as_api_message(self) -> dict[str, Any]:
+    def as_api_message(self, *, include_reasoning_content: bool = True) -> dict[str, Any]:
         """Return an OpenAI-compatible message without lossy text wrapping."""
         message: dict[str, Any] = {"role": self.role, "content": self.content}
+        if include_reasoning_content and self.reasoning_content is not None:
+            message["reasoning_content"] = self.reasoning_content
         if self.tool_calls:
             message["tool_calls"] = self.tool_calls
         if self.tool_call_id:
@@ -36,6 +39,7 @@ class ChatResponse:
     output_tokens: int = 0
     total_tokens: int = 0
     usage_estimated: bool = False
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True)

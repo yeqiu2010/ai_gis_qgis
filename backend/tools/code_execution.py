@@ -378,6 +378,16 @@ def find_generated_code_issues(code: str) -> list[str]:
                 pseudo_color_renderer_names=pseudo_color_renderer_names,
                 issues=issues,
             )
+            _check_color_ramp_shader_item_call(
+                node,
+                color_ramp_shader_names=color_ramp_shader_names,
+                issues=issues,
+            )
+            _check_color_ramp_shader_range_call(
+                node,
+                color_ramp_shader_names=color_ramp_shader_names,
+                issues=issues,
+            )
         if isinstance(node, ast.Attribute):
             if (
                 isinstance(node.value, ast.Name)
@@ -987,6 +997,53 @@ def _check_raster_shader_call(
         "QgsColorRampShader；必须先创建 QgsRasterShader，调用 "
         "raster_shader.setRasterShaderFunction(color_ramp_shader)，再把 "
         "raster_shader 传给构造器或 setShader",
+    )
+
+
+def _check_color_ramp_shader_item_call(
+    node: ast.Call,
+    *,
+    color_ramp_shader_names: set[str],
+    issues: list[str],
+) -> None:
+    """Reject the nonexistent singular QgsColorRampShader item setter."""
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "setColorRampItem":
+        return
+    if not _is_constructor_instance(
+        node.func.value,
+        constructor_name="QgsColorRampShader",
+        assigned_names=color_ramp_shader_names,
+    ):
+        return
+    _append_issue(
+        issues,
+        "QgsColorRampShader 没有 setColorRampItem；必须先构造 "
+        "QgsColorRampShader.ColorRampItem 列表，再调用 setColorRampItemList(items)",
+    )
+
+
+def _check_color_ramp_shader_range_call(
+    node: ast.Call,
+    *,
+    color_ramp_shader_names: set[str],
+    issues: list[str],
+) -> None:
+    """Reject guessed classification range setters absent from QGIS API."""
+    if not isinstance(node.func, ast.Attribute) or node.func.attr not in {
+        "setClassificationMin",
+        "setClassificationMax",
+    }:
+        return
+    if not _is_constructor_instance(
+        node.func.value,
+        constructor_name="QgsColorRampShader",
+        assigned_names=color_ramp_shader_names,
+    ):
+        return
+    _append_issue(
+        issues,
+        f"QgsColorRampShader 没有 {node.func.attr}；范围应通过构造器的最小值/最大值参数，"
+        "或 setMinimumValue()/setMaximumValue() 设置",
     )
 
 

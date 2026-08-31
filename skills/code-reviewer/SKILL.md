@@ -56,6 +56,8 @@ metadata:
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用
   `from qgis.PyQt...`，例如 `from qgis.PyQt.QtCore import QVariant`。
 - 把 `QgsColorRampShader` 直接传给 `QgsSingleBandPseudoColorRenderer` 构造器或 `renderer.setShader()`；二者要求 `QgsRasterShader`，必须先用 `setRasterShaderFunction()` 包装颜色函数。
+- 调用不存在的 `QgsColorRampShader.setColorRampItem()`；必须构造 `QgsColorRampShader.ColorRampItem` 列表并调用 `setColorRampItemList(items)`。
+- 调用不存在的 `QgsColorRampShader.setClassificationMin()`/`setClassificationMax()`；应使用构造器或 `setMinimumValue()`/`setMaximumValue()`。
 - 创建 Polygon/Line/Point 输出图层，却没有为输出要素调用 `setGeometry`；纯统计结果
   应创建无几何表，要求空间结果时必须保留或聚合真实几何。
 - 分组统计中用赋值覆盖分母字段，例如遍历多栋建筑时反复执行

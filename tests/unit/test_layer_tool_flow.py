@@ -15,7 +15,8 @@ from ai_gis_qgis.backend.executor.qgis_executor import (
     _process_qt_events,
 )
 from ai_gis_qgis.backend.failure_analysis import classify_failure
-from ai_gis_qgis.backend.llm.base_provider import ChatResponse, ToolCall
+from ai_gis_qgis.backend.llm.base_provider import ChatMessage, ChatResponse, ToolCall
+from ai_gis_qgis.backend.llm.errors import LLMRequestRejected
 from ai_gis_qgis.backend.tools.code_execution import (
     build_execute_gis_code_tool,
     find_generated_code_issues,
@@ -75,10 +76,12 @@ class Sam3ContinuationProvider:
     def __init__(self):
         self.calls = 0
         self.messages_by_call = []
+        self.systems_by_call = []
 
     def chat(self, system, messages, tools=None):
         self.calls += 1
         self.messages_by_call.append(messages)
+        self.systems_by_call.append(system)
         if self.calls == 1:
             return ChatResponse(
                 content="",
@@ -650,13 +653,16 @@ class RetryCodeExecutionProvider:
 
     def __init__(self):
         self.calls = 0
+        self.messages: list[list[ChatMessage]] = []
 
     def chat(self, system, messages, tools=None):
         self.calls += 1
+        self.messages.append(list(messages))
         if self.calls == 1:
             return ChatResponse(
                 content="",
                 model=self.model,
+                reasoning_content="需要执行生成的代码。",
                 finish_reason="tool_calls",
                 tool_calls=[
                     ToolCall(
@@ -905,6 +911,34 @@ class FlakyLLMProvider:
         if self.calls <= self.fail_times:
             raise TimeoutError("timed out")
         return ChatResponse(content="模型已恢复。", model=self.model)
+
+
+class RejectedLLMProvider:
+    name = "rejected-llm-test"
+    model = "rejected-llm-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, messages, tools=None):
+        self.calls += 1
+        raise LLMRequestRejected("System message must be at the beginning.")
+
+
+class InlineThinkingQuestionProvider:
+    name = "inline-thinking-question-test"
+    model = "inline-thinking-question-test-model"
+
+    def chat(self, system, messages, tools=None):
+        return ChatResponse(
+            content=(
+                "<think>我需要分析图层和字段。用户没有说明分类字段，"
+                "应该先询问，不能自行猜测。</think>\n\n"
+                "请补充用于区分各类用地的字段名。"
+            ),
+            model=self.model,
+            reasoning_content="结构化推理仍供模型调用链使用。",
+        )
 
 
 class SingleToolProvider:
@@ -1192,7 +1226,8 @@ def test_confirmed_sam3_segmentation_resumes_remaining_user_request(
     )
     assert "提取satellite图层中的植被区域" in continuation_context
     assert "vegetation-layer-id" in continuation_context
-    assert "中间产物，不是任务完成信号" in continuation_context
+    assert "中间产物，不是任务完成信号" in provider.systems_by_call[3]
+    assert all(message.role != "system" for message in provider.messages_by_call[3])
     next_confirmation = next(
         event for event in confirmed_events if event["type"] == "confirm_request"
     )
@@ -1367,6 +1402,12 @@ def test_confirmed_buffer_resumes_plan_and_passes_aoi_layer_to_sam3(
         message.content for message in provider.messages_by_call[1]
     )
     assert "buffer-layer-id" in resumed_context
+    assert all(
+        message.role != "system"
+        for call_messages in provider.messages_by_call
+        for message in call_messages
+    )
+    assert "[CONFIRMED TOOL CONTINUATION]" in provider.systems_by_call[1]
     assert "道路缓冲区应作为后续 SAM3 的" in provider.systems_by_call[2]
     assert "aoi_layer_id" in provider.systems_by_call[2]
     sam_confirmation = next(
@@ -2770,6 +2811,56 @@ renderer_2.setShader(raster_shader_2)
     assert find_generated_code_issues(code) == []
 
 
+def test_rejects_nonexistent_singular_color_ramp_item_setter():
+    invalid_code = """
+color_ramp_shader = QgsColorRampShader(minimum, maximum)
+color_ramp_shader.setColorRampItem(
+    QgsColorRampShader.ColorRampItem(minimum, QColor("blue"), "low")
+)
+"""
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any(
+        "QgsColorRampShader 没有 setColorRampItem" in issue
+        and "setColorRampItemList" in issue
+        for issue in issues
+    )
+
+
+def test_accepts_color_ramp_item_list_setter():
+    valid_code = """
+color_ramp_shader = QgsColorRampShader(minimum, maximum)
+items = [
+    QgsColorRampShader.ColorRampItem(minimum, QColor("blue"), "low"),
+    QgsColorRampShader.ColorRampItem(maximum, QColor("red"), "high"),
+]
+color_ramp_shader.setColorRampItemList(items)
+raster_shader = QgsRasterShader()
+raster_shader.setRasterShaderFunction(color_ramp_shader)
+renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, raster_shader)
+"""
+
+    assert find_generated_code_issues(valid_code) == []
+
+
+def test_rejects_nonexistent_color_ramp_classification_range_setters():
+    invalid_code = """
+color_ramp_shader = QgsColorRampShader()
+color_ramp_shader.setClassificationMin(minimum)
+color_ramp_shader.setClassificationMax(maximum)
+"""
+    issues = find_generated_code_issues(invalid_code)
+
+    assert any(
+        "没有 setClassificationMin" in issue and "setMinimumValue" in issue
+        for issue in issues
+    )
+    assert any(
+        "没有 setClassificationMax" in issue and "setMaximumValue" in issue
+        for issue in issues
+    )
+
+
 def test_classifies_pseudocolor_shader_type_failure_as_generated_code_api():
     failure = classify_failure(
         "QgsSingleBandPseudoColorRenderer.setShader(): argument 1 has unexpected type "
@@ -2778,6 +2869,26 @@ def test_classifies_pseudocolor_shader_type_failure_as_generated_code_api():
 
     assert failure["error_code"] == "generated_code_api"
     assert failure["retryable"] is False
+
+
+def test_classifies_nonexistent_color_ramp_item_setter_as_generated_code_api():
+    failure = classify_failure(
+        "AttributeError: 'QgsColorRampShader' object has no attribute "
+        "'setColorRampItem'"
+    )
+
+    assert failure["error_code"] == "generated_code_api"
+    assert "setColorRampItemList" in str(failure["cause"])
+
+
+def test_classifies_nonexistent_color_ramp_range_setter_as_generated_code_api():
+    failure = classify_failure(
+        "AttributeError: 'QgsColorRampShader' object has no attribute "
+        "'setClassificationMin'"
+    )
+
+    assert failure["error_code"] == "generated_code_api"
+    assert "setMinimumValue" in str(failure["cause"])
 
 
 def test_detects_feature_count_on_processing_output_path_variants():
@@ -3462,6 +3573,18 @@ def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
     assert tool_end_events[0]["payload"]["result"]["success"] is False
     assert tool_end_events[1]["payload"]["result"]["success"] is True
     assert tool_end_events[1]["payload"]["result"]["retry_count"] == 1
+    retry_messages = provider.messages[1]
+    assert retry_messages[-1].role == "user"
+    original_tool_call = next(
+        message
+        for message in retry_messages
+        if message.role == "assistant" and message.tool_calls
+    )
+    assert original_tool_call.reasoning_content == "需要执行生成的代码。"
+    assert any(
+        message.role == "tool" and message.tool_call_id == "call-1"
+        for message in retry_messages
+    )
     final_message = next(event for event in reversed(confirmed_events) if event["type"] == "message")
     assert "自动修复并重试 1 次" in final_message["payload"]["content"]
 
@@ -4151,6 +4274,51 @@ def test_agent_core_retries_llm_provider_failures(tmp_path: Path):
     exported = [json.loads(line) for line in export_path.read_text(encoding="utf-8").splitlines()]
     assert len(exported) == 2
     assert exported[0]["source_type"] == "llm_call"
+
+
+def test_agent_core_does_not_retry_rejected_llm_request(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="llm rejected", model="rejected", source="test")
+    provider = RejectedLLMProvider()
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        llm_retry_delay_seconds=0,
+    ).run(session_id=session.id, user_message="你好")
+
+    assert provider.calls == 1
+    assert not any(
+        event["type"] == "thinking" and "正在重试" in event["payload"].get("message", "")
+        for event in events
+    )
+    final_message = next(event for event in reversed(events) if event["type"] == "message")
+    assert "系统已停止无效重试" in final_message["payload"]["content"]
+
+
+def test_agent_hides_inline_thinking_when_asking_for_user_input(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="clarification", model="thinking", source="test")
+
+    events = AgentCore(
+        session_db=session_db,
+        llm_provider=InlineThinkingQuestionProvider(),
+        iface=None,
+    ).run(session_id=session.id, user_message="统计各类用地建筑量")
+
+    final_message = next(event for event in reversed(events) if event["type"] == "message")
+    assert final_message["payload"]["content"] == "请补充用于区分各类用地的字段名。"
+    deltas = "".join(
+        str(event["payload"].get("delta") or "")
+        for event in events
+        if event["type"] == "message_delta"
+    )
+    assert deltas == "请补充用于区分各类用地的字段名。"
+    assert "think" not in deltas
+    assert "自行猜测" not in deltas
+    saved = session_db.get_messages(session.id, limit=10)
+    assert saved[-1]["content"] == "请补充用于区分各类用地的字段名。"
 
 
 def test_search_messages_treats_dotted_query_as_literal_terms(tmp_path: Path):

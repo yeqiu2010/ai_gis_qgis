@@ -548,10 +548,24 @@ function normalizeHistoryMessage(message: ChatMessage): ChatMessage {
   if (message.role === 'assistant') {
     return {
       ...message,
+      content: stripModelThinking(message.content),
       event_type: message.event_type === 'error' ? 'error' : 'summary'
     }
   }
   return message
+}
+
+function stripModelThinking(content: string) {
+  return content
+    .replace(
+      /<\s*(think|thinking|reasoning|analysis)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
+      ''
+    )
+    .replace(/```(?:think|thinking|reasoning|analysis)\s*\r?\n[\s\S]*?```/gi, '')
+    .replace(/<\s*(?:think|thinking|reasoning|analysis)\b[^>]*>[\s\S]*$/gi, '')
+    .replace(/<\s*\/?\s*(?:think|thinking|reasoning|analysis)\b[^>]*>/gi, '')
+    .replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n')
+    .trim()
 }
 
 function stageLabel(name: string) {
@@ -585,17 +599,18 @@ function appendAssistantDelta(runId: string, delta: string) {
 }
 
 function finalizeAssistantMessage(runId: string, content: string) {
+  const visibleContent = stripModelThinking(content)
   if (streamingRunId.value === runId && streamingMessageIndex.value !== null) {
     messages.value[streamingMessageIndex.value] = {
       role: 'assistant',
-      content,
+      content: visibleContent,
       event_type: 'summary',
       run_id: runId
     }
   } else {
     messages.value.push({
       role: 'assistant',
-      content,
+      content: visibleContent,
       event_type: 'summary',
       run_id: runId
     })
@@ -826,7 +841,7 @@ async function waitForPaint() {
             />
           </label>
           <label>
-            <span>Max Tokens</span>
+            <span>单次最大输出（Max Tokens）</span>
             <input
               v-model.number="settingsForm.max_tokens"
               type="number"
@@ -836,7 +851,7 @@ async function waitForPaint() {
             />
           </label>
           <label>
-            <span>Context Window</span>
+            <span>模型总上下文（Context Window）</span>
             <input
               v-model.number="settingsForm.max_context_tokens"
               type="number"

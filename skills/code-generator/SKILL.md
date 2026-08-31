@@ -24,6 +24,8 @@ metadata:
 - 仅需面积、数量、最值等统计结论时，可以不创建文件；代码把完整最终结论清晰打印到 stdout，并使用 `expected_outputs=[]`。
 - 用户只要求调整当前栅格/矢量图层的符号系统、色带、分类或其他显示样式时，可以直接更新该图层 renderer、触发重绘并使用 `expected_outputs=[]`；不要为了通过检查虚构 QML 或栅格输出文件。
 - 单波段伪彩色渲染必须使用正确的三层对象链：`QgsColorRampShader` 是着色函数，先用 `raster_shader = QgsRasterShader()` 和 `raster_shader.setRasterShaderFunction(color_ramp_shader)` 包装，再调用 `QgsSingleBandPseudoColorRenderer(layer.dataProvider(), band, raster_shader)`。构造器第三个参数及 `renderer.setShader()` 都严禁直接传 `QgsColorRampShader`。
+- `QgsColorRampShader` 没有 `setColorRampItem()`；手工设置色带节点时必须先构造 `QgsColorRampShader.ColorRampItem(value, color, label)` 列表，再一次调用 `color_ramp_shader.setColorRampItemList(items)`。
+- `QgsColorRampShader` 没有 `setClassificationMin()`/`setClassificationMax()`；范围应在构造器中传入，或使用继承的 `setMinimumValue()`/`setMaximumValue()`。
 - QGIS 4 栅格色带优先使用 `Qgis.ShaderInterpolationMethod.Linear/Discrete/Exact` 和 `Qgis.ShaderClassificationMethod.Continuous/EqualInterval/Quantile`。相等间隔 7 类应设置 `EqualInterval` 后调用 `color_ramp_shader.classifyColorRamp(7, band, layer.extent(), layer.dataProvider())`。
 - 连续拉伸可以给 `QgsColorRampShader` 设置最小值、最大值、`Linear` 插值以及深色/浅色端点；分类图则使用独立的颜色函数、`EqualInterval` 和明确类别数。每个 renderer 都创建自己的 `QgsRasterShader`，不要在多个 renderer 间复用已被接管所有权的 shader。
 - 用户要求从同一数据生成多种样式的 QGIS 栅格图层、但未要求导出文件时，可以从源数据 URI 创建多个独立 `QgsRasterLayer`，分别设置 renderer 后用 `QgsProject.instance().addMapLayer()` 加入工程，并使用 `expected_outputs=[]`；不要无故复制底层栅格文件。

@@ -107,6 +107,7 @@ class SessionDB:
         tool_call_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_name: str | None = None,
+        reasoning_content: str | None = None,
     ) -> int:
         timestamp = time.time()
         artifact_json = json.dumps(stage_artifact, ensure_ascii=False) if stage_artifact else None
@@ -117,8 +118,8 @@ class SessionDB:
                 INSERT INTO messages (
                     session_id, role, content, timestamp, finish_reason,
                     stage_name, stage_artifact, event_type, run_id,
-                    tool_call_id, tool_calls, tool_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tool_call_id, tool_calls, tool_name, reasoning_content
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -133,6 +134,7 @@ class SessionDB:
                     tool_call_id,
                     json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
                     tool_name,
+                    reasoning_content,
                 ),
             )
             connection.execute(
@@ -277,7 +279,7 @@ class SessionDB:
             rows = connection.execute(
                 """
                 SELECT id, role, content, timestamp, event_type, finish_reason,
-                       tool_call_id, tool_calls, tool_name
+                       tool_call_id, tool_calls, tool_name, reasoning_content
                 FROM messages
                 WHERE session_id = ?
                   AND role IN ('user', 'assistant', 'tool')
@@ -317,7 +319,7 @@ class SessionDB:
             historical = connection.execute(
                 """
                 SELECT id, role, content, timestamp, event_type, finish_reason,
-                       tool_call_id, tool_calls, tool_name
+                       tool_call_id, tool_calls, tool_name, reasoning_content
                 FROM messages
                 WHERE session_id = ?
                   AND id < ?
@@ -333,7 +335,7 @@ class SessionDB:
             active = connection.execute(
                 """
                 SELECT id, role, content, timestamp, event_type, finish_reason,
-                       tool_call_id, tool_calls, tool_name
+                       tool_call_id, tool_calls, tool_name, reasoning_content
                 FROM messages
                 WHERE session_id = ?
                   AND id >= ?

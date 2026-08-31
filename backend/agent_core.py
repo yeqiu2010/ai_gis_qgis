@@ -19,7 +19,8 @@ from .context.prompt_builder import PromptBuilder
 from .context.qgis_context import QGISContext
 from .iteration_budget import IterationBudget
 from .llm.base_provider import ChatMessage, ChatResponse, LLMProvider
-from .llm.errors import ContextWindowExceeded
+from .llm.content_filter import strip_hidden_reasoning
+from .llm.errors import ContextWindowExceeded, LLMRequestRejected
 from .plugin_system import PluginManager
 from .processing.algorithm_evidence import (
     compact_processing_evidence,
@@ -567,6 +568,7 @@ class AgentCore:
                             finish_reason=response.finish_reason,
                             run_id=run_id,
                             tool_calls=self._tool_calls_payload([call]),
+                            reasoning_content=response.reasoning_content,
                         )
                         active_task = self.session_db.get_active_task(session_id)
                         if active_task is not None:
@@ -717,6 +719,7 @@ class AgentCore:
                             tool_registry=tool_registry,
                             publish=publish,
                             model=response.model,
+                            reasoning_content=response.reasoning_content,
                         )
                         return events
                     budget.record_tool_call()
@@ -763,16 +766,17 @@ class AgentCore:
 
             if check_cancelled():
                 return events
+            visible_content = self._visible_model_content(response.content)
             self.session_db.save_message(
                 session_id,
                 "assistant",
-                response.content,
+                visible_content,
                 event_type="summary",
                 finish_reason=response.finish_reason,
                 run_id=run_id,
             )
             self._publish_message_deltas(
-                response.content,
+                visible_content,
                 publish=publish,
                 session_id=session_id,
                 run_id=run_id,
@@ -783,7 +787,7 @@ class AgentCore:
                     "message",
                     {
                         "role": "assistant",
-                        "content": response.content,
+                        "content": visible_content,
                         "model": response.model,
                     },
                     session_id=session_id,
@@ -1104,16 +1108,12 @@ class AgentCore:
             "只有全部步骤和交付物完成后才能最终回复。"
         )
         # The confirmed result is already persisted as a role=tool message.
-        # Keep only a short policy reminder; never serialize the result again
-        # as assistant-authored text.
-        messages.append(
-            ChatMessage(
-                role="system",
-                content=(
-                    "已确认工具的结果是当前请求的中间产物，不是任务完成信号。"
-                    + continuation_instruction
-                ),
-            )
+        # Keep the continuation policy in the leading system prompt: strict
+        # OpenAI-compatible providers reject system messages later in history.
+        system_prompt = (
+            f"{system_prompt}\n\n[CONFIRMED TOOL CONTINUATION]\n"
+            "已确认工具的结果是当前请求的中间产物，不是任务完成信号。"
+            f"{continuation_instruction}"
         )
         budget = IterationBudget()
         last_response: ChatResponse | None = None
@@ -1174,7 +1174,7 @@ class AgentCore:
                         )
                     )
                     continue
-                return response.content, False
+                return self._visible_model_content(response.content), False
 
             messages.append(self._assistant_tool_message(response))
             tool_results: list[dict[str, Any]] = []
@@ -1335,6 +1335,7 @@ class AgentCore:
                         model=response.model,
                         tool_call_id=call.id,
                         assistant_content=response.content,
+                        reasoning_content=response.reasoning_content,
                     )
                     return "", True
 
@@ -1475,7 +1476,7 @@ class AgentCore:
                 return self._format_tool_failure(failed_tool, failed_result), False
 
         if last_response is not None and last_response.content:
-            return last_response.content, False
+            return self._visible_model_content(last_response.content), False
         return "任务未完成：确认后的后续处理达到迭代或工具预算。", False
 
     def _build_tool_registry(self, session_id: str) -> ToolRegistry:
@@ -2032,6 +2033,7 @@ class AgentCore:
         model: str,
         tool_call_id: str | None = None,
         assistant_content: str = "",
+        reasoning_content: str | None = None,
     ) -> None:
         entry = tool_registry.get(tool_name)
         confirmation_id = str(uuid.uuid4())
@@ -2066,6 +2068,7 @@ class AgentCore:
                     },
                 }
             ],
+            reasoning_content=reasoning_content,
         )
         active_task = self.session_db.get_active_task(session_id)
         if active_task is not None:
@@ -2359,7 +2362,7 @@ class AgentCore:
                     tools=tools,
                 )
             except Exception as exc:
-                if isinstance(exc, ContextWindowExceeded):
+                if isinstance(exc, (ContextWindowExceeded, LLMRequestRejected)):
                     raise
                 last_exc = exc
                 if session_id:
@@ -2417,10 +2420,7 @@ class AgentCore:
         if input_tokens == 0:
             input_payload: dict[str, Any] = {
                 "system": system,
-                "messages": [
-                    {"role": message.role, "content": message.content}
-                    for message in messages
-                ],
+                "messages": [message.as_api_message() for message in messages],
             }
             if tools:
                 input_payload["tools"] = tools
@@ -2431,6 +2431,7 @@ class AgentCore:
         if output_tokens == 0:
             output_payload = {
                 "content": response.content,
+                "reasoning_content": response.reasoning_content,
                 "tool_calls": [
                     {
                         "id": call.id,
@@ -2462,12 +2463,25 @@ class AgentCore:
         ascii_chars = len(text) - non_ascii
         return max(1, int(ascii_chars / 4 + non_ascii * 1.1))
 
+    @staticmethod
+    def _visible_model_content(content: str) -> str:
+        visible = strip_hidden_reasoning(content)
+        if visible:
+            return visible
+        return "模型未返回可展示的答复，请补充任务所需信息或重试。"
+
     def _format_llm_error(self, exc: Exception) -> str:
         if isinstance(exc, ContextWindowExceeded):
             return (
                 "当前会话上下文过大，系统无法在保留 GIS 任务状态的同时为完整回答预留足够空间。\n"
                 f"错误原因：{self._short_error(exc)}\n"
                 "请检查模型 Context Window 配置；完整历史仍保存在会话数据库中。"
+            )
+        if isinstance(exc, LLMRequestRejected):
+            return (
+                "模型服务拒绝了本次请求，系统已停止无效重试。\n"
+                f"错误原因：{self._short_error(exc)}\n"
+                "请检查所用模型的 OpenAI-compatible 消息格式与参数兼容性。"
             )
         return (
             "Agent 暂时无法从 LLM 提供商获得响应。\n"
@@ -2818,12 +2832,13 @@ class AgentCore:
         *,
         original_failed_arguments: dict[str, Any] | None = None,
     ) -> list[ChatMessage]:
-        history = self.session_db.get_conversation_messages(session_id, limit=20)
-        messages = [
-            ChatMessage(role=row["role"], content=row["content"] or "")
-            for row in history
-            if row["role"] in {"user", "assistant"}
-        ]
+        history = self.session_db.get_context_messages(
+            session_id,
+            historical_limit=int(
+                self.context_config.get("historical_message_limit", 8)
+            ),
+        )
+        messages = [self._chat_message_from_row(row) for row in history]
         memory_message = self._build_memory_message(session_id)
         if memory_message is not None:
             messages.insert(0, memory_message)
@@ -2861,7 +2876,11 @@ class AgentCore:
         }
         messages.append(
             ChatMessage(
-                role="assistant",
+                # This is a new instruction turn, not a provider-generated
+                # assistant response.  Keeping it as assistant after a tool
+                # result makes DeepSeek thinking mode require another
+                # reasoning_content field and reject the request with HTTP 400.
+                role="user",
                 content=(
                     "execute_gis_code 执行失败。必须重新生成一份从当前 QGIS 原始图层开始、"
                     "包含原脚本全部步骤的完整自包含代码，再次调用 execute_gis_code。"
@@ -2887,6 +2906,10 @@ class AgentCore:
                     "QgsSingleBandPseudoColorRenderer 的第三个构造参数和 setShader() 都要求 "
                     "QgsRasterShader，不能传 QgsColorRampShader。必须先调用 "
                     "raster_shader.setRasterShaderFunction(color_ramp_shader)，再把 raster_shader 传给 renderer。\n"
+                    "QgsColorRampShader 没有 setColorRampItem()；必须构造 "
+                    "QgsColorRampShader.ColorRampItem 列表并一次调用 setColorRampItemList(items)。\n"
+                    "QgsColorRampShader 没有 setClassificationMin()/setClassificationMax()；"
+                    "应在构造器中传入最小值和最大值，或调用 setMinimumValue()/setMaximumValue()。\n"
                     "native:fieldcalculator 中 FIELD_TYPE=2 是 Text/String，不是 Double；"
                     "密度、比例或除法结果应使用算法证据中的 Decimal/Double 类型，不能仅增大 FIELD_LENGTH。\n"
                     f"原始完整失败调用：{json.dumps(original_payload, ensure_ascii=False)}\n"
@@ -2976,6 +2999,7 @@ class AgentCore:
         return ChatMessage(
             role="assistant",
             content=response.content or "",
+            reasoning_content=response.reasoning_content,
             tool_calls=cls._tool_calls_payload(response.tool_calls),
         )
 
@@ -3013,6 +3037,7 @@ class AgentCore:
             finish_reason=response.finish_reason,
             run_id=run_id,
             tool_calls=self._tool_calls_payload(completed_calls),
+            reasoning_content=response.reasoning_content,
         )
         for item in tool_results:
             call_id = str(item.get("call_id") or "")
@@ -3036,6 +3061,11 @@ class AgentCore:
             tool_calls=list(row.get("tool_calls") or []),
             tool_call_id=str(row.get("tool_call_id") or "") or None,
             name=str(row.get("tool_name") or "") or None,
+            reasoning_content=(
+                str(row["reasoning_content"])
+                if row.get("reasoning_content") is not None
+                else None
+            ),
         )
 
     def _pipeline_context_should_compact(self, tool_results: list[dict[str, Any]]) -> bool:

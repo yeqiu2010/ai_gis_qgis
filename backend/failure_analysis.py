@@ -134,6 +134,22 @@ def classify_failure(message: str, *, preflight_failed: bool = False) -> dict[st
             "生成代码把 QgsColorRampShader 直接传给了需要 QgsRasterShader 的伪彩色渲染器。",
             False,
         )
+    if "qgscolorrampshader" in text and "setcolorrampitem" in text:
+        return _result(
+            "generated_code_api",
+            "生成代码调用了不存在的 QgsColorRampShader.setColorRampItem；"
+            "应使用 setColorRampItemList。",
+            False,
+        )
+    if "qgscolorrampshader" in text and (
+        "setclassificationmin" in text or "setclassificationmax" in text
+    ):
+        return _result(
+            "generated_code_api",
+            "生成代码调用了不存在的 QgsColorRampShader 分类范围 setter；"
+            "应使用构造器或 setMinimumValue/setMaximumValue。",
+            False,
+        )
     if "syntaxerror" in text:
         return _result("syntax_error", "生成的 Python 代码存在语法错误。", False)
     if "nameerror" in text or "is not defined" in text:

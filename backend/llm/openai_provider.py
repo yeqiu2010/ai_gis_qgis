@@ -12,10 +12,13 @@ from typing import Any
 
 from ..json_recovery import recover_json_object, unwrap_raw_arguments
 from .base_provider import ChatMessage, ChatResponse, ToolCall
-from .errors import ContextWindowExceeded
+from .errors import ContextWindowExceeded, LLMRequestRejected
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32768
-CONTEXT_WINDOW_SAFETY_TOKENS = 64
+MIN_CONTEXT_WINDOW_SAFETY_TOKENS = 256
+MAX_CONTEXT_WINDOW_SAFETY_TOKENS = 4096
+CONTEXT_WINDOW_SAFETY_RATIO = 0.01
+CONTEXT_WINDOW_RETRY_ATTEMPTS = 2
 MINIMUM_OUTPUT_TOKENS = 2048
 
 
@@ -40,6 +43,8 @@ class OpenAICompatibleProvider:
         self.max_tokens = max(1, int(max_tokens))
         self.max_context_tokens = max(0, int(max_context_tokens))
         self.timeout_seconds = max(1, int(timeout_seconds))
+        self._observed_context_limit = 0
+        self._prompt_token_bias = 0
 
     def chat(
         self,
@@ -47,9 +52,7 @@ class OpenAICompatibleProvider:
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        api_messages = [{"role": "system", "content": system}] + [
-            message.as_api_message() for message in messages
-        ]
+        api_messages = self._build_api_messages(system, messages)
         max_tokens = self._bounded_max_tokens(api_messages, tools)
         payload = {
             "model": self.model,
@@ -89,12 +92,36 @@ class OpenAICompatibleProvider:
         return ChatResponse(
             content=message.get("content") or "",
             model=data.get("model", self.model),
+            reasoning_content=(
+                str(message["reasoning_content"])
+                if message.get("reasoning_content") is not None
+                else None
+            ),
             finish_reason=choice.get("finish_reason") or "stop",
             tool_calls=tool_calls,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens or input_tokens + output_tokens,
         )
+
+    @staticmethod
+    def _build_api_messages(
+        system: str,
+        messages: list[ChatMessage],
+    ) -> list[dict[str, Any]]:
+        """Keep one leading system message for strict compatible providers."""
+        system_parts = [str(system or "").strip()]
+        conversation: list[dict[str, Any]] = []
+        for message in messages:
+            api_message = message.as_api_message()
+            if api_message.get("role") == "system":
+                content = str(api_message.get("content") or "").strip()
+                if content:
+                    system_parts.append(content)
+                continue
+            conversation.append(api_message)
+        combined_system = "\n\n".join(part for part in system_parts if part)
+        return [{"role": "system", "content": combined_system}, *conversation]
 
     @staticmethod
     def _usage_value(usage: dict[str, Any], *keys: str) -> int:
@@ -113,49 +140,45 @@ class OpenAICompatibleProvider:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
         started = time.monotonic()
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except TimeoutError as exc:
-            raise self._timeout_error(payload, started, exc) from exc
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            retry_payload = self._payload_for_context_window_retry(payload, body)
-            if retry_payload is not None:
-                try:
-                    retry_request = urllib.request.Request(
-                        f"{self.base_url}/chat/completions",
-                        data=json.dumps(retry_payload).encode("utf-8"),
-                        headers=headers,
-                        method="POST",
+        current_payload = payload
+        for retry_index in range(CONTEXT_WINDOW_RETRY_ATTEMPTS + 1):
+            request = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=json.dumps(current_payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except TimeoutError as exc:
+                raise self._timeout_error(current_payload, started, exc) from exc
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                retry_payload = self._payload_for_context_window_retry(
+                    current_payload,
+                    body,
+                )
+                if retry_payload is None:
+                    if self._parse_context_window_error(body) is not None:
+                        raise self._context_window_error(current_payload, body) from exc
+                    error_type = (
+                        LLMRequestRejected
+                        if 400 <= exc.code < 500 and exc.code not in {408, 409, 429}
+                        else RuntimeError
                     )
-                    with urllib.request.urlopen(retry_request, timeout=self.timeout_seconds) as response:
-                        return json.loads(response.read().decode("utf-8"))
-                except urllib.error.HTTPError as retry_exc:
-                    retry_body = retry_exc.read().decode("utf-8", errors="replace")
-                    raise RuntimeError(
-                        f"OpenAI-compatible 请求失败：HTTP {retry_exc.code} {retry_body}"
-                    ) from retry_exc
-                except TimeoutError as retry_exc:
-                    raise self._timeout_error(retry_payload, started, retry_exc) from retry_exc
-                except urllib.error.URLError as retry_exc:
-                    if isinstance(retry_exc.reason, TimeoutError):
-                        raise self._timeout_error(
-                            retry_payload, started, retry_exc.reason
-                        ) from retry_exc
-                    raise RuntimeError(f"OpenAI-compatible 请求失败：{retry_exc}") from retry_exc
-            raise RuntimeError(f"OpenAI-compatible 请求失败：HTTP {exc.code} {body}") from exc
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, TimeoutError):
-                raise self._timeout_error(payload, started, exc.reason) from exc
-            raise RuntimeError(f"OpenAI-compatible 请求失败：{exc}") from exc
+                    raise error_type(
+                        f"OpenAI-compatible 请求失败：HTTP {exc.code} {body}"
+                    ) from exc
+                if retry_index >= CONTEXT_WINDOW_RETRY_ATTEMPTS:
+                    raise self._context_window_error(current_payload, body) from exc
+                current_payload = retry_payload
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, TimeoutError):
+                    raise self._timeout_error(current_payload, started, exc.reason) from exc
+                raise RuntimeError(f"OpenAI-compatible 请求失败：{exc}") from exc
+        raise AssertionError("unreachable context-window retry state")
 
     def _timeout_error(
         self,
@@ -180,13 +203,18 @@ class OpenAICompatibleProvider:
     ) -> int:
         if self.max_context_tokens <= 0:
             return self.max_tokens
-        prompt_tokens = self._estimate_prompt_tokens(messages, tools)
-        available = self.max_context_tokens - prompt_tokens - CONTEXT_WINDOW_SAFETY_TOKENS
+        prompt_tokens = self._estimate_prompt_tokens(messages, tools) + self._prompt_token_bias
+        context_limit = self.max_context_tokens
+        if self._observed_context_limit > 0:
+            context_limit = min(context_limit, self._observed_context_limit)
+        available = context_limit - prompt_tokens - self._context_window_safety_tokens(
+            context_limit
+        )
         minimum_output = min(self.max_tokens, MINIMUM_OUTPUT_TOKENS)
         if available < minimum_output:
             raise ContextWindowExceeded(
                 "请求输入过大，无法保留最低输出预算："
-                f"估算输入 {prompt_tokens} tokens，上下文 {self.max_context_tokens} tokens，"
+                f"估算输入 {prompt_tokens} tokens，上下文 {context_limit} tokens，"
                 f"至少需要输出 {minimum_output} tokens。"
             )
         return min(self.max_tokens, available)
@@ -213,13 +241,68 @@ class OpenAICompatibleProvider:
         if limits is None:
             return None
         context_limit, input_tokens = limits
-        available = context_limit - input_tokens - CONTEXT_WINDOW_SAFETY_TOKENS
+        self._record_context_window_observation(payload, context_limit, input_tokens)
+        safety_tokens = self._context_window_safety_tokens(context_limit)
+        available = context_limit - input_tokens - safety_tokens
         current_max_tokens = int(payload.get("max_tokens") or self.max_tokens)
+        if available < 1:
+            return None
+        if available >= current_max_tokens:
+            # Some compatible gateways return a stale or rounded token count.
+            # Still force strict progress instead of replaying the same payload.
+            available = current_max_tokens - safety_tokens
         if available < 1 or available >= current_max_tokens:
             return None
         retry_payload = dict(payload)
         retry_payload["max_tokens"] = max(1, available)
         return retry_payload
+
+    def _record_context_window_observation(
+        self,
+        payload: dict[str, Any],
+        context_limit: int,
+        input_tokens: int,
+    ) -> None:
+        if context_limit > 0:
+            if self._observed_context_limit <= 0:
+                self._observed_context_limit = context_limit
+            else:
+                self._observed_context_limit = min(
+                    self._observed_context_limit,
+                    context_limit,
+                )
+        estimated = self._estimate_prompt_tokens(
+            payload.get("messages") or [],
+            payload.get("tools"),
+        )
+        self._prompt_token_bias = max(
+            self._prompt_token_bias,
+            max(0, input_tokens - estimated),
+        )
+
+    @staticmethod
+    def _context_window_safety_tokens(context_limit: int) -> int:
+        proportional = int(max(0, context_limit) * CONTEXT_WINDOW_SAFETY_RATIO)
+        return min(
+            MAX_CONTEXT_WINDOW_SAFETY_TOKENS,
+            max(MIN_CONTEXT_WINDOW_SAFETY_TOKENS, proportional),
+        )
+
+    def _context_window_error(
+        self,
+        payload: dict[str, Any],
+        error_body: str,
+    ) -> ContextWindowExceeded:
+        limits = self._parse_context_window_error(error_body)
+        if limits is None:
+            return ContextWindowExceeded("模型服务拒绝了上下文预算。")
+        context_limit, input_tokens = limits
+        self._record_context_window_observation(payload, context_limit, input_tokens)
+        return ContextWindowExceeded(
+            "模型服务报告上下文超限，自动收缩输出预算后仍无法完成请求："
+            f"精确输入 {input_tokens} tokens，上下文上限 {context_limit} tokens，"
+            f"最后请求输出上限 {payload.get('max_tokens')} tokens。"
+        )
 
     def _parse_context_window_error(self, error_body: str) -> tuple[int, int] | None:
         message = error_body

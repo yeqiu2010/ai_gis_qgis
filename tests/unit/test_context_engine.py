@@ -162,6 +162,7 @@ def test_active_task_chain_keeps_native_tool_pair(tmp_path):
         "",
         event_type="tool_call",
         tool_calls=[call],
+        reasoning_content="需要先检查建筑图层。",
     )
     session_db.save_message(
         session.id,
@@ -175,7 +176,11 @@ def test_active_task_chain_keeps_native_tool_pair(tmp_path):
     rows = session_db.get_context_messages(session.id)
 
     assert rows[-2]["tool_calls"][0]["id"] == "live-1"
+    assert rows[-2]["reasoning_content"] == "需要先检查建筑图层。"
     assert rows[-1]["tool_call_id"] == "live-1"
+
+    restored = AgentCore._chat_message_from_row(rows[-2])
+    assert restored.as_api_message()["reasoning_content"] == "需要先检查建筑图层。"
 
 
 def test_pipeline_runtime_loads_only_current_stage_include(tmp_path):

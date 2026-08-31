@@ -94,7 +94,24 @@ class SkillRunner:
             )
             if not response.tool_calls:
                 return self._parse_final(response.content)
-            results: list[dict[str, Any]] = []
+            messages.append(
+                ChatMessage(
+                    role="assistant",
+                    content=response.content or "",
+                    reasoning_content=response.reasoning_content,
+                    tool_calls=[
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for call in response.tool_calls
+                    ],
+                )
+            )
             for call in response.tool_calls:
                 if self.should_cancel():
                     return self._cancelled()
@@ -102,29 +119,27 @@ class SkillRunner:
                     return self._failure("子任务已达到工具调用预算。")
                 tool_call_count += 1
                 if call.name not in allowed_names:
-                    results.append(
-                        {
-                            "name": call.name,
-                            "success": False,
-                            "error": "该工具未被当前隔离 Skill 允许或具有副作用。",
-                        }
-                    )
-                    continue
-                result, duration_ms = self.tool_registry.execute(call.name, call.arguments)
-                results.append(
-                    {
+                    tool_result = {
+                        "name": call.name,
+                        "success": False,
+                        "error": "该工具未被当前隔离 Skill 允许或具有副作用。",
+                    }
+                else:
+                    result, duration_ms = self.tool_registry.execute(call.name, call.arguments)
+                    tool_result = {
                         "name": call.name,
                         "arguments": call.arguments,
                         "result": result,
                         "duration_ms": duration_ms,
                     }
+                messages.append(
+                    ChatMessage(
+                        role="tool",
+                        content=json.dumps(tool_result, ensure_ascii=False),
+                        tool_call_id=call.id,
+                        name=call.name,
+                    )
                 )
-            messages.append(
-                ChatMessage(
-                    role="assistant",
-                    content="隔离子任务工具结果：\n" + json.dumps(results, ensure_ascii=False),
-                )
-            )
         return self._failure("子任务已达到迭代预算。")
 
     @staticmethod

@@ -11,6 +11,7 @@ from .constants import SCHEMA_VERSION
 def run_migrations(connection: sqlite3.Connection, schema_path: Path) -> None:
     connection.executescript(schema_path.read_text(encoding="utf-8"))
     _ensure_column(connection, "messages", "run_id", "TEXT")
+    _ensure_column(connection, "messages", "reasoning_content", "TEXT")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS messages_run_id ON messages(run_id)"
     )

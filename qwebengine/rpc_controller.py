@@ -12,6 +12,7 @@ from ..backend.agent_core import AgentCore
 from ..backend.context.prompt_builder import PromptBuilder
 from ..backend.context.qgis_context import QGISContext
 from ..backend.llm.provider_registry import create_provider
+from ..backend.llm.content_filter import strip_hidden_reasoning
 from ..backend.sam3.client import Sam3Client
 from ..backend.sam3.errors import Sam3Error
 from ..backend.tools.skill_management import read_loaded_skills
@@ -76,7 +77,21 @@ class RPCController:
 
     def get_messages(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         session_id = self._require_session_id(params)
-        return self.session_db.get_messages(session_id, limit=int(params.get("limit", 100)))
+        messages = self.session_db.get_messages(
+            session_id,
+            limit=int(params.get("limit", 100)),
+        )
+        visible_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") == "assistant":
+                message = {
+                    **message,
+                    "content": strip_hidden_reasoning(str(message.get("content") or "")),
+                }
+                if not message["content"]:
+                    continue
+            visible_messages.append(message)
+        return visible_messages
 
     def get_task_state(self, params: dict[str, Any]) -> dict[str, Any] | None:
         session_id = self._require_session_id(params)

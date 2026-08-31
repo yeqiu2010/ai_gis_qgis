@@ -63,3 +63,27 @@ def test_cancel_run_persists_active_task_cancellation(tmp_path: Path):
     assert result["cancelled"] is True
     assert session_db.get_task(task_id)["status"] == "cancelled"
     assert session_db.get_active_task(session.id)["status"] == "cancelled"
+
+
+def test_get_messages_hides_inline_thinking_from_existing_history(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="history", model="test", source="test")
+    session_db.save_message(
+        session.id,
+        "assistant",
+        "<think>不应显示的内部推理</think>\n请补充目标字段。",
+        event_type="summary",
+    )
+    session_db.save_message(
+        session.id,
+        "assistant",
+        "<analysis>只有内部分析，没有答复。</analysis>",
+        event_type="summary",
+    )
+
+    controller = RPCController.__new__(RPCController)
+    controller.session_db = session_db
+
+    messages = controller.get_messages({"session_id": session.id, "limit": 100})
+
+    assert [message["content"] for message in messages] == ["请补充目标字段。"]
