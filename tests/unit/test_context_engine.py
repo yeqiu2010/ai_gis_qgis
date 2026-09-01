@@ -108,6 +108,34 @@ def test_context_engine_rejects_fixed_prompt_that_starves_output():
         engine.prepare(system="规则" * 3000, messages=[], tools=[])
 
 
+def test_compaction_summary_is_not_a_synthetic_assistant_turn():
+    engine = QGISContextEngine()
+    messages = [
+        ChatMessage(role="user", content="旧请求" * 1200),
+        ChatMessage(
+            role="assistant",
+            content="旧回答" * 1200,
+            reasoning_content="旧推理",
+        ),
+        ChatMessage(role="user", content="中间请求" * 1200),
+        ChatMessage(
+            role="assistant",
+            content="中间回答" * 1200,
+            reasoning_content="中间推理",
+        ),
+        ChatMessage(role="user", content="当前请求"),
+    ]
+
+    compacted = engine._compact_middle_messages(messages, message_budget=512)
+
+    summary = next(
+        message
+        for message in compacted
+        if message.content.startswith("[CONTEXT COMPACTION")
+    )
+    assert summary.role == "user"
+
+
 def test_new_user_task_does_not_reload_old_raw_tool_exchange(tmp_path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="bounded history", model="test", source="test")

@@ -336,6 +336,150 @@ metadata:
     assert task["status"] == "completed"
 
 
+def test_finalize_resolves_relative_artifacts_in_execution_workspace(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="relative GIS artifacts")
+    manager = SkillManager(tmp_path / "skills")
+    registry = ToolRegistry()
+    for entry in build_task_planning_tools(session_db, session.id, manager):
+        registry.register(entry)
+
+    created, _ = registry.execute(
+        "create_plan",
+        {
+            "objective": "create DEM and slope outputs",
+            "steps": [
+                {
+                    "id": "analysis",
+                    "instruction": "generate all outputs",
+                    "dependencies": [],
+                }
+            ],
+        },
+    )
+    task_id = created["task"]["id"]
+    workspace = tmp_path / "workspaces" / "run-id"
+    workspace.mkdir(parents=True)
+    dem_path = workspace / "wuhan_dem.txt"
+    slope_path = workspace / "wuhan_slope.txt"
+    merged_path = workspace / "merged_dem.txt"
+    for path in (dem_path, slope_path, merged_path):
+        path.write_text("verified GIS output", encoding="utf-8")
+
+    # execute_gis_code has already registered verified absolute outputs.
+    for name, path in (("wuhan_dem", dem_path), ("wuhan_slope", slope_path)):
+        session_db.register_artifact(
+            task_id,
+            "file",
+            step_id="analysis",
+            name=name,
+            uri=str(path),
+            verified=True,
+        )
+
+    completed, _ = registry.execute(
+        "complete_plan_step",
+        {
+            "step_id": "analysis",
+            "outputs": {"output": "wuhan_dem.txt"},
+            "artifacts": [
+                {
+                    "artifact_type": "file",
+                    "name": "merged_dem",
+                    "uri": "merged_dem.txt",
+                    "verified": True,
+                },
+                {
+                    "artifact_type": "file",
+                    "name": "wuhan_dem",
+                    "uri": "wuhan_dem.txt",
+                    "verified": True,
+                },
+            ],
+        },
+    )
+
+    assert completed["success"] is True
+    state = session_db.get_task_state(task_id)
+    assert state is not None
+    registered = state["artifacts"][-2:]
+    assert [artifact["uri"] for artifact in registered] == [
+        str(merged_path.resolve()),
+        str(dem_path.resolve()),
+    ]
+    assert all(artifact["verified"] for artifact in registered)
+
+    finalized, _ = registry.execute("finalize_task", {"summary": "done"})
+    assert finalized["success"] is True
+
+
+def test_finalize_ignores_superseded_relative_artifact_records(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="legacy duplicate artifacts")
+    manager = SkillManager(tmp_path / "skills")
+    registry = ToolRegistry()
+    for entry in build_task_planning_tools(session_db, session.id, manager):
+        registry.register(entry)
+
+    created, _ = registry.execute(
+        "create_plan",
+        {
+            "objective": "finish an already successful execution",
+            "steps": [
+                {
+                    "id": "analysis",
+                    "instruction": "generate output",
+                    "dependencies": [],
+                }
+            ],
+        },
+    )
+    task_id = created["task"]["id"]
+    completed, _ = registry.execute(
+        "complete_plan_step",
+        {"step_id": "analysis", "outputs": {"status": "done"}},
+    )
+    assert completed["success"] is True
+
+    workspace = tmp_path / "workspaces" / "legacy-run"
+    workspace.mkdir(parents=True)
+    output_path = workspace / "wuhan_dem.txt"
+    intermediate_path = workspace / "merged_dem.txt"
+    output_path.write_text("verified output", encoding="utf-8")
+    intermediate_path.write_text("existing intermediate", encoding="utf-8")
+    session_db.register_artifact(
+        task_id,
+        "file",
+        step_id="analysis",
+        name="wuhan_dem",
+        uri=str(output_path),
+        verified=True,
+    )
+    # These records reproduce task 390: relative paths were downgraded to
+    # unverified even though the files exist in the execution workspace.
+    session_db.register_artifact(
+        task_id,
+        "file",
+        step_id="analysis",
+        name="wuhan_dem",
+        uri="wuhan_dem.txt",
+        verified=False,
+    )
+    session_db.register_artifact(
+        task_id,
+        "file",
+        step_id="analysis",
+        name="merged_dem",
+        uri="merged_dem.txt",
+        verified=False,
+    )
+
+    finalized, _ = registry.execute("finalize_task", {"summary": "done"})
+
+    assert finalized["success"] is True
+    assert finalized["status"] == "completed"
+
+
 def test_cancelled_plan_cannot_be_revised_or_resumed(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="cancelled plan")

@@ -376,7 +376,15 @@ class AgentCore:
                     messages.append(
                         ChatMessage(
                             role="assistant",
+                            content=response.content or "",
+                            reasoning_content=response.reasoning_content,
+                        )
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role="user",
                             content=(
+                                "[AGENT CONTINUATION]\n"
                                 "当前任务尚未满足完成条件，不能把上一段不完整文本作为最终回复。"
                                 f"{expected}"
                             ),
@@ -1107,6 +1115,18 @@ class AgentCore:
             "并使用 artifacts、outputs 或 loaded_layers 中的真实路径和 layer_id 继续；"
             "只有全部步骤和交付物完成后才能最终回复。"
         )
+        if (
+            confirmed_tool_name == "execute_gis_code"
+            and confirmed_result.get("success")
+            and current_pipeline_cycle(self.session_db, session_id) == PIPELINE_STAGES
+        ):
+            continuation_instruction = (
+                "GIS Pipeline 的完整脚本已经执行成功，expected_outputs 已完成运行时验证并加载。"
+                "禁止再次调用 execute_gis_code，禁止为了读取分辨率、尺寸、统计值或验证文件而生成诊断脚本；"
+                "直接使用 confirmed_result 的 outputs、loaded_layers、stdout 和 artifacts 完成已覆盖的计划步骤。"
+                "若计划包含用户原始请求未要求的额外步骤，应 revise_plan 删除该扩展，不能继续执行额外分析。"
+                "随后调用 finalize_task。"
+            )
         # The confirmed result is already persisted as a role=tool message.
         # Keep the continuation policy in the leading system prompt: strict
         # OpenAI-compatible providers reject system messages later in history.
@@ -1170,7 +1190,14 @@ class AgentCore:
                     messages.append(
                         ChatMessage(
                             role="assistant",
-                            content=continuation,
+                            content=response.content or "",
+                            reasoning_content=response.reasoning_content,
+                        )
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role="user",
+                            content=f"[AGENT CONTINUATION]\n{continuation}",
                         )
                     )
                     continue
@@ -1422,6 +1449,8 @@ class AgentCore:
                         tool_registry=tool_registry,
                         publish=publish,
                         model=response.model,
+                        assistant_content=response.content,
+                        reasoning_content=response.reasoning_content,
                     )
                     return "", True
                 tool_results.append(
@@ -2228,6 +2257,23 @@ class AgentCore:
                         "duplicate_prevented": True,
                         "message": "相同参数的已确认工具调用已在本次请求中完成，已复用现有结果。",
                     }
+                if tool_name == "execute_gis_code":
+                    output_contract = self._execute_output_contract(arguments)
+                    completed = generic_history.get(
+                        f"{scope}:verified_outputs:{output_contract}"
+                    ) if output_contract else None
+                    if isinstance(completed, dict):
+                        return {
+                            **completed,
+                            "success": True,
+                            "already_completed": True,
+                            "duplicate_prevented": True,
+                            "reuse_reason": "verified_output_contract",
+                            "message": (
+                                "相同 expected_outputs 已在本次请求中生成、验证并加载；"
+                                "即使代码文本不同，也不会在新的工作目录中重复执行。"
+                            ),
+                        }
         return None
 
     def _remember_confirmed_tool_call(
@@ -2251,7 +2297,46 @@ class AgentCore:
             history = {}
         scope = self.session_db.get_state(f"{session_id}:request_scope") or ""
         history[f"{scope}:{fingerprint}"] = result
+        if tool_name == "execute_gis_code" and result.get("success"):
+            output_contract = self._execute_output_contract(arguments)
+            if output_contract:
+                history[f"{scope}:verified_outputs:{output_contract}"] = result
         self.session_db.set_state(state_key, json.dumps(history, ensure_ascii=False))
+
+    @staticmethod
+    def _execute_output_contract(arguments: dict[str, Any]) -> str | None:
+        outputs = arguments.get("expected_outputs")
+        if not isinstance(outputs, list) or not outputs:
+            return None
+        normalized_outputs = []
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            normalized_outputs.append(
+                {
+                    "path": str(output.get("path") or "")
+                    .strip()
+                    .replace("\\", "/")
+                    .casefold(),
+                    "name": str(output.get("name") or "").strip().casefold(),
+                    "type": str(output.get("type") or "").strip().casefold(),
+                    "required": bool(output.get("required", True)),
+                }
+            )
+        if not normalized_outputs:
+            return None
+        deliveries = arguments.get("delivery_outputs")
+        normalized_deliveries = deliveries if isinstance(deliveries, list) else []
+        return json.dumps(
+            {
+                "outputs": normalized_outputs,
+                "deliveries": normalized_deliveries,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
 
     @staticmethod
     def _duplicate_tool_process_message(tool_name: str) -> str:
@@ -2712,7 +2797,13 @@ class AgentCore:
             )
             if not response.tool_calls:
                 if response.content:
-                    messages.append(ChatMessage(role="assistant", content=response.content))
+                    messages.append(
+                        ChatMessage(
+                            role="assistant",
+                            content=response.content,
+                            reasoning_content=response.reasoning_content,
+                        )
+                    )
                 break
             for call in response.tool_calls:
                 if call.name != "execute_gis_code":
@@ -2761,6 +2852,19 @@ class AgentCore:
                     )
                 )
                 self._save_process_message(session_id, self._format_tool_process(call.name, result))
+                self._persist_tool_exchange(
+                    session_id,
+                    response,
+                    [
+                        {
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                            "result": result,
+                        }
+                    ],
+                    run_id=run_id,
+                )
                 last_result = result
                 if result.get("success", True):
                     return result
@@ -2978,7 +3082,7 @@ class AgentCore:
             "以下 JSON 是当前任务的无损状态；历史摘要只能作为参考，不能覆盖其中的图层、字段、参数、步骤或产物。\n"
             + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
         )
-        return ChatMessage(role="assistant", content=content)
+        return ChatMessage(role="user", content=content)
 
     @staticmethod
     def _tool_calls_payload(calls: list[Any]) -> list[dict[str, Any]]:
@@ -3147,6 +3251,17 @@ class AgentCore:
             }
 
         if next_stage == "generated_code":
+            data_overview_artifact = (
+                latest_by_stage.get("data_overview") or {}
+            ).get("stage_artifact") or {}
+            resolved_layers = data_overview_artifact.get("resolved_layers")
+            if isinstance(resolved_layers, list) and resolved_layers:
+                envelope["resolved_layers"] = resolved_layers
+                envelope["layer_binding_instruction"] = (
+                    "resolved_layers 是 inspect_layer 返回的权威 QGIS 图层绑定。"
+                    "按 ID 获取时必须调用 QgsProject.instance().mapLayer(id) 并检查结果；"
+                    "不得把 name 传给 mapLayer()。"
+                )
             solution_artifact = (
                 latest_by_stage.get("solution_plan") or {}
             ).get("stage_artifact") or {}
@@ -3209,7 +3324,7 @@ class AgentCore:
             "不要重复询问已经由工具确认过的图层、字段或筛选依据。\n"
             + "\n".join(lines)
         )
-        return ChatMessage(role="assistant", content=content[:3600])
+        return ChatMessage(role="user", content=content[:3600])
 
     def _summarize_tool_memory(self, call: dict[str, Any]) -> list[str]:
         name = str(call.get("tool_name") or "")

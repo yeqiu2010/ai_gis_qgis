@@ -117,6 +117,17 @@ def build_record_pipeline_stage_tool(session_db: SessionDB, session_id: str) -> 
                 "received_stage": stage_name,
                 "completed_stages": completed_stages,
             }
+        if stage_name == "data_overview":
+            layer_bindings = _current_request_inspected_layers(
+                session_db,
+                session_id,
+            )
+            if layer_bindings:
+                # Do not rely on the model to copy opaque QGIS layer IDs from
+                # inspect results into its stage artifact.  These bindings are
+                # small, authoritative runtime evidence needed by generated
+                # code several pipeline stages later.
+                artifact = {**artifact, "resolved_layers": layer_bindings}
         structured_query = _latest_stage_artifact(
             session_db,
             session_id,
@@ -452,6 +463,48 @@ def _latest_stage_artifact(
             artifact = item.get("stage_artifact")
             return dict(artifact) if isinstance(artifact, dict) else {}
     return {}
+
+
+def _current_request_inspected_layers(
+    session_db: SessionDB,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Return compact layer bindings confirmed during the current request."""
+    history = session_db.get_context_messages(session_id, historical_limit=0)
+    request_started_at = max(
+        (
+            float(item.get("timestamp") or 0)
+            for item in history
+            if item.get("role") == "user"
+        ),
+        default=0.0,
+    )
+    bindings_by_id: dict[str, dict[str, Any]] = {}
+    for call in session_db.get_recent_tool_calls(session_id, limit=64):
+        if not call.get("success") or float(call.get("timestamp") or 0) < request_started_at:
+            continue
+        tool_name = str(call.get("tool_name") or "")
+        if tool_name not in {"inspect_layer", "inspect_layers"}:
+            continue
+        result = call.get("result")
+        if not isinstance(result, dict):
+            continue
+        inspected = result.get("layers") if tool_name == "inspect_layers" else [result]
+        if not isinstance(inspected, list):
+            continue
+        for item in inspected:
+            if not isinstance(item, dict) or not isinstance(item.get("layer"), dict):
+                continue
+            layer = item["layer"]
+            layer_id = str(layer.get("id") or "").strip()
+            if not layer_id:
+                continue
+            bindings_by_id[layer_id] = {
+                key: layer.get(key)
+                for key in ("id", "name", "type", "source", "crs")
+                if layer.get(key) is not None
+            }
+    return list(bindings_by_id.values())
 
 
 def _selected_solution_text(artifact: dict[str, Any]) -> str:

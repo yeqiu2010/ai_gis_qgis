@@ -51,6 +51,8 @@ metadata:
 - 未读取精确 API 证据却直接调用 `QgsVectorFileWriter.create/writeAsVectorFormat*` 重载；常规矢量输出应使用 Processing。
 - 调用不存在的 `QgsProject.addVectorLayer`，或猜测未在算法详情中出现的结果键（如 `OUTPUT_COUNT`）。
 - 对已经列入 `expected_outputs`、将由执行器自动加载的最终 vector/raster 文件，又手工创建 `QgsRasterLayer`/`QgsVectorLayer` 并调用 `addMapLayer()`，导致结果图层重复加载。
+- 使用顶层 `import gdal`/`from gdal ...`；QGIS 环境应使用 `from osgeo import gdal`，而 `gdal:*` Processing 调用根本不需要导入 GDAL。
+- 对 `QgsRasterLayer` 调用不存在的 `resolution()`、`resX()` 或 `resY()`；应使用 `rasterUnitsPerPixelX()`/`rasterUnitsPerPixelY()` 或直接复用执行器返回的输出元数据。
 
 不要尝试通过穷举 Processing、GDAL、Writer 或 Python 文件 API 来静态证明输出一定会生成，也不要根据不完整的静态数据流推断工作目录中的中间文件尚未创建。代码审查只检查声明式输出契约、安全边界和确定性的 API 错误；文件是否存在、非空且可被对应 GIS 驱动打开，以执行后的 `verified` 结果为唯一依据。
 - 直接从 `PyQt5` 或 `PyQt6` 导入 QGIS 运行时类型；必须使用

@@ -448,3 +448,103 @@ def test_openai_compatible_preserves_reasoning_content_for_tool_follow_up(monkey
     assert response.reasoning_content == "需要先读取图层。"
     assistant_message = captured_payloads[1]["messages"][-2]
     assert assistant_message["reasoning_content"] == "需要先读取图层。"
+
+
+def test_deepseek_recovers_missing_reasoning_from_assistant_content(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeHTTPResponse(
+            {
+                "model": "deepseek-v4",
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": "需要继续检查坡度输出。",
+                            "tool_calls": [
+                                {
+                                    "id": "call-next",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "list_layers",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(model="deepseek-v4")
+
+    response = provider.chat(
+        system="system",
+        messages=[
+            ChatMessage(role="user", content="继续任务"),
+            ChatMessage(
+                role="assistant",
+                content="上一轮原始思考内容",
+                tool_calls=[
+                    {
+                        "id": "call-old",
+                        "type": "function",
+                        "function": {"name": "list_layers", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ChatMessage(role="tool", content="[]", tool_call_id="call-old"),
+        ],
+        tools=[{"type": "function", "function": {"name": "list_layers"}}],
+    )
+
+    assistant = captured["payload"]["messages"][-2]
+    assert assistant["reasoning_content"] == "上一轮原始思考内容"
+    assert response.reasoning_content == "需要继续检查坡度输出。"
+
+
+def test_reasoning_content_http_400_retries_once_with_repaired_payload(monkeypatch):
+    payloads = []
+    error_body = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "The `reasoning_content` in the thinking mode must be "
+                    "passed back to the API."
+                )
+            }
+        }
+    )
+
+    def fake_urlopen(request, timeout):
+        payloads.append(json.loads(request.data.decode("utf-8")))
+        if len(payloads) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=FakeHTTPErrorBody(error_body),
+            )
+        return FakeHTTPResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(model="private-reasoner-alias")
+
+    response = provider.chat(
+        system="system",
+        messages=[
+            ChatMessage(role="user", content="继续任务"),
+            ChatMessage(role="assistant", content="历史推理"),
+        ],
+        tools=[{"type": "function", "function": {"name": "list_layers"}}],
+    )
+
+    assert response.content == "this is a test"
+    assert len(payloads) == 2
+    assert "reasoning_content" not in payloads[0]["messages"][-1]
+    assert payloads[1]["messages"][-1]["reasoning_content"] == "历史推理"

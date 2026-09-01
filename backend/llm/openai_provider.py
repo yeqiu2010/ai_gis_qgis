@@ -52,7 +52,12 @@ class OpenAICompatibleProvider:
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        api_messages = self._build_api_messages(system, messages)
+        requires_reasoning_replay = bool(tools) and self._requires_reasoning_replay()
+        api_messages = self._build_api_messages(
+            system,
+            messages,
+            requires_reasoning_replay=requires_reasoning_replay,
+        )
         max_tokens = self._bounded_max_tokens(api_messages, tools)
         payload = {
             "model": self.model,
@@ -89,14 +94,22 @@ class OpenAICompatibleProvider:
         input_tokens = self._usage_value(usage, "prompt_tokens", "input_tokens")
         output_tokens = self._usage_value(usage, "completion_tokens", "output_tokens")
         total_tokens = self._usage_value(usage, "total_tokens")
+        content = str(message.get("content") or "")
+        reasoning_content = (
+            str(message["reasoning_content"])
+            if message.get("reasoning_content") is not None
+            else None
+        )
+        if reasoning_content is None and self._requires_reasoning_replay():
+            # Some DeepSeek-compatible gateways place thinking text in
+            # ``content`` but still require it under ``reasoning_content`` on
+            # the next tool-enabled request. Preserve the only lossless value
+            # available instead of breaking the following turn.
+            reasoning_content = content
         return ChatResponse(
-            content=message.get("content") or "",
+            content=content,
             model=data.get("model", self.model),
-            reasoning_content=(
-                str(message["reasoning_content"])
-                if message.get("reasoning_content") is not None
-                else None
-            ),
+            reasoning_content=reasoning_content,
             finish_reason=choice.get("finish_reason") or "stop",
             tool_calls=tool_calls,
             input_tokens=input_tokens,
@@ -108,6 +121,8 @@ class OpenAICompatibleProvider:
     def _build_api_messages(
         system: str,
         messages: list[ChatMessage],
+        *,
+        requires_reasoning_replay: bool = False,
     ) -> list[dict[str, Any]]:
         """Keep one leading system message for strict compatible providers."""
         system_parts = [str(system or "").strip()]
@@ -119,9 +134,25 @@ class OpenAICompatibleProvider:
                 if content:
                     system_parts.append(content)
                 continue
+            if (
+                requires_reasoning_replay
+                and api_message.get("role") == "assistant"
+                and api_message.get("reasoning_content") is None
+            ):
+                # Repair legacy history written before reasoning_content was
+                # persisted. Tool-call content commonly contains the original
+                # thinking text, so it is a better replay value than an empty
+                # placeholder and satisfies DeepSeek's required field.
+                api_message["reasoning_content"] = str(
+                    api_message.get("content") or ""
+                )
             conversation.append(api_message)
         combined_system = "\n\n".join(part for part in system_parts if part)
         return [{"role": "system", "content": combined_system}, *conversation]
+
+    def _requires_reasoning_replay(self) -> bool:
+        identity = f"{self.model} {self.base_url}".casefold()
+        return "deepseek" in identity
 
     @staticmethod
     def _usage_value(usage: dict[str, Any], *keys: str) -> int:
@@ -142,6 +173,7 @@ class OpenAICompatibleProvider:
             headers["Authorization"] = f"Bearer {self.api_key}"
         started = time.monotonic()
         current_payload = payload
+        reasoning_repair_used = False
         for retry_index in range(CONTEXT_WINDOW_RETRY_ATTEMPTS + 1):
             request = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
@@ -156,6 +188,15 @@ class OpenAICompatibleProvider:
                 raise self._timeout_error(current_payload, started, exc) from exc
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
+                if not reasoning_repair_used:
+                    reasoning_payload = self._payload_for_reasoning_content_retry(
+                        current_payload,
+                        body,
+                    )
+                    if reasoning_payload is not None:
+                        current_payload = reasoning_payload
+                        reasoning_repair_used = True
+                        continue
                 retry_payload = self._payload_for_context_window_retry(
                     current_payload,
                     body,
@@ -179,6 +220,38 @@ class OpenAICompatibleProvider:
                     raise self._timeout_error(current_payload, started, exc.reason) from exc
                 raise RuntimeError(f"OpenAI-compatible 请求失败：{exc}") from exc
         raise AssertionError("unreachable context-window retry state")
+
+    @staticmethod
+    def _payload_for_reasoning_content_retry(
+        payload: dict[str, Any],
+        error_body: str,
+    ) -> dict[str, Any] | None:
+        normalized_error = str(error_body or "").casefold()
+        if not (
+            "reasoning_content" in normalized_error
+            and "must be passed back" in normalized_error
+        ):
+            return None
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return None
+        repaired_messages: list[Any] = []
+        changed = False
+        for raw_message in messages:
+            if not isinstance(raw_message, dict):
+                repaired_messages.append(raw_message)
+                continue
+            message = dict(raw_message)
+            if (
+                message.get("role") == "assistant"
+                and message.get("reasoning_content") is None
+            ):
+                message["reasoning_content"] = str(message.get("content") or "")
+                changed = True
+            repaired_messages.append(message)
+        if not changed:
+            return None
+        return {**payload, "messages": repaired_messages}
 
     def _timeout_error(
         self,

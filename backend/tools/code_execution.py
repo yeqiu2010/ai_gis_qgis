@@ -307,10 +307,22 @@ def find_generated_code_issues(code: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported_roots.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+            if any(alias.name == "gdal" for alias in node.names):
+                _append_issue(
+                    issues,
+                    "QGIS Python 环境没有顶层 gdal 模块；确需 GDAL Python API 时使用 "
+                    "from osgeo import gdal。仅执行 gdal:* Processing 算法时不需要导入 gdal",
+                )
             if any(alias.name in {"PyQt5", "PyQt6"} or alias.name.startswith(("PyQt5.", "PyQt6.")) for alias in node.names):
                 _append_issue(issues, "禁止直接导入 PyQt5/PyQt6，必须使用 qgis.PyQt")
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
+            if module == "gdal" or module.startswith("gdal."):
+                _append_issue(
+                    issues,
+                    "QGIS Python 环境没有顶层 gdal 模块；确需 GDAL Python API 时使用 "
+                    "from osgeo import gdal。仅执行 gdal:* Processing 算法时不需要导入 gdal",
+                )
             if module == "os":
                 imported_roots.add("os")
             if module in {"PyQt5", "PyQt6"} or module.startswith(("PyQt5.", "PyQt6.")):
@@ -319,6 +331,31 @@ def find_generated_code_issues(code: str) -> list[str]:
     literal_string_assignments = _assigned_literal_strings(assignments)
     map_layer_assignments = _assigned_map_layer_names(assignments)
     guarded_layer_names = _null_guarded_names(tree)
+    for assignment in assignments:
+        value = assignment.value
+        if not isinstance(value, ast.Call) or not _call_name(value.func).endswith(
+            "mapLayer"
+        ):
+            continue
+        identifier = _call_argument(
+            value,
+            position=0,
+            keyword_names={"layerId"},
+        )
+        literal_identifier = (
+            _resolved_literal_string(identifier, literal_string_assignments)
+            if identifier is not None
+            else None
+        )
+        if literal_identifier and not QGIS_LAYER_ID_PATTERN.search(
+            literal_identifier
+        ):
+            _append_issue(
+                issues,
+                f"QgsProject.mapLayer() 只接受图层 ID，不能把图层名称 "
+                f"{literal_identifier} 作为 ID；请使用 inspect_layer 返回的 layer.id，"
+                "或用 mapLayersByName() 按名称查找并检查匹配结果",
+            )
     for layer_name in sorted(map_layer_assignments.difference(guarded_layer_names)):
         _append_issue(
             issues,
@@ -333,6 +370,7 @@ def find_generated_code_issues(code: str) -> list[str]:
         assignments,
         "QgsSingleBandPseudoColorRenderer",
     )
+    raster_layer_names = _assigned_constructor_names(assignments, "QgsRasterLayer")
     for node in assignments:
         if not _processing_call_writes_file(node.value):
             continue
@@ -358,6 +396,30 @@ def find_generated_code_issues(code: str) -> list[str]:
                 if isinstance(target, ast.Name) and target.id not in output_path_names:
                     output_path_names.add(target.id)
                     changed = True
+
+    processing_output_layer_names: set[str] = set()
+    for assignment in assignments:
+        value = assignment.value
+        if not isinstance(value, ast.Call):
+            continue
+        constructor = _call_name(value.func)
+        if not (
+            constructor == "QgsRasterLayer"
+            or constructor.endswith(".QgsRasterLayer")
+            or constructor == "QgsVectorLayer"
+            or constructor.endswith(".QgsVectorLayer")
+        ):
+            continue
+        source = _call_argument(value, position=0, keyword_names={"path", "uri"})
+        if source is None or not _is_processing_output_path_expression(
+            source,
+            output_path_names,
+            file_processing_result_names,
+        ):
+            continue
+        processing_output_layer_names.update(
+            target.id for target in assignment.targets if isinstance(target, ast.Name)
+        )
 
     uses_os = any(
         isinstance(node, ast.Name) and node.id == "os" and isinstance(getattr(node, "ctx", None), ast.Load)
@@ -425,6 +487,29 @@ def find_generated_code_issues(code: str) -> list[str]:
                     "禁止猜测 QgsVectorFileWriter 重载签名；矢量结果优先使用已检索的 Processing OUTPUT",
                 )
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (
+                node.func.attr == "addMapLayer"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in processing_output_layer_names
+            ):
+                _append_issue(
+                    issues,
+                    "最终 Processing 文件输出已由 execute_gis_code 按 expected_outputs 自动加载；"
+                    "不得再创建 QgsRasterLayer/QgsVectorLayer 并调用 addMapLayer() 手动加载同一结果",
+                )
+            if (
+                node.func.attr in {"resolution", "resX", "resY"}
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in raster_layer_names.union(
+                    map_layer_assignments
+                )
+            ):
+                _append_issue(
+                    issues,
+                    f"QgsRasterLayer 没有 {node.func.attr}() 方法；像元大小应使用 "
+                    "rasterUnitsPerPixelX()/rasterUnitsPerPixelY()，宽高使用 width()/height()",
+                )
             if (
                 node.func.attr == "featureCount"
                 and _is_processing_output_path_expression(
@@ -539,6 +624,16 @@ def _check_processing_call(
             "PROJWIN 是该算法公开的 Processing 裁剪范围参数名，不是仅供 GDAL 内部使用的名称；"
             "可直接传范围图层、QgsRectangle，或 xmin,xmax,ymin,ymax 字符串",
         )
+    if algorithm_id == "native:reclassifybytable":
+        table = parameters.get("TABLE")
+        if isinstance(table, (ast.List, ast.Tuple)) and any(
+            isinstance(item, (ast.List, ast.Tuple)) for item in table.elts
+        ):
+            _append_issue(
+                issues,
+                "native:reclassifybytable 的 TABLE 必须是按最小值、最大值、新值"
+                "连续排列的一维列表，不能传入由三元组组成的嵌套列表",
+            )
     for parameter_name, value in parameters.items():
         if not _is_processing_layer_parameter(parameter_name):
             continue

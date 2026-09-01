@@ -19,7 +19,7 @@ metadata:
 ## 必须产出的 artifact 字段
 
 - `task_type`：例如 `attribute_extract_buffer_intersection_export`。
-- `target_layers`：涉及的图层名称、角色和是否已通过工具确认。
+- `target_layers`：涉及的图层名称、QGIS 图层 ID、角色和是否已通过工具确认。
 - `attribute_filters`：属性筛选目标、候选字段、候选取值和证据来源。
 - `spatial_relationship`：空间关系，例如 `intersects`、`within_distance`、`clip`。
 - `parameters`：距离、单位、缓冲区策略、是否 dissolve、中间结果名称。
@@ -53,6 +53,7 @@ metadata:
   - 坐标统一：`reproject layer`, `projected CRS`
 - 字段名、图层名、属性取值不明确时写入 `questions`，并停止后续代码生成。
 - 如果已有 `inspect_layer` 结果，必须优先使用真实字段；不要硬猜字段名。
+- 如果上游 `data_overview.resolved_layers` 已提供图层 ID，必须把对应 `id` 原样写入 `target_layers`，不得在结构化阶段退化为只有图层名称。
 
 ## 复杂任务示例
 

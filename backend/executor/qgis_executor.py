@@ -171,6 +171,7 @@ class QGISCodeExecutor:
             with (
                 contextlib.redirect_stdout(stdout_buffer),
                 contextlib.redirect_stderr(stderr_buffer),
+                _working_directory(workspace_dir),
                 self._responsive_processing(),
             ):
                 compiled = compile(code, "<ai_gis_agent_current_qgis_code>", "exec")
@@ -425,3 +426,14 @@ def _process_qt_events(qcore_application, qevent_loop) -> None:
             qcore_application.processEvents()
         except (AttributeError, TypeError):
             return
+
+
+@contextmanager
+def _working_directory(path: Path):
+    """Give current-QGIS execution the same relative-path semantics as workers."""
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)

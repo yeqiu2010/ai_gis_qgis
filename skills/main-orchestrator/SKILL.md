@@ -58,6 +58,8 @@ metadata:
 
 加载后由 `gis-pipeline` 依次完成 `data_overview`、`structured_query`、`solution_plan`、`generated_code`、`execution_result`。每个真正完成的任务步骤使用 `complete_plan_step` 登记输出，最后调用 `finalize_task`。
 
+`create_plan` 只描述 Skill 之间的依赖，不要把同一个 `gis-pipeline` 内部的坡度、重分类、统计、登记等操作拆成多个同 Skill 计划步骤；一个完整 Pipeline 通常对应一个计划步骤，其内部操作由五阶段 artifact 管理。计划目标和步骤不得增加用户原始请求没有要求的统计、面积、占比、验证文件或其他交付物。例如用户只要求地形形态分类时，不得自行增加“统计各类别面积和占比”。
+
 ## 图层管理路由
 
 - 用户询问当前工程、图层列表、字段、CRS、范围、要素数时，优先使用 `list_layers` 或 `inspect_layer`。
@@ -85,6 +87,7 @@ metadata:
 - 大数据空间分析必须检查空间索引，避免逐要素嵌套循环，并优先输出 GeoPackage。
 - 自动重试遇到空几何或无效几何时必须排除对应要素；除非用户明确要求修复数据，不得运行 `fixgeometries` 或创建修复副本。
 - `execute_gis_code` 只用于完成用户要求的最终结果，不得用于字段唯一值探查或仅打印供下一步使用的诊断信息；stdout 本身就是用户所需统计结论时可以直接打印且不创建文件。
+- GIS Pipeline 的 `execution_result` 已成功记录后，禁止再次调用 `execute_gis_code` 验证尺寸、分辨率、统计值或文件有效性；这些证据必须直接使用工具返回的 `outputs`、`loaded_layers` 和 ArtifactVerifier 元数据。
 
 ## 回复规则
 

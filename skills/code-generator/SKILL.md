@@ -34,6 +34,8 @@ metadata:
 - 用户只说“导出/生成结果”但没有给文件名时，不要询问保存目录；使用合理默认文件名并写入 `expected_outputs`，例如 `park_parcels.geojson`。
 - 输出路径用 `Path(QGIS_AGENT_WORKSPACE) / "文件名"` 构造，不要写绝对路径到工作目录外。
 - `expected_outputs` 中的 vector/raster 文件会由 `execute_gis_code` 验证并自动加载到 QGIS，生成代码不要再用 `QgsRasterLayer`/`QgsVectorLayer` 和 `QgsProject.addMapLayer()` 手动加载同一最终文件，否则会产生重复图层。只有不生成文件、且用户明确要求创建工程内存图层或样式副本时才自行添加图层。
+- `gdal:*` 是 QGIS Processing Provider 算法 ID，不代表可以 `import gdal`。仅调用 Processing 时不要导入 GDAL；确需 Python GDAL API 时只能使用 `from osgeo import gdal`。
+- `QgsRasterLayer` 没有 `resolution()`、`resX()` 或 `resY()`；像元大小使用 `rasterUnitsPerPixelX()`/`rasterUnitsPerPixelY()`，宽高使用 `width()`/`height()`。执行结果已经包含栅格结构元数据时不得再生成诊断代码读取这些信息。
 - 如果用户明确要求导出到外部目录，例如 `E:\Desktop\test`，代码仍然只能写入 `QGIS_AGENT_WORKSPACE`；在 `execute_gis_code` 参数中增加 `delivery_outputs`，把工作目录内输出复制到用户目录。
 - 外部导出示例：代码输出 `qn_500_area_8000.geojson`，`expected_outputs=[{"path":"qn_500_area_8000.geojson","name":"qn_500_area_8000","type":"vector"}]`，`delivery_outputs=[{"source_path":"qn_500_area_8000.geojson","target_path":"E:\\Desktop\\test\\qn_500_area_8000.geojson"}]`。
 - 可以直接使用当前命名空间中的常用对象：`QgsProject`、`QgsVectorLayer`、`QgsFeature`、`QgsFeatureRequest`、`QgsGeometry`、`QgsVectorFileWriter`、`QgsProcessing`、`QgsProcessingContext`、`QgsProcessingFeedback`、`processing`、`iface`、`Path`。

@@ -388,7 +388,7 @@ class QGISContextEngine:
         if not removed:
             return messages
         summary = self._historical_summary(removed, max_chars=max(1200, message_budget * 2))
-        summary_message = ChatMessage(role="assistant", content=summary)
+        summary_message = ChatMessage(role="user", content=summary)
         assembled: list[ChatMessage] = []
         inserted = False
         for index, group in enumerate(groups):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from ...database.session_db import SessionDB
 from ..executor.artifact_verifier import ArtifactVerifier
@@ -377,6 +378,7 @@ def _register_artifact_specs(
     if not isinstance(raw_artifacts, list):
         return []
     registered: list[str] = []
+    existing_artifacts = session_db.list_artifacts(task_id)
     for artifact in raw_artifacts:
         if not isinstance(artifact, dict):
             continue
@@ -385,9 +387,13 @@ def _register_artifact_specs(
             continue
         uri = str(artifact.get("uri") or "").strip() or None
         verified = bool(artifact.get("verified"))
-        if uri and _is_local_uri(uri) and not _local_uri_exists(uri):
+        resolved_path = (
+            _resolve_local_artifact_path(uri, existing_artifacts) if uri else None
+        )
+        if uri and _is_local_uri(uri) and resolved_path is None:
             verified = False
-        elif uri and _local_uri_exists(uri):
+        elif uri and resolved_path is not None:
+            uri = str(resolved_path)
             raw_payload = artifact.get("payload")
             payload: dict[str, Any] = (
                 dict(raw_payload) if isinstance(raw_payload, dict) else {}
@@ -403,17 +409,32 @@ def _register_artifact_specs(
             payload = {**payload, "verification": verification}
             artifact = {**artifact, "payload": payload}
             verified = bool(verification.get("verified"))
-        registered.append(
-            session_db.register_artifact(
-                task_id,
-                artifact_type,
-                step_id=step_id,
-                name=str(artifact.get("name") or "").strip() or None,
-                uri=uri,
-                payload=artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {},
-                producer=producer,
-                verified=verified,
-            )
+        name = str(artifact.get("name") or "").strip() or None
+        payload = (
+            artifact.get("payload")
+            if isinstance(artifact.get("payload"), dict)
+            else {}
+        )
+        artifact_id = session_db.register_artifact(
+            task_id,
+            artifact_type,
+            step_id=step_id,
+            name=name,
+            uri=uri,
+            payload=payload,
+            producer=producer,
+            verified=verified,
+        )
+        registered.append(artifact_id)
+        existing_artifacts.append(
+            {
+                "id": artifact_id,
+                "artifact_type": artifact_type,
+                "name": name,
+                "uri": uri,
+                "payload": payload,
+                "verified": verified,
+            }
         )
     return registered
 
@@ -573,10 +594,19 @@ def verify_task_completion(state: dict[str, Any], skill_manager: SkillManager) -
         if step.get("status") not in {"completed", "skipped"}:
             failures.append(f"步骤 {step.get('id')} 状态为 {step.get('status')}")
     artifacts = state.get("artifacts") or []
+    workspace_roots = _artifact_workspace_roots(artifacts)
+    runtime_status = [
+        _artifact_runtime_status(artifact, workspace_roots) for artifact in artifacts
+    ]
+    valid_artifact_keys = {
+        _artifact_logical_key(artifact)
+        for artifact, (_, valid) in zip(artifacts, runtime_status, strict=True)
+        if valid
+    }
     verified_artifact_names = {
         str(value)
-        for artifact in artifacts
-        if artifact.get("verified")
+        for artifact, (_, valid) in zip(artifacts, runtime_status, strict=True)
+        if valid or _artifact_logical_key(artifact) in valid_artifact_keys
         for value in (artifact.get("artifact_type"), artifact.get("name"))
         if value
     }
@@ -594,18 +624,67 @@ def verify_task_completion(state: dict[str, Any], skill_manager: SkillManager) -
                 failures.append(
                     f"步骤 {step.get('id')} 缺少已验证的必需产物 {artifact_name}"
                 )
-    for artifact in artifacts:
+    for artifact, (resolved_path, valid) in zip(
+        artifacts,
+        runtime_status,
+        strict=True,
+    ):
         uri = str(artifact.get("uri") or "")
         if not uri or not _is_local_uri(uri):
             continue
         payload = artifact.get("payload") or {}
         if isinstance(payload, dict) and payload.get("required", True) is False:
             continue
-        if not _local_uri_exists(uri):
+        if valid or _artifact_logical_key(artifact) in valid_artifact_keys:
+            continue
+        if resolved_path is None:
             failures.append(f"产物不存在: {uri}")
-        elif not artifact.get("verified"):
+        else:
             failures.append(f"产物未通过运行时验证: {uri}")
     return failures
+
+
+def _artifact_runtime_status(
+    artifact: dict[str, Any],
+    workspace_roots: list[Path],
+) -> tuple[Path | None, bool]:
+    uri = str(artifact.get("uri") or "").strip()
+    if not uri or not _is_local_uri(uri):
+        return None, bool(artifact.get("verified"))
+    resolved_path = _resolve_local_artifact_path(uri, [], workspace_roots)
+    if resolved_path is None:
+        return None, False
+    if artifact.get("verified"):
+        return resolved_path, True
+    payload = artifact.get("payload") or {}
+    try:
+        verification = ArtifactVerifier().verify(
+            {
+                "path": str(resolved_path),
+                "name": artifact.get("name") or resolved_path.stem,
+                "type": _artifact_output_type(
+                    str(artifact.get("artifact_type") or "file"),
+                    str(resolved_path),
+                    payload if isinstance(payload, dict) else {},
+                ),
+                "required": True,
+            }
+        )
+    except Exception:
+        return resolved_path, False
+    return resolved_path, bool(verification.get("verified"))
+
+
+def _artifact_logical_key(artifact: dict[str, Any]) -> tuple[str, str, str]:
+    uri = str(artifact.get("uri") or "").strip()
+    path = _local_uri_path(uri)
+    filename = path.name.casefold() if path is not None else ""
+    name = str(artifact.get("name") or filename).strip().casefold()
+    return (
+        str(artifact.get("artifact_type") or "").strip().casefold(),
+        name,
+        filename,
+    )
 
 
 def _completion_state_summary(state: dict[str, Any]) -> dict[str, Any]:
@@ -654,7 +733,70 @@ def _is_local_uri(uri: str) -> bool:
 
 
 def _local_uri_exists(uri: str) -> bool:
+    path = _local_uri_path(uri)
+    return path is not None and path.exists()
+
+
+def _local_uri_path(uri: str) -> Path | None:
     if not _is_local_uri(uri):
-        return False
-    path = uri.removeprefix("file://").split("|", 1)[0]
-    return bool(path) and Path(path).expanduser().exists()
+        return None
+    raw = unquote(str(uri or "").strip()).split("|", 1)[0]
+    if raw.casefold().startswith("file:"):
+        parsed = urlparse(raw)
+        raw = unquote(parsed.path)
+        if parsed.netloc:
+            raw = f"//{parsed.netloc}{raw}"
+        elif re.match(r"^/[A-Za-z]:/", raw):
+            raw = raw[1:]
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _artifact_workspace_roots(artifacts: list[dict[str, Any]]) -> list[Path]:
+    roots: list[Path] = []
+    for artifact in reversed(artifacts):
+        if not artifact.get("verified"):
+            continue
+        values = [artifact.get("uri")]
+        payload = artifact.get("payload") or {}
+        if isinstance(payload, dict):
+            values.extend((payload.get("path"), payload.get("absolute_path")))
+            outputs = payload.get("outputs") or []
+            if isinstance(outputs, list):
+                values.extend(
+                    output.get("path") or output.get("absolute_path")
+                    for output in outputs
+                    if isinstance(output, dict) and output.get("verified", True)
+                )
+        for value in values:
+            path = _local_uri_path(str(value or ""))
+            if path is None or not path.is_absolute() or not path.exists():
+                continue
+            root = path if path.is_dir() else path.parent
+            if root not in roots:
+                roots.append(root)
+    return roots
+
+
+def _resolve_local_artifact_path(
+    uri: str,
+    artifacts: list[dict[str, Any]],
+    workspace_roots: list[Path] | None = None,
+) -> Path | None:
+    path = _local_uri_path(uri)
+    if path is None:
+        return None
+    if path.is_absolute():
+        return path.resolve() if path.exists() else None
+    roots = workspace_roots
+    if roots is None:
+        roots = _artifact_workspace_roots(artifacts)
+    for root in roots:
+        candidate = (root / path).resolve()
+        if candidate.exists():
+            return candidate
+    return path.resolve() if path.exists() else None

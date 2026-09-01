@@ -700,6 +700,81 @@ class RetryCodeExecutionProvider:
         )
 
 
+class RetryThenEquivalentExecutionProvider:
+    name = "retry-equivalent-output-test"
+    model = "retry-equivalent-output-test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    @staticmethod
+    def _execute_call(call_id: str, code: str) -> ChatResponse:
+        return ChatResponse(
+            content="",
+            model="retry-equivalent-output-test-model",
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(
+                    id=call_id,
+                    name="execute_gis_code",
+                    arguments={
+                        "code": code,
+                        "expected_outputs": [
+                            {
+                                "path": "terrain_morphology.tif",
+                                "name": "terrain_morphology",
+                                "type": "file",
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+
+    def chat(self, system, messages, tools=None):
+        del system, messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return self._execute_call("initial", "raise RuntimeError('bad table')")
+        if self.calls == 2:
+            return self._execute_call(
+                "retry-success",
+                "Path('terrain_morphology.tif').write_bytes(b'first')",
+            )
+        if self.calls == 3:
+            return self._execute_call(
+                "equivalent-output",
+                "# changed implementation\nPath('terrain_morphology.tif').write_bytes(b'second')",
+            )
+        if self.calls == 4:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="complete-followup",
+                        name="complete_plan_step",
+                        arguments={"step_id": "followup", "outputs": {"done": True}},
+                    )
+                ],
+            )
+        if self.calls == 5:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="finalize-output-replay",
+                        name="finalize_task",
+                        arguments={"summary": "任务完成"},
+                    )
+                ],
+            )
+        raise AssertionError("复用输出契约后不应继续调用模型")
+
+
 class DuplicateRetryCodeExecutionProvider:
     name = "duplicate-retry-code-test"
     model = "duplicate-retry-code-test-model"
@@ -938,6 +1013,64 @@ class InlineThinkingQuestionProvider:
             ),
             model=self.model,
             reasoning_content="结构化推理仍供模型调用链使用。",
+        )
+
+
+class ReasoningContinuationProvider:
+    name = "deepseek-continuation-test"
+    model = "deepseek-continuation-test-model"
+
+    def __init__(self):
+        self.calls = 0
+        self.messages_by_call: list[list[ChatMessage]] = []
+
+    def chat(self, system, messages, tools=None):
+        del system, tools
+        self.calls += 1
+        self.messages_by_call.append(list(messages))
+        assert all(
+            message.reasoning_content is not None
+            for message in messages
+            if message.role == "assistant"
+        )
+        if self.calls == 1:
+            return ChatResponse(
+                content="还需要完成计划步骤。",
+                model=self.model,
+                reasoning_content="检查到任务仍在运行。",
+            )
+        if self.calls == 2:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                reasoning_content="先登记计划步骤完成。",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="complete-analysis",
+                        name="complete_plan_step",
+                        arguments={"step_id": "analysis", "outputs": {"done": True}},
+                    )
+                ],
+            )
+        if self.calls == 3:
+            return ChatResponse(
+                content="",
+                model=self.model,
+                reasoning_content="所有步骤完成，可以结束任务。",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="finalize-analysis",
+                        name="finalize_task",
+                        arguments={"summary": "任务完成"},
+                    )
+                ],
+            )
+        return ChatResponse(
+            content="任务完成",
+            model=self.model,
+            reasoning_content="确认最终工具结果后回复用户。",
         )
 
 
@@ -2235,6 +2368,35 @@ def test_execute_gis_code_uses_current_qgis_mode_when_executor_is_available(tmp_
     assert "current" in result["stdout"]
 
 
+def test_current_qgis_relative_outputs_are_created_in_workspace_and_cwd_is_restored(
+    tmp_path: Path,
+):
+    executor = QGISCodeExecutor(
+        {
+            "execution_mode": "current_qgis",
+            "workspace_dir": str(tmp_path / "workspaces"),
+        }
+    )
+    previous_cwd = Path.cwd()
+
+    result = executor.execute_current_qgis(
+        code="Path('terrain_morphology.tif').write_bytes(b'fake-raster')",
+        expected_outputs=[
+            {
+                "path": "terrain_morphology.tif",
+                "name": "terrain_morphology",
+                "type": "file",
+            }
+        ],
+    )
+
+    output_path = Path(result["outputs"][0]["path"])
+    assert result["success"] is True
+    assert output_path.parent == Path(result["workspace_dir"])
+    assert output_path.read_bytes() == b"fake-raster"
+    assert Path.cwd() == previous_cwd
+
+
 def test_execute_gis_code_allows_stdout_or_project_result_without_files(tmp_path: Path):
     session_db = SessionDB(tmp_path / "state.db")
     session = session_db.create_session(title="direct result", model="test", source="test")
@@ -2835,6 +2997,37 @@ QgsProject.instance().addVectorLayer("result.gpkg", "result", "ogr")
     assert any("addVectorLayer" in issue for issue in issues)
 
 
+def test_rejects_manual_loading_of_processing_output_and_invalid_raster_apis():
+    code = '''
+import gdal
+import processing
+from qgis.core import QgsProject, QgsRasterLayer
+
+result = processing.run("native:reclassifybytable", {
+    "INPUT_RASTER": source,
+    "RASTER_BAND": 1,
+    "TABLE": [0, 5, 1, 5, 15, 2],
+    "OUTPUT": output_path,
+})
+final_layer = QgsRasterLayer(result["OUTPUT"], "terrain_morphology")
+QgsProject.instance().addMapLayer(final_layer)
+print(final_layer.resX())
+project_layer = QgsProject.instance().mapLayer(
+    "terrain_de2304ab_33b3_4f19_8288_41554604c949"
+)
+if project_layer is None:
+    raise ValueError("missing layer")
+print(project_layer.resolution())
+'''
+
+    issues = find_generated_code_issues(code)
+
+    assert any("from osgeo import gdal" in issue for issue in issues)
+    assert any("不得再创建 QgsRasterLayer" in issue for issue in issues)
+    assert any("QgsRasterLayer 没有 resX()" in issue for issue in issues)
+    assert any("QgsRasterLayer 没有 resolution()" in issue for issue in issues)
+
+
 def test_direct_map_layers_by_name_index_is_not_a_hard_code_check_failure():
     code = '''
 from qgis.core import QgsProject
@@ -2902,6 +3095,38 @@ processing.run("qgis:heatmapkerneldensityestimation", {
     assert not any("QGIS 图层 ID" in issue for issue in valid_issues)
     assert not any("未检查是否为 None" in issue for issue in valid_issues)
     assert not any("参数不在 Catalog" in issue for issue in valid_issues)
+
+
+def test_rejects_layer_name_passed_to_qgs_project_map_layer():
+    code = '''
+from qgis.core import QgsProject
+
+dem_layer = QgsProject.instance().mapLayer("ASTGTM_N31E114Q")
+if dem_layer is None:
+    raise ValueError("missing DEM")
+'''
+
+    issues = find_generated_code_issues(code)
+
+    assert any("mapLayer() 只接受图层 ID" in issue for issue in issues)
+    assert any("ASTGTM_N31E114Q" in issue for issue in issues)
+
+
+def test_rejects_nested_reclassification_table_before_execution():
+    code = '''
+import processing
+
+processing.run("native:reclassifybytable", {
+    "INPUT_RASTER": slope_layer,
+    "RASTER_BAND": 1,
+    "TABLE": [[0, 5, 1], [5, 15, 2], [15, 30, 3]],
+    "OUTPUT": output_path,
+})
+'''
+
+    issues = find_generated_code_issues(code)
+
+    assert any("TABLE" in issue and "一维列表" in issue for issue in issues)
 
 
 def test_generated_code_literal_analysis_handles_reassigned_variables():
@@ -3382,7 +3607,7 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     )._build_conversation_messages(session.id)
 
     memory = messages[0].content
-    assert messages[0].role == "assistant"
+    assert messages[0].role == "user"
     assert "会话记忆" in memory
     assert "建筑物" in memory
     assert "buildings-live-id" in memory
@@ -3390,6 +3615,47 @@ def test_agent_core_injects_tool_memory_for_followup(tmp_path: Path):
     assert "landuse" in memory
     assert "中山公园" in memory
     assert messages[-1].content == "导出公园地块"
+
+
+def test_managed_continuation_preserves_every_assistant_reasoning_turn(
+    tmp_path: Path,
+):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="reasoning continuation",
+        model="deepseek-continuation-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(session.id, "完成分析")
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {
+                "id": "analysis",
+                "position": 1,
+                "instruction": "完成分析",
+                "dependencies": [],
+                "status": "pending",
+                "inputs": {},
+                "outputs": {},
+            }
+        ],
+    )
+    provider = ReasoningContinuationProvider()
+    core = AgentCore(session_db=session_db, llm_provider=provider, iface=None)
+
+    events = core.run(session_id=session.id, user_message="继续完成任务")
+
+    assert provider.calls == 4
+    second_call = provider.messages_by_call[1]
+    assert second_call[-2].role == "assistant"
+    assert second_call[-2].reasoning_content == "检查到任务仍在运行。"
+    assert second_call[-1].role == "user"
+    assert second_call[-1].content.startswith("[AGENT CONTINUATION]")
+    final_message = next(
+        event for event in reversed(events) if event["type"] == "message"
+    )
+    assert final_message["payload"]["content"] == "任务完成"
 
 
 def test_agent_core_preserves_school_coverage_binding_for_unit_followup(tmp_path: Path):
@@ -3517,6 +3783,72 @@ def test_pipeline_stage_context_passes_only_structured_query_and_previous_stage(
     assert "arguments" not in compact_results[0]
     assert raw_arguments not in json.dumps(compact_results, ensure_ascii=False)
     assert compact_results[0]["result"]["expected_stage"] == "generated_code"
+
+
+def test_pipeline_preserves_inspected_layer_id_until_code_generation(tmp_path: Path):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="layer binding handoff",
+        model="test",
+        source="test",
+    )
+    session_db.save_message(
+        session.id,
+        "user",
+        "对ASTGTM_N31E114Q图层进行地形形态的分类",
+        event_type="user",
+    )
+    session_db.log_tool_call(
+        session.id,
+        "inspect_layer",
+        {"layer_name": "ASTGTM_N31E114Q"},
+        {
+            "layer": {
+                "id": "ASTGTM_N31E114Q_7f012345_1234_4567_89ab_0123456789ab",
+                "name": "ASTGTM_N31E114Q",
+                "type": "raster",
+                "source": "D:/dem/ASTGTM_N31E114Q.tif",
+                "crs": "EPSG:32649",
+            },
+            "fields": [],
+        },
+        duration_ms=1,
+    )
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+    )
+    stage_tool = core._build_tool_registry(session.id).get("record_pipeline_stage")
+    overview = stage_tool.handler(
+        {
+            "stage_name": "data_overview",
+            "artifact": {
+                "available_layers": ["ASTGTM_N31E114Q"],
+                "summary": "DEM已确认",
+            },
+        }
+    )
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="structured_query",
+        artifact={"task": "地形形态分类"},
+        summary="需求已结构化",
+    )
+    session_db.log_stage_artifact(
+        session.id,
+        stage_name="solution_plan",
+        artifact={"steps": []},
+        summary="方案已确认",
+    )
+
+    envelope = json.loads(core._build_pipeline_stage_messages(session.id)[0].content)
+
+    assert overview["success"] is True
+    assert overview["artifact"]["resolved_layers"][0]["name"] == "ASTGTM_N31E114Q"
+    assert envelope["next_pipeline_stage"] == "generated_code"
+    assert envelope["resolved_layers"][0]["id"].startswith("ASTGTM_N31E114Q_")
+    assert "不得把 name 传给 mapLayer()" in envelope["layer_binding_instruction"]
 
 
 def test_structured_query_context_receives_original_request_and_data_overview(tmp_path: Path):
@@ -3789,8 +4121,137 @@ def test_confirmed_code_execution_retries_after_failure(tmp_path: Path):
         message.role == "tool" and message.tool_call_id == "call-1"
         for message in retry_messages
     )
+    persisted = session_db.get_context_messages(session.id)
+    assert any(
+        message.get("role") == "assistant"
+        and any(
+            call.get("id") == "call-2"
+            for call in message.get("tool_calls") or []
+        )
+        for message in persisted
+    )
+    assert any(
+        message.get("role") == "tool" and message.get("tool_call_id") == "call-2"
+        for message in persisted
+    )
     final_message = next(event for event in reversed(confirmed_events) if event["type"] == "message")
     assert "自动修复并重试 1 次" in final_message["payload"]["content"]
+
+
+def test_confirmed_execution_reuses_verified_output_contract_when_code_changes(
+    tmp_path: Path,
+):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(title="output replay", model="test", source="test")
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=ToolCallingProvider(),
+        iface=None,
+        qgis_executor=lambda func: func(),
+    )
+    registry = core._build_tool_registry(session.id)
+    session_db.set_state(f"{session.id}:request_scope", "same-request")
+    first_arguments = {
+        "code": "print('first implementation')",
+        "expected_outputs": [
+            {
+                "path": "terrain_morphology.tif",
+                "name": "terrain_morphology",
+                "type": "raster",
+            }
+        ],
+    }
+    successful_result = {
+        "success": True,
+        "workspace_dir": str(tmp_path / "workspaces" / "first"),
+        "outputs": [
+            {
+                "path": str(tmp_path / "workspaces" / "first" / "terrain_morphology.tif"),
+                "name": "terrain_morphology",
+                "type": "raster",
+                "exists": True,
+                "verified": True,
+            }
+        ],
+    }
+    core._remember_confirmed_tool_call(
+        session.id,
+        "execute_gis_code",
+        first_arguments,
+        successful_result,
+        registry,
+    )
+
+    replay = core._confirmed_tool_replay(
+        session.id,
+        "execute_gis_code",
+        {
+            **first_arguments,
+            "code": "print('same outputs, changed comments and implementation')",
+        },
+        registry,
+    )
+
+    assert replay is not None
+    assert replay["duplicate_prevented"] is True
+    assert replay["reuse_reason"] == "verified_output_contract"
+    assert replay["workspace_dir"].endswith("first")
+
+
+def test_retry_success_does_not_confirm_or_execute_equivalent_output_again(
+    tmp_path: Path,
+):
+    session_db = SessionDB(tmp_path / "state.db")
+    session = session_db.create_session(
+        title="retry output replay",
+        model="retry-equivalent-output-test-model",
+        source="test",
+    )
+    task_id = session_db.create_task(session.id, "生成分类结果")
+    session_db.replace_plan_steps(
+        task_id,
+        [
+            {"id": "analysis", "instruction": "生成结果", "dependencies": []},
+            {
+                "id": "followup",
+                "instruction": "登记完成",
+                "dependencies": ["analysis"],
+            },
+        ],
+    )
+    provider = RetryThenEquivalentExecutionProvider()
+    core = AgentCore(
+        session_db=session_db,
+        llm_provider=provider,
+        iface=None,
+        qgis_executor=lambda func: func(),
+        executor_config={
+            "execution_mode": "current_qgis",
+            "workspace_dir": str(tmp_path / "workspaces"),
+        },
+    )
+
+    events = core.run(session_id=session.id, user_message="生成分类结果")
+    confirmation = next(event for event in events if event["type"] == "confirm_request")
+    confirmed_events = core.confirm_tool_call(
+        session_id=session.id,
+        confirmation_id=confirmation["payload"]["confirmation_id"],
+        approved=True,
+    )
+
+    assert not any(event["type"] == "confirm_request" for event in confirmed_events)
+    replay_event = next(
+        event
+        for event in confirmed_events
+        if event["type"] == "tool_end"
+        and event["payload"]["result"].get("reuse_reason")
+        == "verified_output_contract"
+    )
+    assert replay_event["payload"]["result"]["duplicate_prevented"] is True
+    generated = list((tmp_path / "workspaces").rglob("terrain_morphology.tif"))
+    assert len(generated) == 1
+    assert generated[0].read_bytes() == b"first"
+    assert session_db.get_active_task(session.id)["status"] == "completed"
 
 
 def test_confirmed_code_execution_does_not_rerun_identical_failed_code(tmp_path: Path):
