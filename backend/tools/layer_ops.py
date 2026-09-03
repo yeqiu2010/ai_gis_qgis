@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ...database.session_db import SessionDB
+from ..context.crs_info import describe_crs
 from .registry import ToolEntry
 
 VECTOR_EXTENSIONS = {
@@ -106,7 +107,7 @@ def _layer_summary(layer) -> dict[str, Any]:
         "name": layer.name(),
         "type": _layer_type_name(layer),
         "source": layer.source(),
-        "crs": crs.authid() if crs.isValid() else "",
+        **describe_crs(crs),
         "feature_count": _safe_feature_count(layer),
         "extent": _extent_to_dict(layer),
         "is_valid": layer.isValid(),

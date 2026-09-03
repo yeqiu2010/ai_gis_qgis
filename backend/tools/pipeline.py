@@ -501,7 +501,17 @@ def _current_request_inspected_layers(
                 continue
             bindings_by_id[layer_id] = {
                 key: layer.get(key)
-                for key in ("id", "name", "type", "source", "crs")
+                for key in (
+                    "id",
+                    "name",
+                    "type",
+                    "source",
+                    "crs",
+                    "crs_authid",
+                    "crs_name",
+                    "crs_definition",
+                    "crs_definition_format",
+                )
                 if layer.get(key) is not None
             }
     return list(bindings_by_id.values())

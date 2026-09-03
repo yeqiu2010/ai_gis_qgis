@@ -3354,7 +3354,10 @@ class AgentCore:
                 lines.append(
                     f"- inspect: 图层={layer.get('name') or arguments.get('layer_name')}, "
                     f"ID={layer.get('id') or arguments.get('layer_id') or ''}, "
-                    f"类型={layer.get('type')}, CRS={layer.get('crs')}, 字段={field_names}{sample_hint}"
+                    f"类型={layer.get('type')}, CRS={layer.get('crs')}, "
+                    f"CRS名称={layer.get('crs_name') or ''}, "
+                    f"CRS定义={layer.get('crs_definition') or ''}, "
+                    f"字段={field_names}{sample_hint}"
                 )
             return lines
         if name == "inspect_school_service_coverage_inputs":

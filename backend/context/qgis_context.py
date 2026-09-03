@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .crs_info import describe_crs
+
 
 @dataclass(frozen=True)
 class QGISContext:
@@ -22,12 +24,13 @@ class QGISContext:
         project = QgsProject.instance()
         layers = []
         for layer in project.mapLayers().values():
+            crs_info = describe_crs(layer.crs())
             layers.append(
                 {
                     "id": layer.id(),
                     "name": layer.name(),
                     "source": layer.source(),
-                    "crs": layer.crs().authid() if layer.crs().isValid() else "",
+                    **crs_info,
                     "type": layer.type(),
                 }
             )
